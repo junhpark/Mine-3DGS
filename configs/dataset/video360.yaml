@@ -1,0 +1,38 @@
+schema_version: "1.0"
+kind: video
+dataset_id: kigam_tunnelA_ep1_insta360_v001
+source_assets:
+  - raw/tunnelA_insta360.mp4
+capture_epoch: { id: ep1, date: "2026-10-14" }
+is_360: true
+
+frames:
+  fps: 1.0
+  max_frames: 800
+  blur_threshold: 60.0
+  dedup_hamming: 6
+
+ring_crop:                     # 같은 프레임의 크롭은 COLMAP rig 로 등록 (§6.2)
+  n_yaw: 6
+  fov_deg: 90.0
+  pitches_deg: [0.0]
+  width: 1200
+  height: 1200
+
+masks:
+  nadir: true                  # 삼각대·촬영자
+  nadir_el_deg: -60.0
+  tripod: false
+
+sfm:
+  backend: colmap
+  mapper: global
+  fix_intrinsics: true         # 크롭 K 는 합성이므로 정확히 알려짐
+  rig: auto
+  experimental: null
+
+register:
+  targets: raw/targets.csv
+  reference_tls: ../kigam_tunnelA_ep1_v001/dataset/init_points.ply
+  icp_max_dist_m: 0.5
+  icp_iters: 50

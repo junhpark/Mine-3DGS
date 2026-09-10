@@ -1,0 +1,26 @@
+# minegs CPU ingest image (optional, §1.2). Native python is fine too; this exists so the
+# E57/PDAL/ffmpeg/COLMAP toolchain is reproducible on machines without conda.
+# Never used for training. Never receives raw data on a pod (ingest is local-only, §1.4).
+FROM condaforge/miniforge3:24.3.0-0
+
+ENV PYTHONUNBUFFERED=1 \
+    MINEGS_RUNTIME=cpu
+
+# PDAL (tiling/downsample, §6.1), pye57 (inventory/scan split), ffmpeg (§6.2),
+# COLMAP CPU (small SfM smoke tests; heavy SfM should go to the GPU image).
+RUN mamba install -y -c conda-forge \
+      python=3.11 pdal python-pdal pye57 ffmpeg colmap opencv \
+    && mamba clean -afy
+
+WORKDIR /opt/minegs
+COPY pyproject.toml README.md ./
+COPY minegs ./minegs
+RUN pip install --no-cache-dir -e ".[video]" \
+    && python -c "import minegs, pye57, pdal; print('minegs', minegs.__version__)"
+
+COPY docker/entrypoint.sh /usr/local/bin/minegs-entrypoint
+RUN chmod +x /usr/local/bin/minegs-entrypoint
+
+VOLUME ["/data"]
+ENTRYPOINT ["minegs-entrypoint"]
+CMD ["--help"]

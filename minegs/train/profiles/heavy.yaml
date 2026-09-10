@@ -1,0 +1,21 @@
+schema_version: "1.0"
+name: heavy
+description: Full-quality run — all images (or one chunk), half/full resolution, 30k iters (§8.3).
+backend: gsplat
+default_runner: runpod
+max_images: null
+data_factor: 2
+max_steps: 30000
+requests:
+  depth_loss: true
+  appearance_embedding: true    # underground lighting variation (§6.2)
+  bilateral_grid: false
+  antialiasing: true
+backend_args:
+  strategy: mcmc
+  normalize_world_space: false
+  init_type: sfm
+  sh_degree: 3
+  eval_steps: [7000, 15000, 30000]
+  save_steps: [15000, 30000]
+  save_ply: true

@@ -1,0 +1,21 @@
+schema_version: "1.0"
+name: light
+description: Quick local baseline — small subset, quarter resolution, 7k iters (§8.3).
+backend: gsplat
+default_runner: local
+max_images: 100
+data_factor: 4
+max_steps: 7000
+requests:                       # capability -> required? (true = refuse backend without it)
+  depth_loss: false
+  appearance_embedding: false
+  bilateral_grid: false
+  antialiasing: false
+backend_args:
+  strategy: default
+  normalize_world_space: false  # keep BACKEND_INTERNAL == LOCAL_METRIC (§3)
+  init_type: sfm                # init_points.ply is written into sparse/0 as points3D
+  sh_degree: 3
+  eval_steps: [7000]
+  save_steps: [7000]
+  save_ply: true

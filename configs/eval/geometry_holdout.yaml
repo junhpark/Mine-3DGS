@@ -1,0 +1,21 @@
+schema_version: "1.0"
+# §5 geometry_holdout — 평가 모듈은 manifest.split / initialization 을 읽어 프로토콜을
+# 판정하고, reconstruction run 에 대해 형상 정확도 요청을 거부한다.
+protocol: geometry_holdout
+surface:
+  method: depth_tsdf           # depth_tsdf | mesh | centers(진단용, 주장 불가)
+  voxel_m: 0.03
+  depth_trunc_m: 30.0
+geometry:
+  max_dist_m: 1.0              # 이 이상은 outlier 로 잘라 통계 계산
+  quantiles: [0.5, 0.9, 0.95]
+  sample_points: 2000000
+sections:
+  interval_m: 1.0
+  thickness_m: 0.10
+  angle_bins: 180
+volume:
+  method: integrate_sections   # ∫A(s)ds 기본, mesh 보조
+  design_profile: null         # raw/design_profile.csv 있으면 Design vs TLS vs 3DGS
+render:
+  metrics: [psnr, ssim, lpips]

@@ -1,0 +1,30 @@
+schema_version: "1.0"
+kind: video
+dataset_id: kigam_tunnelA_ep1_video_v001
+source_assets:
+  - raw/tunnelA_gopro.mp4
+capture_epoch: { id: ep1, date: "2026-10-14" }
+is_360: false
+
+frames:
+  fps: 2.0
+  max_frames: 1500
+  blur_threshold: 60.0         # variance of Laplacian, 이하 제거
+  dedup_hamming: 6             # perceptual hash 해밍거리, 이하 중복
+
+masks:
+  nadir: false
+  tripod: false
+
+sfm:
+  backend: colmap              # >= 4.0
+  mapper: global               # global | incremental — 반복 패턴·저텍스처면 incremental 폴백
+  fix_intrinsics: false        # 일반 영상은 캘리브레이션 되어 있지 않으면 최적화
+  rig: none
+  experimental: null           # gluemap — Phase 2 이후
+
+register:                      # §7 — Sim(3) 초기정합 -> SE(3) ICP -> diagnostics
+  targets: raw/targets.csv     # 알려진 타깃 / 스테이션 대응 (id,x,y,z in TLS_GLOBAL)
+  reference_tls: ../kigam_tunnelA_ep1_v001/dataset/init_points.ply
+  icp_max_dist_m: 0.5
+  icp_iters: 50
