@@ -75,11 +75,8 @@ class GsplatBackend(TrainBackend):
             str(profile.max_steps),
             "--normalize_world_space" if normalize else "--no-normalize_world_space",
         ]
-        if profile.max_images:
-            argv += [
-                "--max_images",
-                str(profile.max_images),
-            ]  # handled by our dataset subset, see runner
+        # profile.max_images is *not* a gsplat flag: the light profile's image subset is
+        # produced by writing a reduced sparse/0 (Phase 0D, runner side), never by the trainer.
         for cap, flag in (
             ("appearance_embedding", "--app_opt"),
             ("bilateral_grid", "--use_bilateral_grid"),
