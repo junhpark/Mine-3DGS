@@ -16,11 +16,12 @@ from minegs.ingest.video.masks import nadir_mask_for_crop
 from minegs.ingest.video.rig import rig_config_json, rig_from_ring
 from minegs.ingest.video.sfm import SfMOptions, get_sfm_backend
 from minegs.train.backends import get_backend
-from minegs.train.backends.gsplat import gsplat_normalization
+from minegs.train.backends.gsplat import TRAINER_ENV, gsplat_normalization
 from minegs.train.profiles import load_profile
 from minegs.train.runner import RunConfig, get_runner
 from minegs.train.runner import sync as rsync
-from minegs.train.runner.base import RunnerConfig
+from minegs.train.runner.base import DATASET_HASH_PATTERNS, RunnerConfig
+from minegs.train.staging import select_images, stage_dataset
 from minegs.viz.export import write_splat
 from minegs.viz.overlay import calibrate_convention, render_overlay
 
@@ -40,12 +41,94 @@ def test_profiles_and_capabilities():
 
 def test_gsplat_command_keeps_local_metric(synthetic, tmp_path):
     be = get_backend("gsplat")
-    cmd = be.build_command(synthetic.dataset_dir, tmp_path / "out", load_profile("light"))
+    cmd = be.build_command(
+        synthetic.dataset_dir, tmp_path / "out", load_profile("light"), check_trainer=False
+    )
     assert "--no-normalize_world_space" in cmd.argv and cmd.T_local_from_internal.is_identity()
+    assert cmd.argv[1].endswith("simple_trainer.py") and cmd.argv[2] == "default"
+    assert "--max_images" not in cmd.argv and "--absgrad" not in cmd.argv
     prof = load_profile("light")
     prof.backend_args["normalize_world_space"] = True
-    cmd2 = be.build_command(synthetic.dataset_dir, tmp_path / "out", prof)
+    cmd2 = be.build_command(synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False)
     assert "--normalize_world_space" in cmd2.argv and not cmd2.T_local_from_internal.is_identity()
+
+
+def test_gsplat_trainer_contract(synthetic, tmp_path, monkeypatch):
+    be = get_backend("gsplat")
+    prof = load_profile("light")
+    monkeypatch.setenv(TRAINER_ENV, str(tmp_path / "nowhere" / "simple_trainer.py"))
+    with pytest.raises(ContractError, match=r"simple_trainer\.py"):
+        be.build_command(synthetic.dataset_dir, tmp_path / "out", prof)
+    script = tmp_path / "simple_trainer.py"
+    script.write_text("# stub")
+    monkeypatch.setenv(TRAINER_ENV, str(script))
+    cmd = be.build_command(synthetic.dataset_dir, tmp_path / "out", prof)
+    assert cmd.argv[:2] == ["python", str(script)]
+    # absgrad is a DefaultStrategy field -> --strategy.absgrad; refused with mcmc
+    prof.requests["absgrad"] = True
+    assert (
+        "--strategy.absgrad" in be.build_command(synthetic.dataset_dir, tmp_path / "out", prof).argv
+    )
+    prof.backend_args["strategy"] = "mcmc"
+    with pytest.raises(ContractError, match="absgrad"):
+        be.build_command(synthetic.dataset_dir, tmp_path / "out", prof)
+    prof.backend_args["strategy"] = "bogus"
+    with pytest.raises(ContractError, match="strategy"):
+        be.build_command(synthetic.dataset_dir, tmp_path / "out", prof)
+
+
+def test_select_images_even_subset():
+    imgs = [f"i{k}" for k in range(50)]
+    assert select_images(imgs, None) == imgs and select_images(imgs, 100) == imgs
+    sub = select_images(imgs, 5)
+    assert sub == ["i0", "i12", "i24", "i37", "i49"]  # np.round half-to-even at 24.5
+    with pytest.raises(ContractError):
+        select_images(imgs, 0)
+
+
+def test_stage_dataset_subset_and_tls_init(synthetic, tmp_path):
+    m = synthetic.manifest
+    st = stage_dataset(synthetic.dataset_dir, tmp_path / "staged", m, max_images=7)
+    assert st.subset and len(st.images) == 7 and st.n_train_available == len(m.train_images())
+    assert set(st.images) <= set(m.train_images()) and not set(st.images) & set(m.test_images())
+    assert all((st.path / "images" / n).exists() for n in st.images)
+    model = colmap_io.read_model(st.path / "sparse" / "0")
+    assert sorted(im.name for im in model.images.values()) == sorted(st.images)
+    assert st.init_source == "init_points.ply" and len(model.points3D) == st.init_points
+    assert len(model.points3D) == len(read_ply(synthetic.dataset_dir / "init_points.ply"))
+    assert all(len(im.point3D_ids) == 0 for im in model.images.values())
+    # no subset, sfm init: keeps the original sparse points
+    st2 = stage_dataset(
+        synthetic.dataset_dir, tmp_path / "staged2", m, max_images=None, use_init_points=False
+    )
+    assert (
+        not st2.subset
+        and st2.init_source == "points3D.txt"
+        and len(st2.images) == st.n_train_available
+    )
+    with pytest.raises(ContractError, match="unknown chunk"):
+        stage_dataset(synthetic.dataset_dir, tmp_path / "s3", m, chunk_id="C99")
+
+
+def test_dataset_hash_covers_images(synthetic, tmp_path):
+    from minegs.core.provenance import sha256_tree
+
+    assert "images/**/*" in DATASET_HASH_PATTERNS and "masks/**/*" in DATASET_HASH_PATTERNS
+    before = sha256_tree(synthetic.dataset_dir, DATASET_HASH_PATTERNS)
+    img = synthetic.dataset_dir / "images" / synthetic.manifest.all_images()[0]
+    original = img.read_bytes()
+    try:
+        img.write_bytes(original + b"\x00")
+        assert sha256_tree(synthetic.dataset_dir, DATASET_HASH_PATTERNS) != before
+    finally:
+        img.write_bytes(original)
+    assert sha256_tree(synthetic.dataset_dir, DATASET_HASH_PATTERNS) == before
+
+
+def test_runpod_runner_is_explicitly_unimplemented(synthetic):
+    r = get_runner("runpod", RunnerConfig(runner="runpod", image="x@sha256:abc"))
+    with pytest.raises(NotYetImplementedError, match="Phase 1"):
+        r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="heavy"))
 
 
 def test_gsplat_normalization_is_invertible(synthetic):

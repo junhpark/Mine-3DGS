@@ -113,16 +113,18 @@ def test_sections_volume_design_against_analytic(synthetic):
         angle_bins=72,
     )
     assert ser.valid_count() == len(ser.sections)
-    assert np.nanmean(ser.areas()) == pytest.approx(np.pi * r**2, rel=0.01)
+    # 72-bin polygon inscribed in a circle has area ratio (n/2π)sin(2π/n) = 0.99873: the 0.2 % gate
+    # documented in README is the discretisation, not noise (checked across seeds).
+    assert np.nanmean(ser.areas()) == pytest.approx(np.pi * r**2, rel=0.002)
     vol = integrate_sections(ser, "centerline:design")
     expected = np.pi * r**2 * (vol.end_chainage_m - vol.start_chainage_m)
-    assert vol.volume_m3 == pytest.approx(expected, rel=0.01)
+    assert vol.volume_m3 == pytest.approx(expected, rel=0.002)
     assert vol.missing_section_count == 0 and vol.section_interval_m == 2.0 and vol.reference_axis
     dc = compare_to_design(ser, 2.4)
     assert dc.overbreak_m3 == pytest.approx(
-        np.pi * (r**2 - 2.4**2) * (vol.end_chainage_m - vol.start_chainage_m), rel=0.02
+        np.pi * (r**2 - 2.4**2) * (vol.end_chainage_m - vol.start_chainage_m), rel=0.002
     )
-    assert dc.underbreak_m3 == pytest.approx(0.0, abs=0.5)
+    assert dc.underbreak_m3 == pytest.approx(0.0, abs=0.01)
     # json roundtrip of the series (what the CLI writes)
     from minegs.eval.sections.sections import SectionSeries
 

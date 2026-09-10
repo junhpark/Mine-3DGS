@@ -44,8 +44,9 @@ minegs train command data/synthetic_tunnel/dataset --profile light     # 실행�
 pytest                                                                 # CI 와 동일
 ```
 
-합성 갱도(반경 2.5 m, 곡선, UTM 급 오프셋)에서 단면 면적·∫A(s)ds·여굴 체적이 해석값과 0.2 % 이내로
-일치하는 것을 `tests/test_eval.py` 가 확인한다. `reconstruction` 프로토콜 데이터셋에 형상 정확도를
+합성 갱도(반경 2.5 m, 곡선, UTM 급 오프셋)에서 단면 면적·∫A(s)ds·여굴 체적이 해석값과 **0.2 % 이내**로
+일치하는 것을 `tests/test_eval.py` 가 게이트(`rel=0.002`)로 강제한다. 실제 오차는 시드와 무관하게 0.128 % 이며,
+이는 72각형 내접 다각형의 면적비 (n/2π)·sin(2π/n) 에서 오는 이산화 오차다. `reconstruction` 프로토콜 데이터셋에 형상 정확도를
 요청하면 CLI 는 exit code 3 으로 거부한다(`--diagnostic` 은 주장 없는 수치만 허용).
 
 ## 디렉토리
@@ -90,14 +91,26 @@ dataset/
 ```bash
 # 로컬 GPU (docker, digest 로 pin 된 이미지) — configs/runner/local.yaml
 minegs train run data/<id>/dataset --profile light --runner local --config configs/runner/local.yaml --wait
-# RunPod — dataset/ 만 push, runs/<run_id>/ 만 pull
-minegs train run data/<id>/dataset --profile heavy --runner runpod --config configs/runner/runpod.yaml
+# heavy 프로파일을 로컬 GPU 에서 (RunPod 러너는 Phase 1, 미구현)
+minegs train run data/<id>/dataset --profile heavy --runner local --config configs/runner/local.yaml
 minegs train status data/<id>/runs/<run_id>      # run.json: backend, digest, dataset_hash, T_local_from_internal, provenance
 ```
 
 프로파일은 backend 플래그가 아니라 **capability** 를 요청한다 (`requests: {depth_loss: true, ...}`).
-gsplat 어댑터는 기본적으로 `--no-normalize_world_space` 로 BACKEND_INTERNAL = LOCAL_METRIC 을 유지하고,
-정규화를 켜면 gsplat 의 정규화(Sim3)를 재계산해 출력 `.ply` 를 LOCAL_METRIC 으로 되돌린다.
+
+**실행 계약 (gsplat v1.5.3 upstream 기준)**
+- trainer 는 PyPI wheel 에 없고 저장소의 `examples/simple_trainer.py` 다. `docker/Dockerfile.gpu` 가 wheel 과 같은
+  태그를 `/opt/gsplat` 에 체크아웃하고 `examples/requirements.txt` 를 설치한 뒤 `MINEGS_GSPLAT_TRAINER` 로 경로를 준다.
+  스크립트를 못 찾으면 어댑터가 커맨드 생성을 거부한다(`minegs train command` 는 dry-run 이라 예외).
+- 러너는 `dataset/` 을 read-only 로 마운트하고 `runs/<run_id>/staged/` 에 **스테이징 복사본**을 만든다
+  (`minegs/train/staging.py`): 프로파일의 `max_images` 를 train 이미지에서 균등 추출하고, `init_points.ply` 를
+  `sparse/0/points3D.txt` 로 써서 TLS 점으로 초기화한다. gsplat 파서가 `images_<factor>_png` 를 `data_dir` 안에 쓰기
+  때문에 read-only 데이터셋을 직접 넘길 수 없다. 스테이징 내용(이미지 수·서브셋 여부·init 출처·sha256)은 `run.json` 에 기록된다.
+- 어댑터는 기본 `--no-normalize_world_space` 로 BACKEND_INTERNAL = LOCAL_METRIC 을 유지하고, 정규화를 켜면 gsplat 의
+  정규화(Sim3)를 재계산해 출력 `.ply` 를 LOCAL_METRIC 으로 되돌린다. `absgrad` 는 `--strategy.absgrad`(default 전략 전용).
+- `run.json` 의 `dataset_hash` 는 manifest·sparse·init_points·**images·masks**·centerline 을 모두 덮는다.
+- **RunPod 러너는 Phase 1 이며 아직 실행되지 않는다.** `--runner runpod` 은 외부 호출 없이 `NotYetImplementedError`(exit 4)
+  로 끝난다. 필요한 단계는 `minegs/train/runner/runpod.py` docstring 에 적혀 있다.
 
 ## 단계 (§13)
 
@@ -106,8 +119,8 @@ gsplat 어댑터는 기본적으로 `--no-normalize_world_space` 로 BACKEND_INT
 | 0A Foundation — 패키지·config·manifest v1+migration·CLI·tests/CI | **완료** (합성 데이터셋 통과) |
 | 0B E57 ingest — inventory·scan split·PDAL·pose·PanoSource | 인터페이스 + 구현, 실제 E57 검증 필요 |
 | 0C Dataset — 링 크롭·COLMAP export·init PLY·프레임 | 구현, **골든 게이트**(재투영 오버레이) 실데이터 확인 필요 |
-| 0D GS baseline — gsplat 어댑터·LocalRunner·light | 어댑터/러너 구현, GPU 실행 검증 필요 |
-| 1 RunPod | 러너 골격 |
+| 0D GS baseline — gsplat 어댑터·LocalRunner·light | 어댑터·스테이징·러너 구현(upstream 계약 확인), GPU 실행 검증 필요 |
+| 1 RunPod | 미구현 — `submit` 이 명시적으로 거부, 계획은 docstring |
 | 2 Image SfM | 커맨드 빌더·rig·Sim3 정합 구현, GLUEMAP 보류 |
 | 3 Metric geometry | 단면·체적·change·양방향 지표 구현, TSDF/PGSR 미구현 |
 | 4 Web (FastAPI) | 미착수 |

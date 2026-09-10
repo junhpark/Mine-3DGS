@@ -181,3 +181,28 @@ def test_cli_dry_runs(tmp_path):
     )
     assert runner.invoke(app, ["ingest", "video", "rig", str(tmp_path / "rig.json")]).exit_code == 0
     assert runner.invoke(app, ["train", "profiles"]).exit_code == 0
+
+
+def test_cli_runpod_is_not_runnable(tmp_path):
+    root = tmp_path / "syn"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "dataset",
+                "synthetic",
+                str(root),
+                "--length-m",
+                "45",
+                "--n-stations",
+                "3",
+                "--image-size",
+                "32",
+            ],
+        ).exit_code
+        == 0
+    )
+    r = runner.invoke(
+        app, ["train", "run", str(root / "dataset"), "--profile", "heavy", "--runner", "runpod"]
+    )
+    assert r.exit_code == 4 and "Phase 1" in r.output

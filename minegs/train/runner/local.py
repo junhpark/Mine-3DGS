@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from minegs.core.errors import ContractError, NoGpuError
+from minegs.core.provenance import sha256_tree
 from minegs.train.backends import get_backend
 from minegs.train.runner.base import (
     RunConfig,
@@ -18,6 +19,7 @@ from minegs.train.runner.base import (
     docker_available,
     load_record,
 )
+from minegs.train.staging import stage_dataset
 
 
 class LocalHandle(RunHandle):
@@ -51,7 +53,7 @@ class LocalRunner(Runner):
     name = "local"
 
     def submit(self, run: RunConfig) -> RunHandle:
-        run, _manifest, profile, record = self.prepare(run)
+        run, manifest, profile, record = self.prepare(run)
         run_dir = Path(run.run_dir)
         dataset_dir = Path(run.dataset_dir).resolve()
         backend = get_backend(run.backend or profile.backend)
@@ -64,8 +66,24 @@ class LocalRunner(Runner):
                 f"route this run to RunPod: `minegs train run {run.dataset_dir} --profile {profile.name} --runner runpod`"
             )
 
+        staged = stage_dataset(
+            dataset_dir,
+            run_dir / "staged",
+            manifest,
+            max_images=profile.max_images,
+            chunk_id=run.chunk_id,
+        )
+        record.staged = {
+            "path": "staged",
+            "n_images": len(staged.images),
+            "n_train_available": staged.n_train_available,
+            "subset": staged.subset,
+            "init_source": staged.init_source,
+            "init_points": staged.init_points,
+            "sha256": sha256_tree(staged.path, ("sparse/0/*.txt", "images/**/*", "masks/**/*")),
+        }
         if self.config.native:
-            cmd = backend.build_command(dataset_dir, work, profile, resume=run.resume)
+            cmd = backend.build_command(staged.path, work, profile, resume=run.resume)
             argv = cmd.argv
         else:
             if not docker_available():
@@ -77,7 +95,11 @@ class LocalRunner(Runner):
                     "runner image must be pinned by digest (image@sha256:...) for reproducibility (§8.2)"
                 )
             cmd = backend.build_command(
-                Path("/data/dataset"), Path("/data/run/backend_out"), profile, resume=run.resume
+                Path("/data/run/staged"),
+                Path("/data/run/backend_out"),
+                profile,
+                resume=run.resume,
+                check_trainer=False,  # the trainer lives inside the image
             )
             argv = [
                 "docker",

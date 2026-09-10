@@ -64,8 +64,14 @@ class TrainBackend(ABC):
 
     @abstractmethod
     def build_command(
-        self, dataset_dir: Path, out_dir: Path, profile: Profile, resume: bool = False
-    ) -> TrainCommand: ...
+        self,
+        dataset_dir: Path,
+        out_dir: Path,
+        profile: Profile,
+        resume: bool = False,
+        **kwargs: object,
+    ) -> TrainCommand:
+        """``dataset_dir`` is the *staged* dataset written by ``minegs.train.staging``."""
 
     @abstractmethod
     def normalize_outputs(

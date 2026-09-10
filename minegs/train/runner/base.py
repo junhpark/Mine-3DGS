@@ -25,6 +25,17 @@ from minegs.core.provenance import ProvenanceRecord, make_id, sha256_tree, stamp
 from minegs.train.backends import get_backend
 from minegs.train.profiles import Profile, load_profile
 
+# Everything the trainer can see (§9): manifest, sparse model, init points, images, masks,
+# centerline. A changed image changes the hash. raw/ is not part of the dataset.
+DATASET_HASH_PATTERNS = (
+    "manifest.json",
+    "sparse/0/*.txt",
+    "init_points.ply",
+    "images/**/*",
+    "masks/**/*",
+    "centerline.csv",
+)
+
 
 class RunStatus(str, Enum):
     PENDING = "pending"
@@ -82,6 +93,7 @@ class RunRecord(VersionedModel):
     command: list[str] = Field(default_factory=list)
     status: RunStatus = RunStatus.PENDING
     T_local_from_internal: list[list[float]] | None = None  # Sim3 4x4 (scale-bearing)
+    staged: dict[str, Any] = Field(default_factory=dict)  # images used, subset flag, init source
     T_tls_from_local: list[list[float]] | None = None
     frame_of_outputs: str = "LOCAL_METRIC"
     outputs: list[str] = Field(default_factory=list)
@@ -158,9 +170,7 @@ class Runner(ABC):
         record = RunRecord(
             run_id=run.run_id,
             dataset_id=manifest.dataset_id,
-            dataset_hash=sha256_tree(
-                dataset_dir, ("manifest.json", "sparse/0/*.txt", "init_points.ply")
-            ),
+            dataset_hash=sha256_tree(dataset_dir, DATASET_HASH_PATTERNS),
             chunk_id=run.chunk_id,
             backend={"name": backend.name, "version": backend.version()},
             profile=profile.model_dump(mode="json"),

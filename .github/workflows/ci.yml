@@ -34,15 +34,22 @@ jobs:
           minegs dataset validate /tmp/syn/dataset
           minegs eval protocol /tmp/syn/dataset
 
-  docker-cpu:
-    # Only checks that the CPU Dockerfile parses/builds; the GPU image is built and pinned manually (§8.2).
+  dockerfiles:
+    # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the
+    # action's recursive **/Dockerfile glob does not match). The GPU image is built and pinned
+    # by digest manually (§8.2); CI only lints.
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Lint Dockerfiles
+      - name: hadolint docker/Dockerfile.gpu
         uses: hadolint/hadolint-action@v3.1.0
         with:
-          recursive: true
+          dockerfile: docker/Dockerfile.gpu
+          failure-threshold: warning
+          ignore: DL3008,DL3013,DL3042
+      - name: hadolint docker/Dockerfile.cpu
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile.cpu
+          failure-threshold: warning
           ignore: DL3008,DL3013,DL3042

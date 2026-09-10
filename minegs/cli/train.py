@@ -31,17 +31,26 @@ def command(
     backend: str = typer.Option("gsplat"),
     out_dir: Path = typer.Option(Path("/data/run/backend_out")),
 ) -> None:
-    """Print the backend command a run would execute (dry run, no GPU needed)."""
+    """Print the backend command a run would execute (dry run, no GPU / trainer needed).
+
+    The real run points the trainer at a *staged* copy (runs/<id>/staged) with the profile's
+    image subset and init_points.ply as points3D — see minegs.train.staging.
+    """
     from minegs.train.backends import get_backend
     from minegs.train.profiles import load_profile
 
     def go() -> None:
         be = get_backend(backend)
         prof = load_profile(profile)
-        cmd = be.build_command(dataset_dir, out_dir, prof)
+        cmd = be.build_command(dataset_dir, out_dir, prof, check_trainer=False)
         console.print(" ".join(cmd.argv))
         console.print(
-            f"T_local_from_internal identity={cmd.T_local_from_internal.is_identity()}  capabilities={be.resolve_requests(prof)}"
+            f"[dim]data_dir above is the staged dataset at run time; "
+            f"max_images={prof.max_images} applied by staging[/]"
+        )
+        console.print(
+            f"T_local_from_internal identity={cmd.T_local_from_internal.is_identity()}  "
+            f"capabilities={be.resolve_requests(prof)}"
         )
 
     run_guarded(go)
@@ -111,16 +120,15 @@ def logs(run_dir: Path = typer.Argument(...), tail: int = typer.Option(50)) -> N
 @app.command()
 def fetch(run_dir: Path = typer.Argument(...), config: Path | None = typer.Option(None)) -> None:
     """Pull artifacts of a RunPod run into run_dir (local runs are already in place)."""
-    from minegs.train.runner import sync
-    from minegs.train.runner.base import RunnerConfig, load_record
+    from minegs.train.runner.base import load_record
 
     def go() -> None:
         rec = load_record(run_dir)
         if rec.runner == "local":
             console.print(f"local run; outputs: {rec.outputs}")
             return
-        rcfg = RunnerConfig.load(config) if config else RunnerConfig(runner="runpod")
-        sync.pull(f"{rcfg.sync.get('remote', '')}/runs/{rec.run_id}", run_dir)
-        console.print(f"pulled -> {run_dir}")
+        from minegs.core.errors import NotYetImplementedError
+
+        raise NotYetImplementedError("fetching RunPod run artifacts", "1")
 
     run_guarded(go)

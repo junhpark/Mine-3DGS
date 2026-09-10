@@ -49,6 +49,14 @@ RUN pip install --upgrade pip \
     && pip install torch==${TORCH_VERSION} --index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
     && pip install gsplat==${GSPLAT_VERSION}
 
+# The trainer is NOT part of the PyPI package: gsplat ships it as examples/simple_trainer.py
+# in the repository, with its own requirements (pycolmap fork, nerfview, fused-ssim, ...).
+# Pin the checkout to the same version as the wheel; minegs invokes it via MINEGS_GSPLAT_TRAINER.
+RUN git clone --depth 1 --branch v${GSPLAT_VERSION} https://github.com/nerfstudio-project/gsplat.git /opt/gsplat \
+    && pip install -r /opt/gsplat/examples/requirements.txt \
+    && python /opt/gsplat/examples/simple_trainer.py default --help > /dev/null
+ENV MINEGS_GSPLAT_TRAINER=/opt/gsplat/examples/simple_trainer.py
+
 WORKDIR /opt/minegs
 COPY pyproject.toml README.md ./
 COPY minegs ./minegs

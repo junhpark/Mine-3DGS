@@ -1,18 +1,26 @@
 """gsplat adapter (§8.1) — v0.1's only backend.
 
-Phase 0: a pinned wrapper around ``gsplat``'s ``simple_trainer.py``; long-term a thin
-``MineGSTrainer`` on the gsplat library. Two frame-related duties:
+Executable contract (verified against gsplat v1.5.3 upstream):
 
-1. The dataset's ``sparse/0`` is already LOCAL_METRIC. We pass ``--no-normalize_world_space``
-   so BACKEND_INTERNAL == LOCAL_METRIC and the exported PLY needs no inverse transform.
-2. If a profile insists on ``normalize_world_space: true`` we recompute the exact
-   normalisation gsplat applies (``similarity_from_cameras`` + ``align_principle_axes``,
-   re-implemented in ``gsplat_normalization``) and invert it on export. Either way
-   ``run.json`` records ``T_local_from_internal``.
+* The trainer is ``examples/simple_trainer.py`` in the gsplat *repository*, not a module of
+  the PyPI wheel. ``docker/Dockerfile.gpu`` clones the tag matching the wheel to
+  ``/opt/gsplat`` and exports ``MINEGS_GSPLAT_TRAINER``; ``build_command`` refuses to build a
+  command when that script cannot be located (env var, or the image default path).
+* Sub-commands are ``default`` / ``mcmc`` (the densification strategy). ``absgrad`` is a
+  field of ``DefaultStrategy`` (``--strategy.absgrad``), not a top-level flag.
+* The COLMAP parser *writes* ``images_<factor>_png`` next to ``images/`` when a downscaled
+  folder is missing, so the trainer must be pointed at a writable **staged** copy of the
+  dataset (``minegs.train.staging``), never at the read-only dataset mount.
+
+Frame duties: we pass ``--no-normalize_world_space`` so BACKEND_INTERNAL == LOCAL_METRIC.
+If a profile insists on ``normalize_world_space: true`` we recompute gsplat's normalisation
+(``similarity_from_cameras`` + ``align_principle_axes``, re-implemented below) and invert it
+on export. Either way ``run.json`` records ``T_local_from_internal``.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -26,10 +34,30 @@ from minegs.train.backends.base import BackendCapabilities, TrainBackend, TrainC
 from minegs.train.profiles import Profile
 
 PINNED_GSPLAT = "1.5.3"
+TRAINER_ENV = "MINEGS_GSPLAT_TRAINER"
+TRAINER_IMAGE_PATH = "/opt/gsplat/examples/simple_trainer.py"  # set in docker/Dockerfile.gpu
+STRATEGIES = ("default", "mcmc")
+
+
+def locate_trainer(require: bool = True) -> Path | None:
+    """Path of gsplat's ``examples/simple_trainer.py`` (env override, else image default)."""
+    cand = Path(os.environ.get(TRAINER_ENV, TRAINER_IMAGE_PATH))
+    if cand.exists():
+        return cand
+    if require:
+        raise ContractError(
+            f"gsplat trainer not found at {cand} (the PyPI wheel does not ship it). Run inside "
+            f"docker/Dockerfile.gpu, or clone gsplat v{PINNED_GSPLAT} and set {TRAINER_ENV}="
+            "<repo>/examples/simple_trainer.py"
+        )
+    return None
 
 
 class GsplatBackend(TrainBackend):
     name = "gsplat"
+
+    def __init__(self, trainer: Path | None = None) -> None:
+        self._trainer = trainer
 
     def version(self) -> str:
         try:
@@ -54,16 +82,27 @@ class GsplatBackend(TrainBackend):
         )
 
     def build_command(
-        self, dataset_dir: Path, out_dir: Path, profile: Profile, resume: bool = False
+        self,
+        dataset_dir: Path,
+        out_dir: Path,
+        profile: Profile,
+        resume: bool = False,
+        trainer: Path | None = None,
+        check_trainer: bool = True,
     ) -> TrainCommand:
+        """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
         enabled = self.resolve_requests(profile)
         args = dict(profile.backend_args)
-        strategy = args.pop("strategy", "default")
+        strategy = str(args.pop("strategy", "default"))
+        if strategy not in STRATEGIES:
+            raise ContractError(f"gsplat strategy must be one of {STRATEGIES}, got {strategy!r}")
         normalize = bool(args.pop("normalize_world_space", False))
+        script = trainer or self._trainer
+        if script is None:
+            script = locate_trainer(require=check_trainer) or Path(TRAINER_IMAGE_PATH)
         argv = [
             "python",
-            "-m",
-            "gsplat.examples.simple_trainer",
+            str(script),
             strategy,
             "--data_dir",
             str(dataset_dir),
@@ -74,19 +113,23 @@ class GsplatBackend(TrainBackend):
             "--max_steps",
             str(profile.max_steps),
             "--normalize_world_space" if normalize else "--no-normalize_world_space",
+            "--disable_viewer",
         ]
-        # profile.max_images is *not* a gsplat flag: the light profile's image subset is
-        # produced by writing a reduced sparse/0 (Phase 0D, runner side), never by the trainer.
+        # profile.max_images is applied by minegs.train.staging (image subset written into the
+        # staged dataset), never by the trainer.
         for cap, flag in (
             ("appearance_embedding", "--app_opt"),
             ("bilateral_grid", "--use_bilateral_grid"),
             ("depth_loss", "--depth_loss"),
             ("antialiasing", "--antialiased"),
-            ("absgrad", "--absgrad"),
             ("pose_refinement", "--pose_opt"),
         ):
             if enabled.get(cap):
                 argv.append(flag)
+        if enabled.get("absgrad"):
+            if strategy != "default":
+                raise ContractError("absgrad is a DefaultStrategy option; not available with mcmc")
+            argv.append("--strategy.absgrad")
         for k, v in args.items():
             if isinstance(v, bool):
                 argv.append(f"--{k}" if v else f"--no-{k}")

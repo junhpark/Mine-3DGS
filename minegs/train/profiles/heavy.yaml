@@ -2,7 +2,7 @@ schema_version: "1.0"
 name: heavy
 description: Full-quality run — all images (or one chunk), half/full resolution, 30k iters (§8.3).
 backend: gsplat
-default_runner: runpod
+default_runner: runpod             # Phase 1 — not runnable yet; pass --runner local for now
 max_images: null
 data_factor: 2
 max_steps: 30000
