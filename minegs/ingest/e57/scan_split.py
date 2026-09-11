@@ -56,15 +56,24 @@ def split_scans(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    inv = inventory(path)
+    inv = inventory(path, compute_hash=False)
     written = []
     for s in inv.scans:
-        if indices is not None and s.index not in indices:
+        if indices is not None and s.scan_index not in indices:
             continue
-        pc, pose = read_scan(path, s.index, voxel_m)
-        p = write_ply(pc, out_dir / f"S{s.index + 1:02d}.ply")
-        (out_dir / f"S{s.index + 1:02d}.pose.json").write_text(
-            json.dumps({"T_tls_from_scanner": pose.to_list(), "guid": s.guid}, indent=2)
+        pc, pose = read_scan(path, s.scan_index, voxel_m)
+        p = write_ply(pc, out_dir / f"{s.scan_id}.ply")
+        # The E57's own coordinates are SOURCE until a later phase declares TLS_GLOBAL (§3).
+        (out_dir / f"{s.scan_id}.pose.json").write_text(
+            json.dumps(
+                {
+                    "scan_id": s.scan_id,
+                    "scan_index": s.scan_index,
+                    "guid": s.guid,
+                    "T_source_from_scanner": pose.to_list(),
+                },
+                indent=2,
+            )
         )
         written.append(p)
     return written

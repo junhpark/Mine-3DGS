@@ -21,7 +21,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | Phase | 이름 | 상태 |
 |---|---|---|
 | 0A | Foundation & Contract Freeze | **implemented, G1 통과** — PR #1 이 closeout |
-| 0B | Real E57 Ingest | implemented (인터페이스+로직), **not validated** — 실제 E57 필요 |
+| 0B | Real E57 Ingest | **0B.1 implemented** (inventory·scan 계약), 0B.2/0B.3 미착수, **not validated** — 실제 E57 필요 |
 | 0C | Metric Dataset Golden Gate | implemented, **not validated** — Golden Gate 미수행 |
 | 0D | Local GS Baseline | implemented (어댑터·스테이징·러너), **not validated** — GPU 학습 미수행 |
 | 1 | Metric Surface & Evaluation | 부분 implemented (지표·단면·체적), surface 추출 미구현 |
@@ -72,17 +72,37 @@ heavy profile 실행, 논문급 형상 검증, multi-epoch 검증.
 
 ### Phase 0B — Real E57 Ingest
 
-실제 E57 파일 구조를 안전하게 해석한다.
+실제 E57 파일 구조를 안전하게 해석한다. 세 개의 PR 로 나눈다.
 
-**범위**: inventory, scan enumeration, station mapping, scan 추출/분리, pose 추출,
-PanoSource 탐지, embedded/external/vendor 파노라마 매핑, 대용량은 PDAL.
+| 하위 | 범위 | 상태 |
+|---|---|---|
+| **0B.1** | inventory, scan enumeration, scan/station 계약, pose 검사, CLI 리포트 | implemented (PR #2), **not validated** |
+| **0B.2** | PanoSource 탐지, station↔panorama 매핑 계약 | 미착수 |
+| **0B.3** | scan 추출/분리, pose 추출, 대용량 PDAL 경로, 실데이터 closeout | 미착수 |
 
 **하지 않을 것**: 3DGS 학습, 형상 평가, cloud.
+
+**0B.1 원칙 — inspection first, interpretation second.** E57 구조를 가정하지 않는다.
+scan 하나가 station 하나라고, 모든 scan 에 pose·RGB·이름·GUID 가 있다고, 파노라마가 파일 안에
+있다고, 좌표가 TLS_GLOBAL 이라고 가정하지 않는다. 없는 것은 `None` 으로 기록하고 이유를 남긴다.
+
+* **식별자**: `scan_000`, `S000` 은 파일 순서와 무관하게 minegs 안에서 결정적이다. vendor GUID 는
+  있으면 함께 보존하되 identity 로 삼지 않는다.
+* **좌표**: E57 자체 좌표는 `SOURCE` 다. `T_source_from_scan` 처럼 방향을 이름에 적는다.
+  TLS_GLOBAL 선언과 LOCAL_METRIC 변환은 dataset materialization(0C) 의 몫이다.
+* **pose**: 없으면 `None`, 있으면 검증(finite·orthonormal·det ≈ +1·unit quaternion)한다.
+  잘못된 pose 를 identity 로 바꾸지 않는다. 반올림된 회전(4~6자리)은 문제가 아니라 note 로 구분하고,
+  변환용으로 orthonormalise 했다는 사실과 편차를 함께 기록한다.
+* **메모리**: header 만 읽는다. point count 는 `points.childCount()`, bounds 는 header 값이므로
+  inventory 비용이 점군 크기에 비례하지 않는다.
+* **station**: `mapping_status = inferred_from_scan`. 확정은 0B.2 가 파노라마 근거로 한다.
 
 **Gate (G2)**: 실제 E57 소구간 ingest 성공. 산출물 — scan/station inventory, pose table,
 파노라마 매핑 리포트, 추출 point cloud 샘플, provenance.
 
-실제 E57 데이터가 없으면 Phase complete 로 선언하지 않는다.
+실제 E57 데이터가 없으면 Phase complete 로 선언하지 않는다. 0B.1 은 합성·fake·test-time 생성
+E57 로만 검증되었고, 사용자의 실제 파일에서 `minegs ingest e57 inventory` 를 돌려 확인하기 전까지
+**0B.1 도 validated 가 아니다.**
 
 ### Phase 0C — Metric Dataset Golden Gate
 
@@ -288,6 +308,8 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
 | surface 추출(depth 렌더·TSDF) | `NotYetImplementedError` | 미구현 | Phase 1 |
+| 매핑 없는 `E57Embedded` 파노라마 | `ContractError` | station↔panorama 추론은 증거가 필요하다 | Phase 0B.2 |
+| 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |
 | `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 4 |
 | `inria` backend | `ContractError` | non-commercial 라이선스 | 해당 없음 |

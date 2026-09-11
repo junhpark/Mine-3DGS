@@ -31,7 +31,7 @@ minegs/
                  frames(SE3/Sim3), centerline, chunking, provenance
     ingest/
       common/    geometry, equirect, colmap_io               ← 두 경로가 공유
-      e57/       inventory(pye57), scan_split(pye57), tiles(PDAL), pose_to_colmap,
+      e57/       inventory+models+exceptions (SOURCE 프레임 계약), scan_split(pye57), tiles(PDAL), pose_to_colmap,
                  pano/  PanoSource 어댑터: E57Embedded · ExternalJpeg · VendorExport
       video/     frames(ffmpeg), dedup_blur, masks,
                  sfm/   SfMBackend: COLMAPIncremental · COLMAPGlobal · (exp) GLUEMAP

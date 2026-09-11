@@ -96,6 +96,26 @@ def git_commit(repo_root: str | Path | None = None) -> str:
         return "unknown"
 
 
+def _package_version(name: str) -> str | None:
+    """Version of an installed package.
+
+    Prefer installed metadata: some packages (pye57) bind ``__version__`` to a *module*, and
+    ``str()`` on that leaks a local filesystem path into the provenance record.
+    """
+    from importlib import metadata
+
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        pass
+    mod = importlib.import_module(name)
+    v = getattr(mod, "__version__", None)
+    if isinstance(v, str):
+        return v
+    inner = getattr(v, "__version__", None)  # module-shaped __version__
+    return inner if isinstance(inner, str) else None
+
+
 _TOOLS = (
     "numpy",
     "scipy",
@@ -114,10 +134,11 @@ def tool_versions(extra: dict[str, str] | None = None) -> dict[str, str]:
     out: dict[str, str] = {"python": platform.python_version(), "minegs": minegs.__version__}
     for name in _TOOLS:
         try:
-            mod = importlib.import_module(name)
-            out[name] = str(getattr(mod, "__version__", "?"))
-        except Exception:
+            v = _package_version(name)
+        except Exception:  # absent optional dependency is the normal case
             continue
+        if v is not None:
+            out[name] = v
     for cmd in ("colmap", "ffmpeg", "pdal", "rclone"):
         v = _cli_version(cmd)
         if v:
