@@ -9,6 +9,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # report every Python, not just the first to fail
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
@@ -17,10 +18,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install (core + dev only — no GPU / no native deps in CI)
+      - name: Install (core + dev + e57 — no GPU, no other native deps in CI)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # The e57 extra is pye57 only (wheels for 3.10-3.12), so the reader is covered by
+          # real libE57 round trips in CI. PDAL is a separate extra: its bindings compile
+          # against the PDAL C++ library and cannot be pip-installed on a bare runner.
+          pip install -e ".[dev,e57]"
       - name: Lint
         run: ruff check .
       - name: Format check
@@ -33,6 +37,20 @@ jobs:
           minegs dataset synthetic /tmp/syn --length-m 60 --n-stations 4
           minegs dataset validate /tmp/syn/dataset
           minegs eval protocol /tmp/syn/dataset
+          # E57 inventory against a real (tiny) E57 written here, not a committed fixture
+          python -c "
+          import numpy as np, pye57
+          f = pye57.E57('/tmp/smoke.e57', mode='w')
+          f.write_scan_raw({'cartesianX': np.zeros(4), 'cartesianY': np.zeros(4), 'cartesianZ': np.zeros(4)}, name='Smoke', translation=np.array([1.0, 2.0, 3.0]))
+          f.close()"
+          minegs ingest e57 inventory /tmp/smoke.e57 --json /tmp/inventory.json
+          python -c "
+          import json; d = json.load(open('/tmp/inventory.json'))
+          assert d['scan_count'] == 1, d
+          assert d['scans'][0]['scan_id'] == 'scan_000'
+          assert d['station_candidates'][0]['mapping_status'] == 'inferred_from_scan'
+          assert d['scans'][0]['pose']['source_frame'] == 'SOURCE'
+          print('e57 inventory smoke ok')"
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

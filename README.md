@@ -21,7 +21,8 @@ TLS(E57)·영상(일반/360) 두 입력 경로 → 하나의 데이터셋 계약
 
 ```bash
 pip install -e ".[dev]"          # 코어 + 테스트 (CPU, 순수 numpy/scipy)
-pip install -e ".[e57]"          # pye57, PDAL            (§6.1)
+pip install -e ".[e57]"          # pye57 — E57 읽기      (§6.1)
+pip install -e ".[pdal]"         # PDAL 대용량 타일링 — PDAL C++ 라이브러리 별도 필요 (§6.1)
 pip install -e ".[video]"        # OpenCV, pycolmap       (§6.2, COLMAP ≥ 4.0 바이너리 별도)
 pip install -e ".[viz]"          # Viser 뷰어             (§12)
 pip install -e ".[train]"        # torch + gsplat — 보통은 docker/Dockerfile.gpu 사용
@@ -57,7 +58,7 @@ minegs/
   core/      config(schema_version + migration) · manifest · frames(SE3/Sim3) · centerline · chunking · provenance · pointcloud(PLY) · synthetic
   ingest/
     common/  geometry(PanoConvention) · equirect(링 크롭) · colmap_io(rigs.txt/frames.txt 포함)
-    e57/     inventory · scan_split · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
+    e57/     inventory+models+exceptions(0B.1 계약) · scan_split · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
     video/   frames(ffmpeg) · dedup_blur · masks · rig(360 → COLMAP rig) · sfm/{COLMAPIncremental,COLMAPGlobal,GLUEMAP(exp)}
   train/     staging(쓰기 가능 복사본 + max_images 서브셋 + init_points→points3D)
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
@@ -71,6 +72,40 @@ configs/     dataset/{e57,video,video360}.yaml · eval/geometry_holdout.yaml · 
 docs/        ARCHITECTURE.md(invariant) · ROADMAP.md(Phase·Gate·DoD)
 data/        (git 제외) <dataset_id>/{raw,dataset,runs,eval,export}
 ```
+
+## 실제 E57 검사 (Phase 0B.1)
+
+E57 파일이 실제로 무엇을 담고 있는지 **점군을 읽지 않고** 조사한다.
+
+비용은 두 부분으로 나뉜다. **메타데이터 파싱은 O(scan 수)** 이고 점 배열을 전혀 적재하지 않으므로
+수십 GB 파일에서도 메모리를 쓰지 않는다. 반면 **provenance 용 SHA-256 은 O(파일 크기)** 다 —
+1 MB 씩 스트리밍하므로 메모리는 일정하지만, 50 GB 스캔이면 50 GB 를 읽는 시간이 든다.
+빠르게 훑어보려면 `--no-hash` 를 쓴다(리포트에 건너뛴 사실이 기록된다).
+
+```bash
+pip install -e ".[e57]"          # pye57 만 있으면 된다 (휠 제공, 네이티브 빌드 불필요)
+
+# Linux / macOS
+minegs ingest e57 inventory /data/scan/tunnel.e57
+
+# Windows (PowerShell / cmd)
+minegs ingest e57 inventory D:\scan\tunnel.e57
+
+# 결과를 JSON 으로도 저장 (Phase 0B.2 로 넘길 입력)
+minegs ingest e57 inventory D:\scan\tunnel.e57 --json inventory.json
+
+# SHA-256(O(파일 크기))을 건너뛰고 메타데이터만 빠르게 훑어보기 — 리포트에 건너뛴 사실이 남는다
+minegs ingest e57 inventory D:\scan\tunnel.e57 --no-hash
+```
+
+리포트는 scan 마다 다음을 그대로 보여준다: 결정적 식별자(`scan_000` / 후보 station `S000`),
+점 개수, Cartesian·spherical·RGB·intensity·row/column 존재 여부, pose 상태, header bounds.
+파일 수준 문제(예: 유효하지 않은 pose 를 선언한 scan)와 관찰(예: pose 가 전부 identity)을
+구분해 마지막에 모아 출력한다.
+
+**이 명령이 하지 않는 것**: 파노라마를 꺼내거나 station 에 연결하지 않고(Phase 0B.2),
+점군을 추출하지 않으며(Phase 0B.3), E57 좌표를 TLS_GLOBAL 이라고 선언하지 않는다.
+pose 는 파일 자신의 `SOURCE` 프레임에 있는 `T_source_from_scan` 으로 보고된다.
 
 ## 데이터셋 계약 (§4)
 
@@ -140,7 +175,7 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 | Phase | 상태 |
 |---|---|
 | 0A Foundation & Contract Freeze | **implemented + G1 통과** — 이 PR 이 closeout |
-| 0B Real E57 ingest | implemented, **not validated** (실제 E57 소구간 필요) |
+| 0B Real E57 ingest | **0B.1 implementation in progress** (inventory·scan/station 계약), 0B.2 파노라마 매핑·0B.3 추출 미착수, **not validated** — 실제 E57 필요 |
 | 0C Metric dataset golden gate | implemented, **not validated** (재투영 오버레이·Viser 정합 미수행) |
 | 0D Local GS baseline | implemented, **not validated** (GPU 학습 미수행) |
 | 1 Metric surface & evaluation | 부분 — 양방향 지표·단면·체적 구현, surface 추출(depth/TSDF) 미구현 |

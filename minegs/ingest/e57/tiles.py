@@ -73,7 +73,12 @@ def run_pipeline(pipeline: dict[str, Any], workdir: str | Path | None = None) ->
         pass
     exe = shutil.which("pdal")
     if not exe:
-        raise MissingDependencyError("pdal", "e57", "PDAL tiling")
+        raise MissingDependencyError(
+            "pdal",
+            "pdal",
+            "PDAL tiling (the bindings also need the PDAL C++ library: conda/apt, or "
+            "docker/Dockerfile.cpu)",
+        )
     wd = Path(workdir or ".")
     pf = wd / "pipeline.json"
     pf.write_text(json.dumps(pipeline, indent=2))

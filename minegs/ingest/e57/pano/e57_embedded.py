@@ -10,7 +10,7 @@ from PIL import Image
 
 from minegs.core.errors import ContractError
 from minegs.ingest.common.geometry import PanoConvention
-from minegs.ingest.e57.inventory import _pye57, inventory
+from minegs.ingest.e57.inventory import _pye57, inventory, list_images2d
 from minegs.ingest.e57.pano.base import PanoRecord, PanoSource, read_mapping
 
 
@@ -23,28 +23,36 @@ class E57Embedded(PanoSource):
     ) -> None:
         self.path = Path(e57_path)
         self.convention = convention or PanoConvention(source="E57Embedded")
-        self.inv = inventory(self.path)
+        self.inv = inventory(self.path, compute_hash=False)
+        self.images = list_images2d(self.path)
         self.mapping = read_mapping(mapping) if mapping else None
 
     def list_panoramas(self) -> list[PanoRecord]:
-        recs = []
-        if self.mapping:
-            by_name = {im.name: im for im in self.inv.images}
-            by_idx = {str(im.index): im for im in self.inv.images}
-            for sid, pid in self.mapping.items():
-                im = by_name.get(pid) or by_idx.get(pid)
-                if im is None:
-                    raise ContractError(f"pano {pid!r} for station {sid!r} not in E57")
-                recs.append(PanoRecord(sid, str(im.index), im.width, im.height))
-            return recs
-        for s_idx, im_idx in self.inv.station_pano_map().items():
-            if im_idx is not None:
-                im = self.inv.images[im_idx]
-                recs.append(PanoRecord(f"S{s_idx + 1:02d}", str(im.index), im.width, im.height))
-        if not recs:
+        """Station -> panorama records.
+
+        Requires an explicit ``station_id,pano_id`` mapping. Phase 0B.1 deliberately stops at
+        *detecting* images: inferring which panorama belongs to which station from GUIDs or
+        file order is the Phase 0B.2 contract, and guessing it here would be exactly the
+        vendor assumption the ingest path must not make.
+        """
+        if not self.images:
             raise ContractError(
-                f"{self.path}: no embedded panoramas; use ExternalJpeg/VendorExport"
+                f"{self.path}: no embedded images2D entries; use ExternalJpeg/VendorExport"
             )
+        if not self.mapping:
+            raise ContractError(
+                f"{self.path}: an explicit station_id,pano_id mapping is required. Automatic "
+                "station/panorama mapping is Phase 0B.2 (docs/ROADMAP.md); run "
+                "`minegs ingest e57 inventory` to see the available scans and images."
+            )
+        by_name = {im["name"]: im for im in self.images if im.get("name")}
+        by_idx = {str(im["index"]): im for im in self.images}
+        recs = []
+        for sid, pid in self.mapping.items():
+            im = by_name.get(pid) or by_idx.get(pid)
+            if im is None:
+                raise ContractError(f"pano {pid!r} for station {sid!r} not in E57")
+            recs.append(PanoRecord(sid, str(im["index"]), im.get("width"), im.get("height")))
         return recs
 
     def load(self, pano_id: str) -> np.ndarray:

@@ -15,12 +15,130 @@ app.add_typer(video_app, name="video")
 
 @e57_app.command("inventory")
 def e57_inventory(
-    file: Path = typer.Argument(...), out: Path | None = typer.Option(None, help="Write JSON")
+    file: Path = typer.Argument(..., help="Path to the .e57 file"),
+    json_out: Path | None = typer.Option(
+        None, "--json", help="Also write the full machine-readable report here"
+    ),
+    no_hash: bool = typer.Option(
+        False,
+        "--no-hash",
+        help="Skip the SHA-256 (faster on very large files; recorded as skipped)",
+    ),
 ) -> None:
-    """List scans / embedded panoramas / poses (header only, pye57)."""
+    """Inspect an E57: how many scans, what each declares, whether poses are usable.
+
+    Reads header metadata only — no point data is loaded, so this is fast and safe on
+    multi-gigabyte files. It reports what the file *declares*; it does not interpret the
+    coordinates as TLS_GLOBAL and does not map panoramas to stations (Phase 0B.2).
+    """
     from minegs.ingest.e57.inventory import inventory
 
-    run_guarded(lambda: dump_json(inventory(file), out))
+    def go() -> None:
+        inv = inventory(file, compute_hash=not no_hash)
+        _print_inventory(inv)
+        if json_out:
+            inv.save(json_out)
+            console.print(f"\nwrote {json_out}")
+
+    run_guarded(go)
+
+
+def _yn(value: bool) -> str:
+    return "[green]yes[/]" if value else "[dim]no[/]"
+
+
+def _pose_label(scan) -> str:
+    """Render pose_status. "declared but unreadable" must never read as "none declared"."""
+    if scan.pose_status == "absent":
+        return "[dim]none declared[/]"
+    if scan.pose_status == "unreadable":
+        return "[red]DECLARED BUT UNREADABLE[/] (the file has a pose node we could not parse)"
+    if scan.pose_status == "invalid":
+        issues = "; ".join(scan.pose.validation.issues) if scan.pose else "validation failed"
+        return f"[red]INVALID[/] ({issues})"
+    if scan.pose_status == "identity":
+        return "[yellow]identity[/] (file declares no displacement for this scan)"
+    t = scan.pose.translation_m
+    return f"[green]yes[/]  translation = ({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}) m"
+
+
+def _print_inventory(inv) -> None:
+    """Block-per-scan report: stays readable at any terminal width and for any scan count."""
+    f = inv.file
+    console.print(f"[bold]E57 file:[/] {f.file_name}")
+    console.print(f"  path:   {f.path}")
+    console.print(f"  size:   {f.size_bytes:,} bytes ({f.size_bytes / 1e9:.2f} GB)")
+    if f.sha256:
+        console.print(f"  sha256: {f.sha256}")
+    else:
+        console.print(f"  sha256: [yellow]not computed[/] ({f.hash_skipped_reason})")
+    if f.e57_library_version:
+        console.print(f"  writer: {f.e57_library_version}")
+    if f.coordinate_metadata:
+        console.print(f"  coordinate metadata: {f.coordinate_metadata}")
+    console.print(
+        f"[bold]Scans:[/] {inv.scan_count}   "
+        f"[dim](usable as declared: {inv.usable_scan_count()})[/]"
+    )
+
+    for station, s in zip(inv.station_candidates, inv.scans, strict=True):
+        console.print(f"\n[bold]Scan {station.station_id}[/]")
+        console.print(f"  scan_id:       {s.scan_id}")
+        if s.name:
+            console.print(f"  name:          {s.name}")
+        if s.guid:
+            console.print(f"  guid:          {s.guid}")
+        console.print(
+            f"  points:        {s.point_count:,}"
+            if s.point_count is not None
+            else "  points:        [dim]not declared[/]"
+        )
+        console.print(f"  Cartesian XYZ: {_yn(s.has_cartesian_xyz)}")
+        console.print(f"  Spherical:     {_yn(s.has_spherical)}")
+        console.print(f"  RGB:           {_yn(s.has_rgb)}")
+        console.print(f"  Intensity:     {_yn(s.has_intensity)}")
+        console.print(f"  Row/column:    {_yn(s.has_row_column)}")
+        console.print(f"  Pose:          {_pose_label(s)}")
+        if s.bounds is not None and s.bounds.valid:
+            dx, dy, dz = s.bounds.extent()
+            console.print(
+                f"  Bounds extent: {dx:.2f} x {dy:.2f} x {dz:.2f} m ({s.bounds.source_field})"
+            )
+        for msg in s.issues:
+            console.print(f"  [red]problem:[/] {msg}")
+        for msg in s.notes:
+            console.print(f"  [yellow]note:[/] {msg}")
+
+    console.print(
+        "\n[bold]Images:[/] "
+        + (
+            f"images2D present with {inv.images.image_count} entries"
+            if inv.images.has_images2d and inv.images.image_count is not None
+            else "images2D present but the entry count could not be read"
+            if inv.images.has_images2d
+            else "no images2D structure"
+        )
+        + " [dim]— detected only; station/panorama mapping is Phase 0B.2[/]"
+    )
+    console.print(
+        f"[bold]Station candidates:[/] {len(inv.station_candidates)}, one per scan, "
+        "status [yellow]inferred_from_scan[/] [dim](unconfirmed until Phase 0B.2)[/]"
+    )
+    console.print(
+        "[dim]Poses are in the file's own SOURCE frame. Declaring them TLS_GLOBAL is a later "
+        "decision (docs/ARCHITECTURE.md §3).[/]"
+    )
+
+    if inv.issues:
+        console.print("\n[bold red]Problems[/]")
+        for msg in inv.issues:
+            console.print(f"  [red]•[/] {msg}")
+    if inv.notes:
+        console.print("\n[bold]Notes[/]")
+        for msg in inv.notes:
+            console.print(f"  [yellow]•[/] {msg}")
+    if not inv.has_any_issue():
+        console.print("\n[green]No problems detected.[/]")
 
 
 @e57_app.command("split")
