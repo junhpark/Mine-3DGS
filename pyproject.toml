@@ -31,8 +31,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 6.1 E57 (TLS) ingest — CPU runtime (native or docker/Dockerfile.cpu)
-e57 = ["pye57>=0.4", "pdal>=3.2"]
+# 6.1 E57 (TLS) reader — pure pip, wheels on Linux/macOS/Windows for 3.10-3.12
+e57 = ["pye57>=0.4"]
+# 6.1 large-cloud tiling. The `pdal` bindings COMPILE against the PDAL C++ library, so pip
+# alone is not enough: install PDAL via conda/apt first, or use docker/Dockerfile.cpu. Kept
+# out of `e57` so `pip install minegs[e57]` cannot fail on a machine without that library.
+pdal = ["pdal>=3.2"]
 # 6.2 video / 360 ingest — ffmpeg + COLMAP >= 4.0 must be on PATH or in docker/Dockerfile.cpu
 video = ["opencv-python-headless>=4.9", "pycolmap>=3.11"]
 # 8 training — GPU runtime (docker/Dockerfile.gpu). torch/gsplat versions are pinned in the image.
@@ -50,7 +54,7 @@ dev = [
   "mypy>=1.10",
   "types-PyYAML",
 ]
-all = ["minegs[e57,video,eval,viz,runpod,dev]"]
+all = ["minegs[e57,pdal,video,eval,viz,runpod,dev]"]
 
 [project.scripts]
 minegs = "minegs.cli.main:app"

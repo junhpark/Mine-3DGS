@@ -21,7 +21,8 @@ TLS(E57)·영상(일반/360) 두 입력 경로 → 하나의 데이터셋 계약
 
 ```bash
 pip install -e ".[dev]"          # 코어 + 테스트 (CPU, 순수 numpy/scipy)
-pip install -e ".[e57]"          # pye57, PDAL            (§6.1)
+pip install -e ".[e57]"          # pye57 — E57 읽기      (§6.1)
+pip install -e ".[pdal]"         # PDAL 대용량 타일링 — PDAL C++ 라이브러리 별도 필요 (§6.1)
 pip install -e ".[video]"        # OpenCV, pycolmap       (§6.2, COLMAP ≥ 4.0 바이너리 별도)
 pip install -e ".[viz]"          # Viser 뷰어             (§12)
 pip install -e ".[train]"        # torch + gsplat — 보통은 docker/Dockerfile.gpu 사용
@@ -78,7 +79,7 @@ E57 파일이 실제로 무엇을 담고 있는지 **점군을 읽지 않고** �
 수십 GB 파일에서도 빠르고 메모리를 쓰지 않는다.
 
 ```bash
-pip install -e ".[e57]"          # pye57 필요
+pip install -e ".[e57]"          # pye57 만 있으면 된다 (휠 제공, 네이티브 빌드 불필요)
 
 # Linux / macOS
 minegs ingest e57 inventory /data/scan/tunnel.e57
