@@ -21,9 +21,9 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | Phase | 이름 | 상태 |
 |---|---|---|
 | 0A | Foundation & Contract Freeze | **implemented, G1 통과** — PR #1 이 closeout |
-| 0B | Real E57 Ingest | **0B.1 implemented** (inventory·scan 계약), 0B.2/0B.3 미착수, **not validated** — 실제 E57 필요 |
+| 0B | Real E57 Ingest | **0B.1·0B.2·0B.3 implemented** (inventory·매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C | Metric Dataset Golden Gate | implemented, **not validated** — Golden Gate 미수행 |
-| 0D | Local GS Baseline | implemented (어댑터·스테이징·러너), **not validated** — GPU 학습 미수행 |
+| 0D | Local GS Baseline | implemented (어댑터·스테이징·러너), **not validated** — GPU 학습 미수행. **entry blocker 있음** (§0D) |
 | 1 | Metric Surface & Evaluation | 부분 implemented (지표·단면·체적), surface 추출 미구현 |
 | 2 | E57 End-to-End MVP | 미착수 |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
@@ -77,8 +77,8 @@ heavy profile 실행, 논문급 형상 검증, multi-epoch 검증.
 | 하위 | 범위 | 상태 |
 |---|---|---|
 | **0B.1** | inventory, scan enumeration, scan/station 계약, pose 검사, CLI 리포트 | implemented (PR #2), **not validated** |
-| **0B.2** | PanoSource 탐지, station↔panorama 매핑 계약 | 미착수 |
-| **0B.3** | scan 추출/분리, pose 추출, 대용량 PDAL 경로, 실데이터 closeout | 미착수 |
+| **0B.2** | image asset 탐지, representation 분류, 증거 기반 station↔image 매핑 계약 | implemented (PR #4), **not validated** |
+| **0B.3** | scan/image 추출, invalid-state mask, extraction manifest, staging 산출물 | implemented (PR #4), **not validated** |
 
 **하지 않을 것**: 3DGS 학습, 형상 평가, cloud.
 
@@ -104,12 +104,83 @@ scan 하나가 station 하나라고, 모든 scan 에 pose·RGB·이름·GUID 가
   **O(파일 크기)** 다(`compute_hash=False` / `--no-hash` 로 생략 가능).
 * **station**: `mapping_status = inferred_from_scan`. 확정은 0B.2 가 파노라마 근거로 한다.
 
+**0B.2 원칙 — 매핑은 추론이 아니라 증거다.** "이 파노라마는 어느 station 것인가" 에 대한
+답은 데이터가 말해 준 것만 쓴다. 틀린 매핑은 crash 하지도 warn 하지도 않는다 — 학습이 되고
+수렴까지 하는 무의미한 재구성이 나올 뿐이다.
+
+| 근거 | 출처 | status |
+|---|---|---|
+| `e57_associated_guid` | E57 자신의 `associatedData3DGuid` 가 정확히 한 scan GUID 와 연결 | `confirmed` |
+| `vendor_manifest` | 캡처 소프트웨어가 생성한 index (`vendor`·`generated_by` 선언 필수) | `confirmed` |
+| `explicit_mapping` | 사용자가 직접 작성한 CSV/JSON | `manual` |
+
+* **금지되는 근거**: scan index == image index, 개수 동일, 파일 순서, lexical sort, fuzzy
+  name matching, timestamp/EXIF 근접, 문서화되지 않은 vendor 관례, 검증된 카메라 형상 없는
+  최근접 pose. 각각에 "매핑을 만들지 않는다" 를 확인하는 회귀 테스트가 있다. 진단용 **hint**
+  로 출력하는 것은 가능하지만 `MappingRecord` 의 target 이 되지 않는다.
+* **status**: `confirmed` · `manual` · `unmapped` · `ambiguous`(하나의 근거가 여러 target) ·
+  `orphan`(근거는 있으나 target 없음) · `conflict`(근거끼리 모순). GUID 를 두 scan 이
+  선언하면 first match 가 아니라 `ambiguous` 다. 사용자 매핑이 파일 자체 근거와 다르면
+  덮어쓰기가 아니라 `conflict` 다.
+* **산출물**: `PanoMappingReport` (schema 1.0) — `E57Inventory` 에 필드를 더하지 않는다.
+  inventory 는 "파일에 무엇이 있는가", 이쪽은 "무엇이 무엇과 짝인가" 이고, 두 번째 질문은
+  새 매핑 파일로 다시 답할 수 있어야 한다.
+* **외부 이미지**: 디렉토리만으로는 매핑하지 않는다. 파일명을 station ID 로 해석하지 않는다
+  (`VendorExport` 의 `Station_03.jpg → S03` 추론도 이때 fail-closed 로 바뀌었다).
+
+**0B.3 원칙 — 처음으로 point payload 를 읽는다. 산출물은 staging 이지 dataset 이 아니다.**
+
+```
+<work_dir>/inventory.json  pano_mapping.json  extraction_manifest.json
+           scans/scan_000.ply + scan_000.pose.json
+           images/image_000.jpg
+```
+
+`dataset/` 계약으로 오인될 구조를 만들지 않는다. TLS_GLOBAL 선언, LOCAL_METRIC origin,
+train/test split, `init_points.ply`, dataset manifest 는 전부 0C 다.
+
+* **invalid-state mask**: E57 scan 은 고정 길이 record array 다. `cartesianInvalidState` 로
+  점을 지운 뒤 색을 `rgb[:len(xyz)]` 로 자르면 **첫 invalid 점 이후의 모든 색이 한 칸씩
+  밀린다** — 뷰어에서는 멀쩡해 보이고 결과만 틀린다. boolean mask 를 한 번 만들어 xyz · RGB ·
+  intensity · row/column · 나머지 유지 컬럼 **전부에 동일하게** 적용한다. 길이가 다른 컬럼은
+  하드 실패다. state 1(방향만 유효)과 2 는 모두 제거한다.
+* **색 범위**: scan 의 `colorLimits` 를 읽는다. 0..255 는 그대로, 다른 범위는 한 번 변환하고
+  **변환 사실을 manifest 에 기록**한다. 선언이 없으면 8-bit 라고 가정하지 않고 raw 로 보존한다.
+* **pose**: registered 추출(기본)은 SOURCE 프레임에 점을 놓고 usable pose 를 요구한다.
+  pose 없는 scan 은 `--raw` 를 알려주며 거부한다. `--raw` 는 SCANNER 프레임 클라우드를
+  `unregistered` 로 표시해 쓰고, 없는 pose 는 `null` 로 남긴다 — **identity 로 채우지 않는다**.
+  `unreadable`/`invalid` pose 는 양쪽 경로 모두 거부한다. 점은 `read_scan_raw` 로 읽는다:
+  `read_scan(transform=True)` 는 pye57 의 `rotation_matrix`/`translation` 으로 변환을 만들고,
+  그 둘은 pose 없는 scan 에서 identity·0 을 돌려주는 silent fallback 이다.
+* **이미지**: spherical·cylindrical embedded image 만 내보낸다. 바이트가 선언한 코덱과
+  맞는지 확인하고, 아니면 이름만 바꿔 저장하지 않고 거부한다. pinhole·visual_reference·
+  unknown 은 `skipped_images` 에 이유와 함께 기록한다 — 다른 projection 으로 재해석하지 않는다.
+  perspective crop·cubemap·ring crop·COLMAP camera·undistortion 은 여기서 하지 않는다.
+* **거부는 쓰기 전에**: 모든 preflight 가 통과한 뒤에야 파일을 쓴다. scan 세 개를 쓰고 네 번째에
+  거부하면 완성된 것처럼 보이는 staging 디렉토리가 남는다. `--overwrite` 는 이전 추출을
+  *교체*하며, 이 추출기가 쓰지 않은 파일이 있으면 지우지 않고 거부한다.
+* **대용량**: pye57 에는 chunked reader 가 없어 scan 을 통째로 읽는다. 선언된 점 개수로 추정
+  peak memory 를 note 로 보고하고, `--max-scan-points` 로 fail-closed 할 수 있다. production
+  규모 타일링은 PDAL 경로(§22 경계)의 몫이고, PDAL 은 인터페이스 + fail-closed 의존성 검사로
+  남는다 (bare pip CI 에 억지로 설치하지 않는다; 실제 PDAL 런타임 검증은 G2/manual).
+
 **Gate (G2)**: 실제 E57 소구간 ingest 성공. 산출물 — scan/station inventory, pose table,
 파노라마 매핑 리포트, 추출 point cloud 샘플, provenance.
 
-실제 E57 데이터가 없으면 Phase complete 로 선언하지 않는다. 0B.1 은 합성·fake·test-time 생성
-E57 로만 검증되었고, 사용자의 실제 파일에서 `minegs ingest e57 inventory` 를 돌려 확인하기 전까지
-**0B.1 도 validated 가 아니다.**
+실데이터로 확인할 것:
+
+```
+minegs ingest e57 inventory REAL.e57 --json inventory.json
+minegs ingest e57 pano-map  REAL.e57 --json pano_mapping.json
+minegs ingest e57 extract   REAL.e57 output/
+```
+
+사람이 확인: scan 수 · pose status · scan 배치 · image representation · station/image 매핑 ·
+추출된 point cloud · 파노라마 추출 · SOURCE-frame 일관성.
+
+실제 E57 데이터가 없으면 Phase complete 로 선언하지 않는다. 0B.1~0B.3 은 합성·fake·test-time
+생성 E57 로만 검증되었고, 사용자의 실제 파일에서 위 세 명령을 돌려 확인하기 전까지
+**Phase 0B 는 implementation complete 이지 validated 가 아니다.**
 
 ### Phase 0C — Metric Dataset Golden Gate
 
@@ -126,7 +197,24 @@ initialization point 가 동일 공간에서 일치한다.
 
 ### Phase 0D — Local GS Baseline
 
-실제 소구간을 로컬 GPU 에서 gsplat baseline 으로 끝까지 학습한다.
+실제 소구간을 로컬 GPU 에서 gsplat baseline 으로 끝까지 학습한다. 두 단계로 나눈다.
+
+| 하위 | 범위 |
+|---|---|
+| **0D.1** | LocalRunner, Docker staging, checkpoint path mapping, `--resume`, fail-closed missing checkpoint |
+| **0D.2** | 실제 GPU baseline, checkpoint 생성, 중단, resume, 이어붙임 검증 |
+
+**Phase 0D entry blocker — Docker `--resume`.** PR #1 검증에서 확인된 문제이며 0D 시작 시
+**가장 먼저** 해결한다. 0B.2–0B.3 PR 에서는 고치지 않는다.
+
+> Phase 0D entry blocker: Docker LocalRunner `--resume` must resolve checkpoints using the
+> host staging path and translate only the executed command path into the container
+> namespace. A requested but missing checkpoint must fail closed; silent restart from
+> iteration 0 is forbidden.
+
+현재 Docker 학습 경로는 container 안의 checkpoint 경로를 host 에서 검사하기 때문에 체크포인트를
+찾지 못하고, `--resume` 을 요청해도 조용히 iteration 0 부터 다시 시작할 수 있다. 요청한
+체크포인트가 없으면 fail-closed 여야 한다 — 재시작은 "조금 느린 resume" 이 아니라 다른 실험이다.
 
 **범위**: pinned GPU docker image, gsplat v1.5.3 executable contract, LocalRunner,
 light profile, staging, checkpoint/output, LOCAL_METRIC 출력 정규화 계약.
@@ -275,9 +363,9 @@ Phase 0B 예시:
 
 | PR | 범위 |
 |---|---|
-| #2 | E57 inventory + scan/station contract |
-| #3 | PanoSource + station/panorama 매핑 |
-| #4 | Phase 0B real-E57 closeout (실데이터 검증 수정만) |
+| #2 | E57 inventory + scan/station contract (0B.1) |
+| #4 | panorama 매핑 계약 (0B.2) + scan/image 추출 (0B.3) |
+| 다음 | Phase 0B real-E57 closeout (실데이터 검증 수정만) |
 
 실데이터 검증에서 나온 수정은 별도 closeout PR 로 둔다.
 
@@ -315,7 +403,20 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
 | surface 추출(depth 렌더·TSDF) | `NotYetImplementedError` | 미구현 | Phase 1 |
-| 매핑 없는 `E57Embedded` 파노라마 | `ContractError` | station↔panorama 추론은 증거가 필요하다 | Phase 0B.2 |
+| 매핑 없는 `E57Embedded` 파노라마 | `ContractError` | station↔panorama 추론은 증거가 필요하다 | 해당 없음 (설계) |
+| index/개수/파일명/유사도 기반 station↔image 매핑 | 매핑을 만들지 않음 — `unmapped` | 틀린 매핑은 학습·수렴까지 되고 결과만 무의미하다 | 해당 없음 (설계) |
+| 하나의 GUID 를 두 scan 이 선언 | `ambiguous` (first match 아님) | 근거가 target 을 특정하지 못한다 | 해당 없음 (설계) |
+| 사용자 매핑이 E57 자체 근거와 모순 | `conflict` (덮어쓰기 아님) | 어느 쪽이 틀렸는지 알 수 없다 | 해당 없음 (설계) |
+| `vendor`/`generated_by` 없는 vendor manifest | `ContractError` | 손으로 쓴 파일이 confirmed 로 보고되면 안 된다 | 해당 없음 (설계) |
+| 파일명 기반 `VendorExport` station 추론 | `ContractError` | 문서화되지 않은 관례는 조용히 깨진다 | 해당 없음 (설계) |
+| pose 없는 scan 의 registered 추출 | `E57PoseUnusableError` | SOURCE 배치는 pose 를 요구한다 (`--raw` 로 unregistered 추출) | 해당 없음 (설계) |
+| `unreadable`/`invalid` pose 의 추출 | `E57PoseUnusableError` | 깨진 pose 를 identity 로 대체하지 않는다 | 해당 없음 (설계) |
+| 길이가 다른 point/attribute 컬럼 | `ContractError` | 한쪽을 잘라 맞추면 속성이 엉뚱한 점에 붙는다 | 해당 없음 (설계) |
+| 선언한 코덱과 다른 image blob | `ContractError` / `skipped` | 내용으로 포맷을 추측하지 않는다 | 해당 없음 (설계) |
+| 미지원 image representation | `skipped_images` 에 이유 기록 | 다른 projection 으로 재해석하지 않는다 | Phase 0C |
+| 이미 추출 산출물이 있는 디렉토리 | `ContractError` (`--overwrite` 로 교체) | 두 실행이 섞이면 구분할 수 없다 | 해당 없음 (설계) |
+| `--overwrite` 가 추출기 산출물 아닌 파일을 만남 | `ContractError` | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
+| Docker `--resume` 의 없는 checkpoint | (미구현) 현재 iteration 0 재시작 가능 | **Phase 0D entry blocker** — §Phase 0D | Phase 0D.1 |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |
 | `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 4 |

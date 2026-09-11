@@ -58,7 +58,7 @@ minegs/
   core/      config(schema_version + migration) · manifest · frames(SE3/Sim3) · centerline · chunking · provenance · pointcloud(PLY) · synthetic
   ingest/
     common/  geometry(PanoConvention) · equirect(링 크롭) · colmap_io(rigs.txt/frames.txt 포함)
-    e57/     inventory+models+exceptions(0B.1 계약) · scan_split · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
+    e57/     _nodes(단일 pye57 seam) · inventory+models+exceptions(0B.1) · images+mapping(0B.2 증거 기반 매핑) · extract(0B.3 추출·마스크·manifest) · scan_split(deprecated) · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
     video/   frames(ffmpeg) · dedup_blur · masks · rig(360 → COLMAP rig) · sfm/{COLMAPIncremental,COLMAPGlobal,GLUEMAP(exp)}
   train/     staging(쓰기 가능 복사본 + max_images 서브셋 + init_points→points3D)
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
@@ -73,7 +73,7 @@ docs/        ARCHITECTURE.md(invariant) · ROADMAP.md(Phase·Gate·DoD)
 data/        (git 제외) <dataset_id>/{raw,dataset,runs,eval,export}
 ```
 
-## 실제 E57 검사 (Phase 0B.1)
+## 실제 E57 검사 · 매핑 · 추출 (Phase 0B)
 
 E57 파일이 실제로 무엇을 담고 있는지 **점군을 읽지 않고** 조사한다.
 
@@ -91,7 +91,7 @@ minegs ingest e57 inventory /data/scan/tunnel.e57
 # Windows (PowerShell / cmd)
 minegs ingest e57 inventory D:\scan\tunnel.e57
 
-# 결과를 JSON 으로도 저장 (Phase 0B.2 로 넘길 입력)
+# 결과를 JSON 으로도 저장 (매핑·추출로 넘길 입력)
 minegs ingest e57 inventory D:\scan\tunnel.e57 --json inventory.json
 
 # SHA-256(O(파일 크기))을 건너뛰고 메타데이터만 빠르게 훑어보기 — 리포트에 건너뛴 사실이 남는다
@@ -103,9 +103,68 @@ minegs ingest e57 inventory D:\scan\tunnel.e57 --no-hash
 파일 수준 문제(예: 유효하지 않은 pose 를 선언한 scan)와 관찰(예: pose 가 전부 identity)을
 구분해 마지막에 모아 출력한다.
 
-**이 명령이 하지 않는 것**: 파노라마를 꺼내거나 station 에 연결하지 않고(Phase 0B.2),
-점군을 추출하지 않으며(Phase 0B.3), E57 좌표를 TLS_GLOBAL 이라고 선언하지 않는다.
+**이 명령이 하지 않는 것**: 파노라마를 꺼내거나 station 에 연결하지 않고(`pano-map`),
+점군을 추출하지 않으며(`extract`), E57 좌표를 TLS_GLOBAL 이라고 선언하지 않는다(Phase 0C).
 pose 는 파일 자신의 `SOURCE` 프레임에 있는 `T_source_from_scan` 으로 보고된다.
+
+### station ↔ 파노라마 매핑 (Phase 0B.2)
+
+```bash
+minegs ingest e57 pano-map tunnel.e57 --json pano_mapping.json
+minegs ingest e57 pano-map tunnel.e57 --mapping mapping.csv --json pano_mapping.json
+minegs ingest e57 pano-map tunnel.e57 --images-dir ./panoramas --mapping mapping.csv
+```
+
+매핑은 **증거가 있을 때만** 만들어진다. E57 자신의 `associatedData3DGuid` 가 정확히 한 scan 을
+가리키면 `confirmed`, 캡처 소프트웨어가 만든 vendor index 도 `confirmed`, 사람이 쓴 매핑 파일은
+`manual` 이다. scan/image index 가 같다거나, 개수가 같다거나, 파일 순서·이름이 비슷하다는 것은
+근거로 쓰지 않는다 — 힌트로 출력될 수는 있어도 매핑이 되지는 않는다. 틀린 매핑은 오류를 내지
+않고 학습도 되고 수렴까지 하는, 의미 없는 재구성이 되기 때문이다.
+
+근거가 없으면 `unmapped`, 하나의 근거가 여러 scan 을 가리키면 `ambiguous`, 근거가 가리키는
+scan 이 없으면 `orphan`, 사람이 쓴 매핑이 파일 자체 근거와 다르면 (덮어쓰기가 아니라) `conflict`
+로 보고한다. 매핑 파일은 헤더가 있는 CSV 또는 JSON 이고, 이미지 열
+(`image_id`/`image_name`/`image_guid`) 과 대상 열(`scan_id`/`scan_guid`/`station_id`) 을 하나씩
+갖는다:
+
+```csv
+scan_id,image_id
+scan_000,image_002
+scan_001,image_004
+```
+
+### scan · 이미지 추출 (Phase 0B.3)
+
+```bash
+minegs ingest e57 extract tunnel.e57 work/              # SOURCE 프레임, pose 필요
+minegs ingest e57 extract tunnel.e57 work/ --voxel 0.01 --scan scan_000
+minegs ingest e57 extract tunnel.e57 work/ --raw        # SCANNER 프레임, unregistered
+```
+
+```
+work/
+  inventory.json  pano_mapping.json  extraction_manifest.json
+  scans/scan_000.ply  scan_000.pose.json
+  images/image_000.jpg
+```
+
+**이것은 dataset 이 아니다.** 점은 아직 E57 자신의 `SOURCE` 프레임(또는 `--raw` 의 scan 별
+`SCANNER` 프레임)에 있다. TLS_GLOBAL 선언, LOCAL_METRIC origin, train/test 분할,
+`init_points.ply`, dataset manifest 는 전부 Phase 0C 다.
+
+기본값(registered)은 모든 대상 scan 에 쓸 수 있는 pose 를 요구하고, 없으면 `--raw` 를 알려주며
+거부한다. `--raw` 는 scanner 프레임 그대로 쓰고 `unregistered` 로 표시하며, 없는 pose 를 identity
+로 채우지 않는다. 읽을 수 없거나 유효하지 않은 pose 는 두 경로 모두 거부한다.
+
+invalid-state 마스크는 좌표·RGB·intensity·row/column 에 **동일하게** 적용된다(길이가 다른 컬럼은
+하드 실패). 색 범위는 scan 의 `colorLimits` 에서 읽어 변환 사실을 manifest 에 남기고, 선언이
+없으면 8-bit 라고 가정하지 않고 raw 로 보존한다. 임베디드 이미지는 spherical·cylindrical 만
+꺼내며 바이트가 선언한 코덱과 맞는지 확인한다 — pinhole 등은 이유와 함께 `skipped_images` 에
+기록되고 다른 projection 으로 재해석되지 않는다.
+
+pye57 에는 chunked reader 가 없어 scan 을 통째로 읽는다. 큰 scan 은 예상 peak memory 를 note 로
+알려주고 `--max-scan-points` 로 fail-closed 할 수 있다. production 규모 타일링은
+`minegs ingest e57 tiles` 의 PDAL 경로가 담당한다(PDAL C++ 라이브러리 필요; 없으면 fail-closed).
 
 ## 데이터셋 계약 (§4)
 
@@ -174,10 +233,10 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 
 | Phase | 상태 |
 |---|---|
-| 0A Foundation & Contract Freeze | **implemented + G1 통과** — 이 PR 이 closeout |
-| 0B Real E57 ingest | **0B.1 implementation in progress** (inventory·scan/station 계약), 0B.2 파노라마 매핑·0B.3 추출 미착수, **not validated** — 실제 E57 필요 |
+| 0A Foundation & Contract Freeze | **implemented + G1 통과** |
+| 0B Real E57 ingest | **0B.1–0B.3 implemented** (inventory·증거 기반 매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C Metric dataset golden gate | implemented, **not validated** (재투영 오버레이·Viser 정합 미수행) |
-| 0D Local GS baseline | implemented, **not validated** (GPU 학습 미수행) |
+| 0D Local GS baseline | implemented, **not validated** (GPU 학습 미수행). Docker `--resume` entry blocker 는 ROADMAP §Phase 0D 에 기록 |
 | 1 Metric surface & evaluation | 부분 — 양방향 지표·단면·체적 구현, surface 추출(depth/TSDF) 미구현 |
 | 2 E57 end-to-end MVP (v0.1) | 미착수 |
 | 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |

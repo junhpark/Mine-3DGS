@@ -31,7 +31,9 @@ minegs/
                  frames(SE3/Sim3), centerline, chunking, provenance
     ingest/
       common/    geometry, equirect, colmap_io               ← 두 경로가 공유
-      e57/       inventory+models+exceptions (SOURCE 프레임 계약), scan_split(pye57), tiles(PDAL), pose_to_colmap,
+      e57/       _nodes(단일 pye57 seam), inventory+models+exceptions (SOURCE 프레임 계약),
+                 images+mapping(증거 기반 station↔image), extract(추출·마스크·manifest),
+                 scan_split(deprecated), tiles(PDAL), pose_to_colmap,
                  pano/  PanoSource 어댑터: E57Embedded · ExternalJpeg · VendorExport
       video/     frames(ffmpeg), dedup_blur, masks,
                  sfm/   SfMBackend: COLMAPIncremental · COLMAPGlobal · (exp) GLUEMAP
@@ -66,8 +68,11 @@ minegs/
 ## 3. 좌표 프레임
 
 ```
-Source frame  (스캐너 로컬 / SfM 임의)
-   │
+SCANNER        개별 스캔 자신의 좌표             ← 0B.3 --raw 추출 (unregistered)
+   │  T_source_from_scan (E57 pose)
+   ▼
+SOURCE        원본 파일 자신의 좌표 (스캐너 로컬 / SfM 임의)  ← 0B 추출 산출물
+   │  Phase 0C 의 선언
    ▼
 TLS_GLOBAL     실제 계측 좌표, m        ← 평가·보고
    │  SE(3), 병진·회전만
@@ -83,6 +88,10 @@ BACKEND_INTERNAL                        ← 어댑터가 반드시 역변환해�
 * UTM 급 좌표(10⁶ m)를 float32 에 넣으면 유효 정밀도가 수십 cm 로 떨어진다.
   체적 계측에서 이 하나로 결과가 무의미해진다.
 * `T_tls_from_local` 은 manifest 필수 항목. run 이 청크 단위면 청크마다 하나.
+* `SOURCE` 와 `SCANNER` 는 Phase 0B ingest 전용이며 dataset 계약에 등장하지 않는다. E57 의
+  좌표가 `TLS_GLOBAL` 인지는 파일이 말해 주지 않으므로, 그 선언은 dataset materialization
+  (Phase 0C) 이 명시적으로 한다. Phase 0B 산출물에는 `TLS_GLOBAL`/`LOCAL_METRIC` 이라는 문자열이
+  주석으로도 등장하지 않는다 — 산출물을 grep 했을 때 나오면 그것은 진짜 주장이어야 한다.
 
 ## 4. 데이터셋 계약
 
