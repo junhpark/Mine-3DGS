@@ -10,7 +10,8 @@ from PIL import Image
 
 from minegs.core.errors import ContractError
 from minegs.ingest.common.geometry import PanoConvention
-from minegs.ingest.e57.inventory import _pye57, inventory, list_images2d
+from minegs.ingest.e57 import _nodes
+from minegs.ingest.e57.inventory import inventory, list_images2d
 from minegs.ingest.e57.pano.base import PanoRecord, PanoSource, read_mapping
 
 
@@ -56,15 +57,11 @@ class E57Embedded(PanoSource):
         return recs
 
     def load(self, pano_id: str) -> np.ndarray:
-        pye57 = _pye57()
-        e57 = pye57.E57(str(self.path))
-        try:
+        with _nodes.open_e57(self.path) as e57:
             node = e57.image_file.root()["images2D"].get(int(pano_id))
             rep = node["sphericalRepresentation"]
             blob = rep["jpegImage"] if rep.isDefined("jpegImage") else rep["pngImage"]
             buf = np.empty(blob.byteCount(), dtype=np.uint8)
             blob.read(buf, 0, blob.byteCount())
-        finally:
-            e57.close()
         with Image.open(io.BytesIO(buf.tobytes())) as im:
             return np.asarray(im.convert("RGB"))

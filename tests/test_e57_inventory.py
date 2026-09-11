@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import pytest
 from minegs.core.errors import MissingDependencyError
-from minegs.ingest.e57 import inventory as inv_mod
+from minegs.ingest.e57 import _nodes
 from minegs.ingest.e57.exceptions import (
     E57FileNotFoundError,
     E57NoScansError,
@@ -40,200 +40,16 @@ from minegs.ingest.e57.models import (
 )
 from minegs.ingest.e57.scan_split import read_scan, split_scans
 
-# ---------------------------------------------------------------- fake libE57 node tree
-
-
-class FakeE57Error(Exception):
-    """Stands in for libe57.E57Exception: raised for a node that is not defined."""
-
-
-class FakeLeaf:
-    def __init__(self, name: str, value: Any) -> None:
-        self._name, self._value = name, value
-
-    def elementName(self) -> str:
-        return self._name
-
-    def value(self) -> Any:
-        return self._value
-
-    def childCount(self) -> int:
-        return 0
-
-    def isDefined(self, key: str) -> bool:
-        return False
-
-    def __getitem__(self, key: str) -> Any:
-        raise FakeE57Error(key)
-
-
-class FakeNode:
-    """A structure node: ordered children, libE57-style accessors."""
-
-    def __init__(self, name: str = "", children: dict[str, Any] | None = None) -> None:
-        self._name = name
-        self._children: dict[str, Any] = {}
-        for k, v in (children or {}).items():
-            self._children[k] = v if isinstance(v, (FakeNode, FakeLeaf)) else FakeLeaf(k, v)
-
-    def elementName(self) -> str:
-        return self._name
-
-    def childCount(self) -> int:
-        return len(self._children)
-
-    def get(self, index_or_name: Any) -> Any:
-        if isinstance(index_or_name, int):
-            return list(self._children.values())[index_or_name]
-        return self[index_or_name]
-
-    def isDefined(self, key: str) -> bool:
-        return key in self._children
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._children:
-            raise FakeE57Error(f"node {key!r} is not defined")
-        return self._children[key]
-
-    def __len__(self) -> int:
-        return len(self._children)
-
-
-class ExplodingNode(FakeNode):
-    """A node whose enumeration fails, as a corrupt or exotic file's would."""
-
-    def childCount(self) -> int:
-        raise FakeE57Error("cannot enumerate")
-
-
-class FakeHeader:
-    def __init__(self, node: FakeNode, point_fields: list[str], point_count: int | None) -> None:
-        self.node = node
-        self.point_fields = point_fields
-        self._point_count = point_count
-
-    @property
-    def point_count(self) -> int:
-        if self._point_count is None:
-            raise FakeE57Error("point count unavailable")
-        return self._point_count
-
-    def __getitem__(self, key: str) -> Any:
-        return self.node[key]
-
-
-class FakeE57:
-    """Stands in for pye57.E57. Reading point data from it is a test failure by construction."""
-
-    def __init__(self, headers: list[FakeHeader], root: FakeNode) -> None:
-        self._headers = headers
-        self.root = root
-        self.closed = False
-
-    @property
-    def scan_count(self) -> int:
-        return len(self._headers)
-
-    def get_header(self, index: int) -> FakeHeader:
-        return self._headers[index]
-
-    def read_scan(self, *a: Any, **k: Any) -> Any:
-        raise AssertionError("inventory must never read point data (§17)")
-
-    def read_scan_raw(self, *a: Any, **k: Any) -> Any:
-        raise AssertionError("inventory must never read point data (§17)")
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def _rotmat_from_quat(q: list[float]) -> np.ndarray:
-    """Rotation from a quaternion WITHOUT normalising, matching what the reader builds."""
-    w, x, y, z = q
-    return np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ]
-    )
-
-
-def _pose_node(quat_wxyz: tuple[float, ...], xyz: tuple[float, ...]) -> FakeNode:
-    w, x, y, z = quat_wxyz
-    return FakeNode(
-        "pose",
-        {
-            "rotation": FakeNode("rotation", {"w": w, "x": x, "y": y, "z": z}),
-            "translation": FakeNode("translation", {"x": xyz[0], "y": xyz[1], "z": xyz[2]}),
-        },
-    )
-
-
-def make_scan(
-    name: str | None = "Setup 1",
-    guid: str | None = "{abc}",
-    point_fields: list[str] | None = None,
-    point_count: int | None = 1_000,
-    pose: FakeNode | None = None,
-    bounds: dict[str, float] | None = None,
-    extra: dict[str, Any] | None = None,
-) -> FakeHeader:
-    children: dict[str, Any] = {}
-    if guid is not None:
-        children["guid"] = guid
-    if name is not None:
-        children["name"] = name
-    if bounds is not None:
-        children["cartesianBounds"] = FakeNode("cartesianBounds", bounds)
-    if pose is not None:
-        children["pose"] = pose
-    children.update(extra or {})
-    children["points"] = FakeNode("points", {})
-    fields = (
-        point_fields
-        if point_fields is not None
-        else [
-            "cartesianX",
-            "cartesianY",
-            "cartesianZ",
-            "intensity",
-        ]
-    )
-    return FakeHeader(FakeNode("data3D", children), fields, point_count)
-
-
-CARTESIAN_BOUNDS_OK = {
-    "xMinimum": -5.0,
-    "xMaximum": 5.0,
-    "yMinimum": -4.0,
-    "yMaximum": 4.0,
-    "zMinimum": -1.0,
-    "zMaximum": 2.0,
-}
-
-
-@pytest.fixture
-def fake_e57(tmp_path, monkeypatch):
-    """Install a fake pye57 whose E57 class is built from the headers a test supplies."""
-
-    def install(headers: list[FakeHeader], root: FakeNode | None = None, name: str = "f.e57"):
-        path = tmp_path / name
-        path.write_bytes(b"not really an e57, the reader is faked")
-        opened: list[FakeE57] = []
-
-        class _Module:
-            @staticmethod
-            def E57(p: str, mode: str = "r") -> FakeE57:
-                obj = FakeE57(headers, root if root is not None else FakeNode("root", {}))
-                opened.append(obj)
-                return obj
-
-        monkeypatch.setattr(inv_mod, "_pye57", lambda: _Module)
-        return path, opened
-
-    return install
-
+from e57_fakes import (
+    CARTESIAN_BOUNDS_OK,
+    ExplodingNode,
+    FakeE57Error,
+    FakeHeader,
+    FakeNode,
+    make_scan,
+)
+from e57_fakes import pose_node as _pose_node
+from e57_fakes import rotmat_from_quat as _rotmat_from_quat
 
 # ---------------------------------------------------------------- identifiers
 
@@ -535,7 +351,7 @@ def test_unopenable_file_reports_which_file(tmp_path, monkeypatch):
         def E57(p: str, mode: str = "r") -> Any:
             raise FakeE57Error("bad file signature")
 
-    monkeypatch.setattr(inv_mod, "_pye57", lambda: _Module)
+    monkeypatch.setattr(_nodes, "pye57_module", lambda: _Module)
     with pytest.raises(E57ReadError, match=r"corrupt\.e57"):
         inventory(path)
 
@@ -564,7 +380,7 @@ def test_missing_pye57_says_how_to_install(tmp_path, monkeypatch):
     def _boom():
         raise MissingDependencyError("pye57", "e57", "reading E57 files")
 
-    monkeypatch.setattr(inv_mod, "_pye57", _boom)
+    monkeypatch.setattr(_nodes, "pye57_module", _boom)
     with pytest.raises(MissingDependencyError, match=r"minegs\[e57\]"):
         inventory(path)
 
@@ -706,12 +522,23 @@ def test_unreadable_pose_is_visible_in_the_cli(fake_e57, capsys):
 # ------------------------------ BLOCKER 2: extraction honours the pose contract
 
 
-def _fake_split_reader(monkeypatch):
-    """scan_split imported ``_pye57`` by value, so its own binding needs the fake too."""
-    import minegs.ingest.e57.inventory as _inv
+def test_every_e57_reader_opens_the_file_through_one_seam():
+    """No reader may open an E57 itself, or it grows its own guards and drifts from the rest.
+
+    The Phase 0B.1 review found the inventory and the splitter disagreeing about the same
+    file's poses for exactly this reason. ``_nodes.open_e57`` is the single door; a module
+    that calls ``pye57.E57(...)`` directly has walked around it.
+    """
+    import inspect
+
+    import minegs.ingest.e57.images as images_mod
+    import minegs.ingest.e57.inventory as inv_module
     import minegs.ingest.e57.scan_split as split_mod
 
-    monkeypatch.setattr(split_mod, "_pye57", _inv._pye57)
+    for mod in (inv_module, split_mod, images_mod):
+        src = inspect.getsource(mod)
+        assert "pye57.E57(" not in src, f"{mod.__name__} opens an E57 outside _nodes.open_e57"
+        assert "open_e57" in src
 
 
 def test_split_refuses_scans_without_a_usable_pose(fake_e57, tmp_path, monkeypatch):
@@ -723,7 +550,6 @@ def test_split_refuses_scans_without_a_usable_pose(fake_e57, tmp_path, monkeypat
             make_scan(pose=_pose_node((2.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0))),
         ]
     )
-    _fake_split_reader(monkeypatch)
     with pytest.raises(E57PoseUnusableError) as err:
         split_scans(path, tmp_path / "out")
     message = str(err.value)
@@ -735,7 +561,6 @@ def test_split_refuses_scans_without_a_usable_pose(fake_e57, tmp_path, monkeypat
 def test_read_scan_refuses_an_unusable_pose(fake_e57, monkeypatch):
     """The guard sits before read_scan_raw, so no point data is touched either."""
     path, _ = fake_e57([make_scan(pose=None)])
-    _fake_split_reader(monkeypatch)
     with pytest.raises(E57PoseUnusableError, match="absent"):
         read_scan(path, 0)
 

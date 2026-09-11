@@ -17,8 +17,9 @@ import numpy as np
 
 from minegs.core.pointcloud import PointCloud, voxel_downsample, write_ply
 from minegs.ingest.common.geometry import spherical_to_cart
+from minegs.ingest.e57 import _nodes
 from minegs.ingest.e57.exceptions import E57PoseUnusableError
-from minegs.ingest.e57.inventory import _pye57, scan_pose
+from minegs.ingest.e57.inventory import scan_pose
 from minegs.ingest.e57.models import ScanPose
 
 
@@ -32,9 +33,7 @@ def read_scan(
     missing, unreadable or invalid raises ``E57PoseUnusableError`` rather than yielding a
     plausible identity.
     """
-    pye57 = _pye57()
-    e57 = pye57.E57(str(path))
-    try:
+    with _nodes.open_e57(path) as e57:
         h = e57.get_header(index)
         pose, status = scan_pose(h)
         if pose is None or not pose.validation.valid:
@@ -57,8 +56,6 @@ def read_scan(
         if "colorRed" in data:
             rgb = np.column_stack([data["colorRed"], data["colorGreen"], data["colorBlue"]])
             rgb = rgb[: len(xyz)]
-    finally:
-        e57.close()
     pc = PointCloud(xyz, rgb, frame="SOURCE")
     if voxel_m:
         pc = pc.select(voxel_downsample(pc.xyz, voxel_m))

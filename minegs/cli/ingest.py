@@ -141,6 +141,107 @@ def _print_inventory(inv) -> None:
         console.print("\n[green]No problems detected.[/]")
 
 
+@e57_app.command("pano-map")
+def e57_pano_map(
+    file: Path = typer.Argument(..., help="Path to the .e57 file"),
+    json_out: Path | None = typer.Option(
+        None, "--json", help="Write the full PanoMappingReport here"
+    ),
+    mapping: Path | None = typer.Option(
+        None, "--mapping", help="Explicit station/scan <-> image mapping (CSV or JSON)"
+    ),
+    vendor_manifest: Path | None = typer.Option(
+        None, "--vendor-manifest", help="Machine-generated vendor index (JSON)"
+    ),
+    images_dir: Path | None = typer.Option(
+        None, "--images-dir", help="Map external image files in this directory instead of /images2D"
+    ),
+    no_hash: bool = typer.Option(False, "--no-hash", help="Skip the SHA-256 (recorded as skipped)"),
+) -> None:
+    """Discover images and map them to scans — from evidence only.
+
+    Reads metadata, never pixels or point data. An image is mapped when the E57 associates it
+    with exactly one scan, when a vendor index says so, or when you say so with --mapping.
+    Index equality, equal counts, file order and name similarity never produce a mapping
+    (docs/ARCHITECTURE.md §3, docs/ROADMAP.md Phase 0B.2): a panorama attributed to the wrong
+    station trains and converges just as well as a correct one.
+    """
+    from minegs.ingest.e57.mapping import build_mapping_report
+
+    def go() -> None:
+        rep = build_mapping_report(
+            file,
+            mapping=mapping,
+            vendor_manifest=vendor_manifest,
+            images_dir=images_dir,
+            compute_hash=not no_hash,
+        )
+        _print_mapping(rep)
+        if json_out:
+            rep.save(json_out)
+            console.print(f"\nwrote {json_out}")
+
+    run_guarded(go)
+
+
+_STATUS_STYLE = {
+    "confirmed": "green",
+    "manual": "cyan",
+    "unmapped": "yellow",
+    "ambiguous": "red",
+    "orphan": "red",
+    "conflict": "red",
+}
+
+
+def _print_mapping(rep) -> None:
+    """Block-per-image report. Every line says what the evidence was, or that there was none."""
+    console.print(f"[bold]Source:[/] {rep.source_file}")
+    if rep.image_root:
+        console.print(f"  images from: {rep.image_root}")
+    console.print(
+        f"[bold]Scans:[/] {rep.scan_count}   [bold]Images:[/] {len(rep.images)}   "
+        f"[dim](resolved: {len(rep.resolved())})[/]"
+    )
+
+    by_id = {im.image_id: im for im in rep.images}
+    for m in rep.mappings:
+        im = by_id[m.image_id]
+        style = _STATUS_STYLE.get(m.status, "white")
+        console.print(f"\n[bold]{m.image_id}[/]  [{style}]{m.status}[/]")
+        if im.name:
+            console.print(f"  name:           {im.name}")
+        console.print(
+            f"  representation: {im.representation}"
+            + ("  [green](panorama candidate)[/]" if im.panorama_candidate else "")
+        )
+        if im.width and im.height:
+            console.print(f"  size:           {im.width} x {im.height}")
+        console.print(f"  scan:           {m.scan_id or '[dim]not determined[/]'}")
+        console.print(f"  station:        {m.station_id or '[dim]not determined[/]'}")
+        console.print(f"  evidence:       {m.evidence_type}", highlight=False)
+        if m.evidence_value:
+            console.print(f"  evidence value: {m.evidence_value}", highlight=False)
+        console.print(f"  why:            {m.reason}")
+        if m.candidate_scan_ids:
+            console.print(f"  candidates:     {', '.join(m.candidate_scan_ids)}")
+        for hint in m.hints:
+            console.print(f"  [yellow]hint:[/] {hint} [dim](a hint is not evidence)[/]")
+
+    if rep.issues:
+        console.print("\n[bold red]Problems[/]")
+        for msg in rep.issues:
+            console.print(f"  [red]•[/] {msg}")
+    if rep.notes:
+        console.print("\n[bold]Notes[/]")
+        for msg in rep.notes:
+            console.print(f"  [yellow]•[/] {msg}")
+    console.print(
+        "\n[dim]Mapping is evidence-based: scan/image index equality, equal counts, file order "
+        "and name similarity are never used (docs/ROADMAP.md Phase 0B.2).[/]"
+    )
+
+
 @e57_app.command("split")
 def e57_split(
     file: Path = typer.Argument(...),
