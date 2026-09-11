@@ -267,7 +267,12 @@ def e57_extract(
         None, "--max-scan-points", help="Refuse scans larger than this (pye57 reads a scan whole)"
     ),
     overwrite: bool = typer.Option(False, "--overwrite", help="Replace existing output"),
-    no_hash: bool = typer.Option(False, "--no-hash", help="Skip the source SHA-256"),
+    no_hash: bool = typer.Option(
+        False,
+        "--no-hash",
+        help="Skip hashing the inputs (E57, mapping files, external images). Output digests "
+        "are still recorded — they are the record of what this run produced.",
+    ),
 ) -> None:
     """Extract scans and supported images into a Phase 0B staging directory.
 
@@ -355,8 +360,9 @@ def e57_split(
     """Deprecated: flat scanner-frame PLY + pose JSON per scan. Use `extract` instead.
 
     Kept for the Phase 0A dataset builder. `extract` writes the same points plus the mapping
-    report, the image outputs and an extraction manifest, and can place points in the SOURCE
-    frame.
+    report, the image outputs and an extraction manifest, can place points in the SOURCE
+    frame, and publishes its output all-or-nothing. This command writes scan by scan with no
+    rollback, so an interrupted run leaves whatever it had written.
     """
     from minegs.ingest.e57.scan_split import split_scans
 

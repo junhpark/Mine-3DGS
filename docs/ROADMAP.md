@@ -121,7 +121,16 @@ scan 하나가 station 하나라고, 모든 scan 에 pose·RGB·이름·GUID 가
 * **status**: `confirmed` · `manual` · `unmapped` · `ambiguous`(하나의 근거가 여러 target) ·
   `orphan`(근거는 있으나 target 없음) · `conflict`(근거끼리 모순). GUID 를 두 scan 이
   선언하면 first match 가 아니라 `ambiguous` 다. 사용자 매핑이 파일 자체 근거와 다르면
-  덮어쓰기가 아니라 `conflict` 다.
+  덮어쓰기가 아니라 `conflict` 다 — **E57 이 선언한 GUID 가 이 파일에 없을 때(orphan)도
+  마찬가지다.** target 이 없다는 것은 파일의 진술이 *해석 불가능*하다는 뜻이지 *진술이 없다*는
+  뜻이 아니고, 그 진술을 가장 이해하지 못하는 순간에 다른 근거가 조용히 이기게 두는 것이
+  이 모듈이 막으려는 바로 그 override 다. 명시적 override 정책이 필요해지면 그때는 선언된
+  flag 여야지 target 이 없다는 부작용이어서는 안 된다.
+* **provenance**: 결과를 바꾸는 입력은 전부 hash 한다 — E57, `--mapping`, `--vendor-manifest`,
+  외부 이미지 각각. 같은 E57 을 서로 다른 CSV 로 매핑하면 서로 다른 결과이므로, E57 만 적힌
+  provenance 는 둘을 구분하지도 재현하지도 못한다. 외부 이미지는 파일별 digest 와, 그것들로부터
+  유도한 image-set digest 하나(추가 I/O 없음)를 함께 기록한다. `--no-hash` 는 전부에 일관되게
+  적용되고 이유를 남긴다 — 일부만 반영된 digest 는 없는 것보다 나쁘다.
 * **산출물**: `PanoMappingReport` (schema 1.0) — `E57Inventory` 에 필드를 더하지 않는다.
   inventory 는 "파일에 무엇이 있는가", 이쪽은 "무엇이 무엇과 짝인가" 이고, 두 번째 질문은
   새 매핑 파일로 다시 답할 수 있어야 한다.
@@ -156,9 +165,20 @@ train/test split, `init_points.ply`, dataset manifest 는 전부 0C 다.
   맞는지 확인하고, 아니면 이름만 바꿔 저장하지 않고 거부한다. pinhole·visual_reference·
   unknown 은 `skipped_images` 에 이유와 함께 기록한다 — 다른 projection 으로 재해석하지 않는다.
   perspective crop·cubemap·ring crop·COLMAP camera·undistortion 은 여기서 하지 않는다.
-* **거부는 쓰기 전에**: 모든 preflight 가 통과한 뒤에야 파일을 쓴다. scan 세 개를 쓰고 네 번째에
-  거부하면 완성된 것처럼 보이는 staging 디렉토리가 남는다. `--overwrite` 는 이전 추출을
-  *교체*하며, 이 추출기가 쓰지 않은 파일이 있으면 지우지 않고 거부한다.
+* **transactional staging**: run 전체를 `.<name>.minegs-partial` 임시 트리에 쓰고, 전부
+  성공했을 때만 최종 `work_dir` 로 rename 해서 publish 한다. header preflight 는 잘린 payload 를
+  볼 수 없으므로 실패는 12/40 번째 scan 에서 날 수 있고, 그때 scan 12개와 manifest 없는
+  디렉토리가 남으면 PLY 개수만 세는 쪽에는 완성된 run 으로 보인다. 이전 트리는 지우지 않고
+  옆으로 옮겼다가 마지막 rename 이 실패하면 되돌린다. 어디서 실패하든 `work_dir` 는 그대로다.
+  `--overwrite` 도 "좋은 run 을 먼저 지우고 시도한다" 가 아니다. publish 도중(옆으로 옮긴 뒤
+  rename 전) 죽으면 다음 실행이 그 백업을 복구한다 — stale 로 보고 지우면 crash 가 곧 데이터
+  손실이 된다. 이 보장은 `extract` 의 것이고, deprecated `split` 은 여전히 flat 레이아웃에
+  하나씩 쓴다.
+* **디렉토리 소유권**: `inventory.json`·`pano_mapping.json`·`extraction_manifest.json`·`scans/`·
+  `images/` 와 그 안의 `scan_NNN.*`/`image_NNN.*` 만 이 추출기의 산출물이다. 그 외 파일이
+  하나라도 있으면 `--overwrite` 여부와 무관하게 거부한다 — 오타 난 경로가 데이터를 지울 수
+  없어야 하고, 옵션의 뜻은 "내 지난 추출을 교체하라" 이지 "이 디렉토리를 비워라" 가 아니다.
+  대상 검사는 hash 를 계산하기 전에 먼저 한다.
 * **대용량**: pye57 에는 chunked reader 가 없어 scan 을 통째로 읽는다. 선언된 점 개수로 추정
   peak memory 를 note 로 보고하고, `--max-scan-points` 로 fail-closed 할 수 있다. production
   규모 타일링은 PDAL 경로(§22 경계)의 몫이고, PDAL 은 인터페이스 + fail-closed 의존성 검사로
@@ -414,8 +434,17 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | 길이가 다른 point/attribute 컬럼 | `ContractError` | 한쪽을 잘라 맞추면 속성이 엉뚱한 점에 붙는다 | 해당 없음 (설계) |
 | 선언한 코덱과 다른 image blob | `ContractError` / `skipped` | 내용으로 포맷을 추측하지 않는다 | 해당 없음 (설계) |
 | 미지원 image representation | `skipped_images` 에 이유 기록 | 다른 projection 으로 재해석하지 않는다 | Phase 0C |
-| 이미 추출 산출물이 있는 디렉토리 | `ContractError` (`--overwrite` 로 교체) | 두 실행이 섞이면 구분할 수 없다 | 해당 없음 (설계) |
-| `--overwrite` 가 추출기 산출물 아닌 파일을 만남 | `ContractError` | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
+| 이미 추출 산출물이 있는 디렉토리 (`inventory.json` 하나라도) | `ContractError` (`--overwrite` 로 교체) | 두 실행이 섞이면 구분할 수 없다 | 해당 없음 (설계) |
+| 추출기 산출물 아닌 파일이 있는 디렉토리 | `ContractError` (`--overwrite` 여도) | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
+| 대상 경로가 디렉토리가 아님 | `ContractError` | staging 은 자기 디렉토리를 요구한다 | 해당 없음 (설계) |
+| payload 도중 실패한 추출 (`extract`) | 아무것도 publish 하지 않음 (임시 트리 삭제) | 부분 결과가 완성된 run 처럼 보인다 | 해당 없음 (설계) |
+| publish 도중 중단된 추출 | 다음 실행이 백업을 복구하고 note 로 보고 | crash 를 조용한 데이터 손실로 바꾸지 않는다 | 해당 없음 (설계) |
+| symlink 인 대상 디렉토리 | `ContractError` | rename 은 링크를 갈아치우지 대상을 바꾸지 않는다 | 해당 없음 (설계) |
+| 같은 파일을 `--mapping` 과 `--vendor-manifest` 둘 다로 | `ContractError` | 자기 자신과 일치해 confirmed 가 되어버린다 | 해당 없음 (설계) |
+| 실패한 `--overwrite` run | 이전 추출 그대로 보존 | 새 run 의 실패가 좋은 run 을 파괴하면 안 된다 | 해당 없음 (설계) |
+| 남아 있는 임시 트리 안의 외부 파일 | `ContractError` | 이 도구가 쓰지 않은 것은 지우지 않는다 | 해당 없음 (설계) |
+| E57 의 orphan association 을 사용자 매핑이 덮어씀 | `conflict` (scan_id 없음) | target 이 없다고 진술이 없는 것은 아니다 | 명시적 override 정책 (미설계) |
+| 결과를 바꾸는 입력이 provenance 에 없음 | E57·매핑 파일·vendor manifest·외부 이미지 전부 hash | 재현할 수 없는 결과는 근거가 아니다 | 해당 없음 (설계) |
 | Docker `--resume` 의 없는 checkpoint | (미구현) 현재 iteration 0 재시작 가능 | **Phase 0D entry blocker** — §Phase 0D | Phase 0D.1 |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |

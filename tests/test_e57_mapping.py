@@ -332,6 +332,66 @@ def test_manual_mapping_never_overwrites_the_files_own_evidence(fake_e57, tmp_pa
     assert "does not silently overwrite" in m.reason
 
 
+def test_a_manual_mapping_cannot_override_an_orphan_e57_association(fake_e57, tmp_path):
+    """The E57 names a GUID this file does not contain, and the user names a scan.
+
+    Those are two different statements about the same image. The file's target being missing
+    makes its statement unresolvable, not absent — and letting the mapping file win exactly
+    when we understand the E57's claim least is the silent override this module exists to
+    prevent. An explicit override policy would be a declared flag, not a side effect.
+    """
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\n")
+    rep = _report(
+        fake_e57, _scans(GUID_A), [image_node(associated_scan_guid=GUID_C)], mapping=mapping
+    )
+    m = rep.record_for("image_000")
+    assert m.status == "conflict" and m.scan_id is None and not m.is_resolved
+    assert m.station_id is None
+    assert GUID_C in (m.evidence_value or "")
+    assert "which is not in this file" in m.reason
+    assert m.candidate_scan_ids == ["scan_000"]
+
+
+def test_a_vendor_manifest_cannot_override_an_orphan_e57_association(fake_e57, tmp_path):
+    """Tier C is machine-generated, which makes it confirmed evidence — not a tiebreaker."""
+    manifest = tmp_path / "vendor.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "vendor": "Acme",
+                "generated_by": "exporter",
+                "mappings": [{"image_id": "image_000", "scan_id": "scan_000"}],
+            }
+        )
+    )
+    rep = _report(
+        fake_e57,
+        _scans(GUID_A),
+        [image_node(associated_scan_guid=GUID_C)],
+        vendor_manifest=manifest,
+    )
+    assert rep.record_for("image_000").status == "conflict"
+
+
+def test_an_orphan_association_alone_is_still_orphan_not_conflict(fake_e57):
+    """Only a *disagreement* is a conflict; the E57 alone naming a missing scan is orphan."""
+    rep = _report(fake_e57, _scans(GUID_A), [image_node(associated_scan_guid=GUID_C)])
+    m = rep.record_for("image_000")
+    assert m.status == "orphan" and m.scan_id is None
+
+
+def test_a_mapping_file_only_overrides_nothing_when_the_e57_is_silent(fake_e57, tmp_path):
+    """The permitted case: no embedded association at all, so nothing is being overridden."""
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\n")
+    rep = _report(
+        fake_e57, _scans(GUID_A), [image_node(associated_scan_guid=None)], mapping=mapping
+    )
+    m = rep.record_for("image_000")
+    assert m.status == "manual" and m.scan_id == "scan_000"
+
+
 def test_a_mapping_file_that_contradicts_itself_is_a_conflict(fake_e57, tmp_path):
     mapping = tmp_path / "mapping.csv"
     mapping.write_text("scan_id,image_id\nscan_000,image_000\nscan_001,image_000\n")
@@ -640,6 +700,175 @@ def test_report_records_provenance_and_the_source_hash(fake_e57):
 
     skipped = build_mapping_report(path, compute_hash=False)
     assert skipped.source_sha256 is None and skipped.hash_skipped_reason
+
+
+def test_every_mapping_input_is_hashed_into_the_report(fake_e57, tmp_path):
+    """The same E57 with two different CSVs is two different reports.
+
+    A provenance record naming only the E57 cannot tell them apart, so it cannot reproduce
+    either — and a mapping file is the one input a person edits between runs.
+    """
+    from minegs.core.provenance import sha256_file
+
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\n")
+    manifest = tmp_path / "vendor.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "vendor": "Acme",
+                "generated_by": "exporter 2.1",
+                "mappings": [{"image_id": "image_001", "scan_id": "scan_000"}],
+            }
+        )
+    )
+    path, _ = fake_e57(_scans(GUID_A), root=root_with_images(image_node(), image_node()))
+    rep = build_mapping_report(path, mapping=mapping, vendor_manifest=manifest)
+
+    # vendor first: the report reads in evidence-tier order
+    assert [i.role for i in rep.mapping_inputs] == ["vendor_manifest", "explicit_mapping"]
+    by_role = {i.role: i for i in rep.mapping_inputs}
+    assert by_role["explicit_mapping"].path == str(mapping.resolve())
+    assert by_role["explicit_mapping"].sha256 == sha256_file(mapping)
+    assert by_role["vendor_manifest"].sha256 == sha256_file(manifest)
+    assert by_role["vendor_manifest"].row_count == 1
+    assert all(i.size_bytes > 0 for i in rep.mapping_inputs)
+
+    recorded = {a.path: a.sha256 for a in rep.provenance.source_assets}
+    assert recorded[str(path.resolve())] == rep.source_sha256
+    assert recorded[str(mapping.resolve())] == sha256_file(mapping)
+    assert recorded[str(manifest.resolve())] == sha256_file(manifest)
+
+
+def test_a_report_with_no_mapping_file_records_none(fake_e57):
+    rep = _report(fake_e57, _scans(GUID_A), [image_node()])
+    assert rep.mapping_inputs == []
+    assert len(rep.provenance.source_assets) == 1
+
+
+def test_external_images_are_hashed_into_the_report(tmp_path, fake_e57):
+    from minegs.core.provenance import sha256_file
+
+    d = tmp_path / "images"
+    d.mkdir()
+    _write_png(d / "a.png")
+    _write_png(d / "b.png", (16, 8))
+    path, _ = fake_e57(_scans(GUID_A))
+    rep = build_mapping_report(path, images_dir=d)
+
+    assert [a.sha256 for a in rep.images] == [sha256_file(d / "a.png"), sha256_file(d / "b.png")]
+    assert all(a.hash_skipped_reason is None for a in rep.images)
+    assert rep.image_root_sha256 and len(rep.image_root_sha256) == 64
+    root = next(a for a in rep.provenance.source_assets if a.path == str(d.resolve()))
+    assert root.sha256 == rep.image_root_sha256
+    assert root.size_bytes == sum(f.stat().st_size for f in (d / "a.png", d / "b.png"))
+
+
+def test_the_image_set_digest_moves_when_the_set_does(tmp_path, fake_e57):
+    d = tmp_path / "images"
+    d.mkdir()
+    _write_png(d / "a.png")
+    path, _ = fake_e57(_scans(GUID_A))
+    one = build_mapping_report(path, images_dir=d).image_root_sha256
+    _write_png(d / "b.png", (16, 8))
+    two = build_mapping_report(path, images_dir=d).image_root_sha256
+    assert one and two and one != two
+    assert build_mapping_report(path, images_dir=d).image_root_sha256 == two, "and is stable"
+
+
+def test_no_hash_leaves_no_partial_digest_anywhere(tmp_path, fake_e57):
+    """A digest covering only the inputs that happened to be hashed is worse than none."""
+    d = tmp_path / "images"
+    d.mkdir()
+    _write_png(d / "a.png")
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_name\nscan_000,a.png\n")
+    path, _ = fake_e57(_scans(GUID_A))
+    rep = build_mapping_report(path, images_dir=d, mapping=mapping, compute_hash=False)
+
+    assert rep.source_sha256 is None and rep.hash_skipped_reason
+    assert rep.image_root_sha256 is None
+    assert rep.images[0].sha256 is None and rep.images[0].hash_skipped_reason
+    assert rep.mapping_inputs[0].sha256 is None
+    assert rep.mapping_inputs[0].hash_skipped_reason
+    assert rep.record_for("image_000").status == "manual", "mapping still works without hashes"
+
+
+def test_a_precomputed_source_hash_is_used_instead_of_rereading(tmp_path, fake_e57, monkeypatch):
+    """Extraction hashes the E57 once for three artifacts; this is the seam that lets it."""
+    import minegs.ingest.e57.mapping as mapping_mod
+
+    def forbidden(*a, **k):
+        raise AssertionError("the caller already supplied the digest")
+
+    path, _ = fake_e57(_scans(GUID_A), root=root_with_images(image_node()))
+    monkeypatch.setattr(mapping_mod, "sha256_file", forbidden)
+    rep = build_mapping_report(path, compute_hash=False, source_sha256="a" * 64)
+    assert rep.source_sha256 == "a" * 64 and rep.hash_skipped_reason is None
+    assert rep.provenance.source_assets[0].sha256 == "a" * 64
+
+
+def test_one_file_cannot_be_both_evidence_tiers(tmp_path, fake_e57):
+    """Passing the same JSON twice would make it agree with itself and report confirmed."""
+    both = tmp_path / "v.json"
+    both.write_text(
+        json.dumps(
+            {
+                "vendor": "Acme",
+                "generated_by": "exporter",
+                "mappings": [{"image_id": "image_000", "scan_id": "scan_000"}],
+            }
+        )
+    )
+    path, _ = fake_e57(_scans(GUID_A), root=root_with_images(image_node()))
+    with pytest.raises(ContractError, match="both --mapping and --vendor-manifest"):
+        build_mapping_report(path, mapping=both, vendor_manifest=both, compute_hash=False)
+
+
+def test_an_empty_image_directory_still_gets_a_digest(tmp_path, fake_e57):
+    """ "I looked here and found nothing" is a fact about the run, not a missing measurement."""
+    d = tmp_path / "images"
+    d.mkdir()
+    path, _ = fake_e57(_scans(GUID_A))
+    rep = build_mapping_report(path, images_dir=d)
+    assert rep.images == []
+    assert rep.image_root_sha256 and len(rep.image_root_sha256) == 64
+    root = next(a for a in rep.provenance.source_assets if a.path == str(d.resolve()))
+    assert root.sha256 == rep.image_root_sha256, "never an empty hash claiming to be one"
+
+
+def test_an_external_directory_says_it_has_no_embedded_evidence(tmp_path, fake_e57):
+    """The laundering path, named out loud: extract images, then re-map them without the E57.
+
+    Nothing on that path can contradict a mapping file, so a conflict the E57 would have
+    raised quietly becomes a clean manual mapping. The report says so rather than looking the
+    same as a mapping made against the file itself.
+    """
+    d = tmp_path / "images"
+    d.mkdir()
+    _write_png(d / "a.png")
+    path, _ = fake_e57(_scans(GUID_A))
+    rep = build_mapping_report(path, images_dir=d, compute_hash=False)
+    note = " ".join(rep.notes)
+    assert "nothing to contradict" in note
+    assert "name order, not the first entry in /images2D" in note
+
+
+def test_hints_from_every_mapping_row_survive(fake_e57, tmp_path):
+    """A near-miss on row 7 is exactly the one the user needs to see."""
+    mapping = tmp_path / "mapping.csv"
+    near_a = GUID_A.strip("{}").upper()
+    near_b = GUID_B.strip("{}").upper()
+    mapping.write_text(f"scan_guid,image_id\n{near_a},image_000\n{near_b},image_000\n")
+    rep = _report(
+        fake_e57, _scans(GUID_A, GUID_B), [image_node(associated_scan_guid=None)], mapping=mapping
+    )
+    m = rep.record_for("image_000")
+    # neither GUID matches exactly, so both rows resolve to nothing: an orphan, with a
+    # near-miss hint from each row rather than only from the first
+    assert m.status == "orphan" and m.scan_id is None
+    assert len(m.hints) == 2, m.hints
+    assert all("differ only in case, braces or hyphens" in h for h in m.hints)
 
 
 def test_report_never_claims_a_tls_global_frame(fake_e57):

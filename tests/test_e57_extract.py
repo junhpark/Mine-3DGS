@@ -9,6 +9,7 @@ colour shifted onto the wrong point. Several tests below construct exactly that 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -21,10 +22,12 @@ from minegs.ingest.e57.extract import (
     extract,
     read_scan_points,
 )
+from minegs.ingest.e57.models import E57Inventory
 
 from e57_fakes import (
     ExplodingBlob,
     ExplodingNode,
+    FakeE57Error,
     FakeNode,
     image_node,
     make_scan,
@@ -408,6 +411,211 @@ def test_overwrite_replaces_rather_than_merges(fake_e57, tmp_path):
     assert [s.scan_id for s in m.scan_outputs] == ["scan_001"]
 
 
+def _exploding_scan(guid=GUID_B):
+    """A scan whose header is fine and whose payload is not — a truncated file, in effect."""
+    return make_scan(
+        guid=guid,
+        pose=pose_node(IDENTITY, (0.0, 0.0, 0.0)),
+        point_fields=["cartesianX", "cartesianY", "cartesianZ"],
+        point_count=3,
+        point_data=FakeE57Error("compressed vector truncated"),
+    )
+
+
+def test_a_failure_partway_through_the_payload_leaves_nothing_behind(fake_e57, tmp_path):
+    """Header preflight cannot see a truncated payload, so the failure lands mid-write.
+
+    Twelve scans and no manifest looks like a finished run to anything that counts PLYs, so a
+    run either publishes whole or leaves the target exactly as it found it.
+    """
+    path, _ = fake_e57([_scan(data=cartesian_data(3)), _exploding_scan()])
+    out = tmp_path / "out"
+    with pytest.raises(E57ReadScanError, match="truncated"):
+        extract(path, out, compute_hash=False)
+    assert not out.exists(), "the first scan had already been written when the second failed"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".out")]
+    assert leftovers == [], f"the temporary staging tree was not cleaned up: {leftovers}"
+
+
+def test_a_failed_overwrite_leaves_the_previous_extraction_intact(fake_e57, tmp_path):
+    """--overwrite must not mean "delete the good run, then try"."""
+    out = tmp_path / "out"
+    good, _ = fake_e57([_scan(data=cartesian_data(3)), _scan(guid=GUID_B, data=cartesian_data(4))])
+    first = extract(good, out, compute_hash=False)
+    before = {p.name: p.read_bytes() for p in (out / "scans").iterdir()}
+    assert len(before) == 4
+
+    broken, _ = fake_e57([_scan(data=cartesian_data(9)), _exploding_scan()], name="broken.e57")
+    with pytest.raises(E57ReadScanError):
+        extract(broken, out, overwrite=True, compute_hash=False)
+
+    assert {p.name: p.read_bytes() for p in (out / "scans").iterdir()} == before
+    reloaded = E57ExtractionManifest.load(out / "extraction_manifest.json")
+    assert reloaded.model_dump() == first.model_dump()
+    assert not any(p.name.startswith(".out") for p in tmp_path.iterdir())
+
+
+def test_an_occupied_target_is_refused_before_the_source_is_read(fake_e57, tmp_path, monkeypatch):
+    """A mistyped target should cost a stat, not a 50 GB stream."""
+    import minegs.ingest.e57.extract as extract_mod
+
+    def forbidden(*a, **k):
+        raise AssertionError("a refused target must not first hash the source")
+
+    monkeypatch.setattr(extract_mod, "sha256_file", forbidden)
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    (out / "scans").mkdir(parents=True)
+    with pytest.raises(ContractError, match="already holds extraction output"):
+        extract(path, out)
+
+
+def test_a_root_file_this_extractor_did_not_write_is_never_clobbered(fake_e57, tmp_path):
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    out.mkdir()
+    notes = out / "field_notes.md"
+    notes.write_text("where the water ingress was")
+    for overwrite in (False, True):
+        with pytest.raises(ContractError, match="did not write"):
+            extract(path, out, overwrite=overwrite, compute_hash=False)
+    assert notes.read_text() == "where the water ingress was"
+
+
+def test_an_existing_report_json_counts_as_a_previous_run(fake_e57, tmp_path):
+    """inventory.json and pano_mapping.json are outputs too; silently replacing one is not on."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "inventory.json").write_text('{"mine": true}')
+    with pytest.raises(ContractError, match="already holds extraction output"):
+        extract(path, out, compute_hash=False)
+    assert json.loads((out / "inventory.json").read_text()) == {"mine": True}
+
+    extract(path, out, overwrite=True, compute_hash=False)
+    assert E57Inventory.load(out / "inventory.json").scan_count == 1
+
+
+def test_an_empty_target_directory_is_fine(fake_e57, tmp_path):
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    out.mkdir()
+    extract(path, out, compute_hash=False)
+    assert (out / "extraction_manifest.json").exists()
+
+
+def test_a_missing_parent_directory_is_created(fake_e57, tmp_path):
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "surveys" / "2026" / "out"
+    extract(path, out, compute_hash=False)
+    assert (out / "scans" / "scan_000.ply").exists()
+
+
+def test_a_target_that_is_a_file_is_refused(fake_e57, tmp_path):
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    target = tmp_path / "out"
+    target.write_text("not a directory")
+    with pytest.raises(ContractError, match="not a directory"):
+        extract(path, target, compute_hash=False)
+    assert target.read_text() == "not a directory"
+
+
+def test_a_leftover_partial_tree_is_reclaimed_but_never_raided(fake_e57, tmp_path):
+    """An interrupted run leaves a partial tree; the next run may reuse that name — unless
+    someone has since put something of their own inside it."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    partial = tmp_path / ".out.minegs-partial"
+    (partial / "scans").mkdir(parents=True)
+    (partial / "scans" / "scan_000.ply").write_bytes(b"half a cloud")
+    extract(path, tmp_path / "out", compute_hash=False)
+    assert not partial.exists()
+
+    other = tmp_path / ".out2.minegs-partial"
+    (other / "scans").mkdir(parents=True)
+    (other / "rescued.txt").write_text("do not delete me")
+    with pytest.raises(ContractError, match="did not write"):
+        extract(path, tmp_path / "out2", compute_hash=False)
+    assert (other / "rescued.txt").exists()
+    assert not (tmp_path / "out2").exists()
+
+
+def test_a_crash_inside_the_publish_window_is_recovered_not_discarded(fake_e57, tmp_path):
+    """Publish moves the old tree aside, renames the new one in, then drops the backup.
+
+    A crash between the first two steps leaves no work_dir and a hidden backup holding the
+    only copy of the previous run. Treating that backup as stale would turn a crash into
+    silent data loss — the exact failure this whole design exists to remove — so it is put
+    back instead, and the run then refuses like any other occupied target.
+    """
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    extract(path, out, compute_hash=False)
+    good = {p.name: p.read_bytes() for p in (out / "scans").iterdir()}
+
+    # exactly the on-disk state a crash between the two renames leaves behind
+    out.rename(tmp_path / ".out.minegs-previous")
+    assert not out.exists()
+
+    with pytest.raises(ContractError, match="already holds extraction output"):
+        extract(path, out, compute_hash=False)
+    assert {p.name: p.read_bytes() for p in (out / "scans").iterdir()} == good
+    assert not (tmp_path / ".out.minegs-previous").exists()
+
+    # and when the run does go through, the recovery is reported rather than swallowed
+    out.rename(tmp_path / ".out.minegs-previous")
+    m = extract(path, out, overwrite=True, compute_hash=False)
+    assert any("interrupted" in n for n in m.notes), "a recovery is never silent"
+
+
+def test_a_successful_publish_leaves_no_backup_behind(fake_e57, tmp_path):
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    extract(path, out, compute_hash=False)
+    extract(path, out, overwrite=True, compute_hash=False)
+    hidden = sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("."))
+    assert hidden == [], hidden
+
+
+def test_recorded_paths_point_at_the_published_tree_not_the_temporary_one(fake_e57, tmp_path):
+    path, _ = fake_e57(
+        [_scan(data=cartesian_data(3))],
+        root=root_with_images(image_node(associated_scan_guid=GUID_A)),
+    )
+    out = tmp_path / "out"
+    m = extract(path, out, compute_hash=False)
+    assert m.work_dir == str(out.resolve())
+    assert m.scan_outputs[0].path == str(out / "scans" / "scan_000.ply")
+    assert m.image_outputs[0].path == str(out / "images" / "image_000.jpg")
+    for recorded in (m.scan_outputs[0].path, m.image_outputs[0].path):
+        assert "minegs-partial" not in recorded
+        assert Path(recorded).is_file(), "a recorded path must exist once the run is published"
+    reloaded = E57ExtractionManifest.load(out / "extraction_manifest.json")
+    assert Path(reloaded.scan_outputs[0].path).is_file()
+
+
+def test_a_symlinked_target_is_refused(fake_e57, tmp_path):
+    """Publish renames the target aside, which would replace the link, not what it points at."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "out"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ContractError, match="symlink"):
+        extract(path, link, compute_hash=False)
+    assert link.is_symlink() and link.resolve() == real.resolve()
+
+
+def test_an_external_image_output_says_why_it_has_no_hash(fake_e57, tmp_path):
+    from PIL import Image
+
+    d = tmp_path / "images"
+    d.mkdir()
+    Image.new("RGB", (8, 4)).save(d / "a.png")
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    (im,) = extract(path, tmp_path / "out", images_dir=d, compute_hash=False).image_outputs
+    assert im.sha256 is None and im.hash_skipped_reason, "never a bare None"
+
+
 def test_a_scan_too_large_for_memory_can_be_refused(fake_e57, tmp_path):
     path, _ = fake_e57([make_scan(point_count=10_000_000, pose=pose_node(IDENTITY, (0, 0, 0)))])
     with pytest.raises(ContractError, match="max-scan-points"):
@@ -529,9 +737,11 @@ def test_an_unreadable_blob_does_not_write_a_truncated_file(fake_e57, tmp_path):
         [_scan(data=cartesian_data(3))],
         root=root_with_images(image_node(blob=ExplodingBlob("jpegImage", b"xx"))),
     )
+    out = tmp_path / "out"
     with pytest.raises(Exception, match="blob payload unreadable"):
-        extract(path, tmp_path / "out", compute_hash=False)
-    assert not (tmp_path / "out" / "images" / "image_000.jpg").exists()
+        extract(path, out, compute_hash=False)
+    assert not out.exists(), "the image path is a mid-write failure surface too"
+    assert not any(p.name.startswith(".out") for p in tmp_path.iterdir())
 
 
 def test_images_can_be_skipped_entirely(fake_e57, tmp_path):
@@ -578,16 +788,42 @@ def test_manual_mapping_metadata_reaches_the_images(fake_e57, tmp_path):
 
 
 def test_external_images_are_referenced_not_copied(fake_e57, tmp_path):
+    """Extraction gets data *out of* an E57; a file already on disk needs no copy, only a
+    reference and a digest, so a directory of panoramas is not duplicated into staging."""
+    from minegs.core.provenance import sha256_file
     from PIL import Image
 
     d = tmp_path / "images"
     d.mkdir()
     Image.new("RGB", (8, 4)).save(d / "a.png")
     path, _ = fake_e57([_scan(data=cartesian_data(3))])
-    (im,) = extract(path, tmp_path / "out", images_dir=d, compute_hash=False).image_outputs
+    (im,) = extract(path, tmp_path / "out", images_dir=d).image_outputs
     assert im.source == "external_file" and im.extracted is False
-    assert im.path == str((d / "a.png").resolve()) and im.sha256
+    assert im.path == str((d / "a.png").resolve())
+    assert im.sha256 == sha256_file(d / "a.png"), "a referenced input is still hashed"
     assert not (tmp_path / "out" / "images").exists()
+
+
+def test_no_hash_skips_every_input_digest_consistently(fake_e57, tmp_path):
+    """--no-hash means one thing everywhere, and says so rather than leaving a blank."""
+    from PIL import Image
+
+    d = tmp_path / "images"
+    d.mkdir()
+    Image.new("RGB", (8, 4)).save(d / "a.png")
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    m = extract(path, tmp_path / "out", images_dir=d, compute_hash=False)
+
+    assert m.source_sha256 is None and m.hash_skipped_reason
+    assert m.mapping_report.source_sha256 is None and m.mapping_report.hash_skipped_reason
+    assert m.mapping_report.image_root_sha256 is None
+    asset = m.mapping_report.images[0]
+    assert asset.sha256 is None and asset.hash_skipped_reason
+    assert m.image_outputs[0].sha256 is None
+    inv = E57Inventory.load(tmp_path / "out" / "inventory.json")
+    assert inv.file.sha256 is None and inv.file.hash_skipped_reason
+    # output digests are the record of what we produced, not an input, so they stay
+    assert m.scan_outputs[0].sha256
 
 
 # ---------------------------------------------------------------- the manifest (§26)
@@ -623,6 +859,125 @@ def test_extraction_manifest_round_trips_and_records_hashes(fake_e57, tmp_path):
         "notes",
         "provenance",
     }
+
+
+def test_one_digest_is_shared_by_every_artifact_in_a_staging_tree(fake_e57, tmp_path):
+    """A staging tree where only the manifest names the source is not a provenance chain.
+
+    scan_000 and image_000 are indices into a specific file, so an artifact that cannot name
+    that file's bytes cannot say what its own ids refer to. All three artifacts carry the same
+    digest, computed once.
+    """
+    from minegs.core.provenance import sha256_file
+    from minegs.ingest.e57.mapping import PanoMappingReport
+
+    path, _ = fake_e57(
+        [_scan(data=cartesian_data(3))],
+        root=root_with_images(image_node(associated_scan_guid=GUID_A)),
+    )
+    out = tmp_path / "out"
+    m = extract(path, out)
+    expected = sha256_file(path)
+
+    inv = E57Inventory.load(out / "inventory.json")
+    rep = PanoMappingReport.load(out / "pano_mapping.json")
+    assert m.source_sha256 == expected
+    assert inv.file.sha256 == expected and inv.file.hash_skipped_reason is None
+    assert rep.source_sha256 == expected and rep.hash_skipped_reason is None
+    assert m.mapping_report.source_sha256 == expected
+    for artifact in (inv, rep, m):
+        assert artifact.provenance.source_assets[0].sha256 == expected
+
+
+def test_the_e57_is_hashed_once_per_extraction(fake_e57, tmp_path, monkeypatch):
+    """Three artifacts, one 50 GB read. And not before the preflight has had its say."""
+    import minegs.ingest.e57.extract as extract_mod
+    from minegs.core.provenance import sha256_file as real
+
+    calls: list[str] = []
+
+    def counted(target, *a, **k):
+        calls.append(str(target))
+        return real(target, *a, **k)
+
+    monkeypatch.setattr(extract_mod, "sha256_file", counted)
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    extract(path, tmp_path / "out")
+    assert calls.count(str(path)) == 1, calls
+
+
+def test_hashing_happens_after_the_preflight_refuses(fake_e57, tmp_path, monkeypatch):
+    import minegs.ingest.e57.extract as extract_mod
+
+    def forbidden(target, *a, **k):
+        raise AssertionError(f"a refused run must not stream {target}")
+
+    monkeypatch.setattr(extract_mod, "sha256_file", forbidden)
+    path, _ = fake_e57([_scan(pose=None, data=cartesian_data(3))])
+    with pytest.raises(E57PoseUnusableError):
+        extract(path, tmp_path / "out")
+
+
+def test_mapping_files_are_recorded_as_inputs_with_their_hashes(fake_e57, tmp_path):
+    """The same E57 mapped with two different CSVs is two different results.
+
+    A provenance record naming only the E57 cannot tell them apart, so it cannot reproduce
+    either one.
+    """
+    from minegs.core.provenance import sha256_file
+
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\n")
+    manifest = tmp_path / "vendor.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "vendor": "Acme",
+                "generated_by": "exporter 2.1",
+                "mappings": [{"image_id": "image_001", "scan_id": "scan_000"}],
+            }
+        )
+    )
+    path, _ = fake_e57(
+        [_scan(data=cartesian_data(3))],
+        root=root_with_images(image_node(), image_node()),
+    )
+    m = extract(path, tmp_path / "out", mapping=mapping, vendor_manifest=manifest)
+
+    inputs = {i.role: i for i in m.mapping_report.mapping_inputs}
+    assert set(inputs) == {"explicit_mapping", "vendor_manifest"}
+    assert inputs["explicit_mapping"].sha256 == sha256_file(mapping)
+    assert inputs["vendor_manifest"].sha256 == sha256_file(manifest)
+    assert inputs["explicit_mapping"].row_count == 1
+    assert all(i.hash_skipped_reason is None for i in inputs.values())
+
+    recorded = {a.path: a.sha256 for a in m.provenance.source_assets}
+    assert recorded[str(mapping.resolve())] == sha256_file(mapping)
+    assert recorded[str(manifest.resolve())] == sha256_file(manifest)
+    assert recorded[str(Path(m.source_e57))] == m.source_sha256
+
+
+def test_external_image_bytes_are_named_in_the_provenance(fake_e57, tmp_path):
+    from minegs.core.provenance import sha256_file
+    from PIL import Image
+
+    d = tmp_path / "images"
+    d.mkdir()
+    Image.new("RGB", (8, 4), (1, 2, 3)).save(d / "a.png")
+    Image.new("RGB", (8, 4), (4, 5, 6)).save(d / "b.png")
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    m = extract(path, tmp_path / "out", images_dir=d)
+
+    rep = m.mapping_report
+    assert [a.sha256 for a in rep.images] == [sha256_file(d / "a.png"), sha256_file(d / "b.png")]
+    assert rep.image_root_sha256 and len(rep.image_root_sha256) == 64
+    root_asset = next(a for a in m.provenance.source_assets if a.path == str(d.resolve()))
+    assert root_asset.sha256 == rep.image_root_sha256
+
+    # the set digest must move when the set does
+    Image.new("RGB", (8, 4), (9, 9, 9)).save(d / "b.png")
+    again = extract(path, tmp_path / "out2", images_dir=d)
+    assert again.mapping_report.image_root_sha256 != rep.image_root_sha256
 
 
 def test_staging_layout_is_not_a_dataset(fake_e57, tmp_path):

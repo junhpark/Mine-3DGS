@@ -36,6 +36,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -47,7 +50,6 @@ from minegs.core.errors import ContractError
 from minegs.core.pointcloud import PointCloud, voxel_downsample, write_ply
 from minegs.core.provenance import (
     ProvenanceRecord,
-    SourceAsset,
     git_commit,
     sha256_file,
     tool_versions,
@@ -62,6 +64,7 @@ from minegs.ingest.e57.inventory import (
     SPHERICAL_FIELDS,
     inventory,
     scan_pose,
+    with_source_hash,
 )
 from minegs.ingest.e57.mapping import MappingRecord, PanoMappingReport, build_mapping_report
 from minegs.ingest.e57.models import E57Inventory, ScanPose
@@ -155,6 +158,8 @@ class ImageOutput(_Strict):
     mapping_status: str
     mapping_evidence_type: str
     sha256: str | None = None
+    #: Why ``sha256`` is absent, so "not hashed" never reads as "could not be hashed".
+    hash_skipped_reason: str | None = None
     issues: list[str] = Field(default_factory=list)
 
 
@@ -429,49 +434,179 @@ def plan_scans(
     return selected, notes
 
 
-def _prepare_work_dir(work_dir: Path, overwrite: bool) -> None:
-    """Refuse an occupied directory, or empty it. Never write one run on top of another.
+#: What this extractor writes at the root of a staging directory.
+_ROOT_OUTPUTS = ("inventory.json", "pano_mapping.json", "extraction_manifest.json")
+_OUTPUT_DIRS = {"scans": re.compile(r"^scan_\d{3}\.(ply|pose\.json)$")}
+_OUTPUT_DIRS["images"] = re.compile(r"^image_\d{3}\.(jpg|png)$")
 
-    ``overwrite`` *replaces*: the previous ``scans/`` and ``images/`` are removed first.
-    Writing over them file by file would leave any scan the new run did not select sitting
-    there — possibly in the other frame, since a SCANNER-frame cloud and a SOURCE-frame one
-    look identical — and the manifest would not mention it.
 
-    It removes only files this extractor itself writes. ``--overwrite`` pointed at a
-    directory holding anything else refuses rather than deleting it: a mistyped path must not
-    be able to destroy data, and the option means "replace my last extraction", not "empty
-    this directory".
+def foreign_entries(work_dir: Path) -> list[str]:
+    """Everything in ``work_dir`` that this extractor would not have written.
+
+    Used to decide whether a directory is ours to replace. Anything unrecognised — a stray
+    note, a hand-edited JSON, a subdirectory of someone's own — means the directory is not
+    ours, and neither ``--overwrite`` nor the publish step may touch it.
     """
-    import shutil
+    out: list[str] = []
+    for entry in sorted(work_dir.iterdir(), key=lambda e: e.name):
+        pattern = _OUTPUT_DIRS.get(entry.name)
+        if pattern is not None and entry.is_dir():
+            out += [
+                f"{entry.name}/{c.name}"
+                for c in sorted(entry.iterdir(), key=lambda c: c.name)
+                if not (c.is_file() and pattern.match(c.name))
+            ]
+        elif not (entry.name in _ROOT_OUTPUTS and entry.is_file()):
+            out.append(entry.name + ("/" if entry.is_dir() else ""))
+    return out
 
-    outputs = (work_dir / "scans", work_dir / "images", work_dir / "extraction_manifest.json")
-    existing = [p for p in outputs if p.exists()]
-    if existing and not overwrite:
+
+def _recover_interrupted_publish(work_dir: Path) -> str | None:
+    """Put back a tree that a crash left moved aside, and say so.
+
+    :func:`_publish` moves the old tree to ``.<name>.minegs-previous``, renames the new one
+    into place, then removes the backup. A crash between the first two steps leaves no
+    ``work_dir`` at all and a backup holding the only copy of the previous run. Restoring it
+    makes that window self-healing; treating the backup as stale and discarding it would turn
+    a crash into silent data loss, which is the whole failure mode this design exists to
+    remove.
+    """
+    previous = work_dir.parent / f".{work_dir.name}.minegs-previous"
+    if work_dir.exists() or not previous.exists() or not previous.is_dir():
+        return None
+    previous.rename(work_dir)
+    return (
+        f"restored {work_dir} from {previous.name}: a previous publish was interrupted after "
+        "the old tree had been moved aside but before the new one was in place"
+    )
+
+
+def _prepare_target(work_dir: Path, overwrite: bool) -> str | None:
+    """Recover an interrupted publish, then decide whether we may publish into ``work_dir``.
+
+    Called twice: once at the very top of a run, so a mistyped target costs nothing, and again
+    from :func:`staging_dir` at the moment it matters. Idempotent — the second call finds the
+    recovery already done.
+    """
+    note = _recover_interrupted_publish(work_dir)
+    _check_target(work_dir, overwrite)
+    return note
+
+
+def _check_target(work_dir: Path, overwrite: bool) -> None:
+    """Whether ``work_dir`` is ours to replace. Pure: it inspects and refuses, nothing else.
+
+    A directory holding anything this extractor did not write is refused first and regardless
+    of ``overwrite`` — that refusal protects data, and the occupied-directory one only
+    protects tidiness.
+    """
+    if not work_dir.name:
         raise ContractError(
-            f"{work_dir} already holds extraction output ({[p.name for p in existing]}). "
-            "Writing into it would mix two runs whose scans cannot be told apart afterwards. "
-            "Use a new directory, or pass --overwrite to replace it."
+            f"{work_dir} has no directory name to stage beside. Give the extraction a named "
+            "directory of its own."
         )
-    for path in existing:
-        if path.is_dir():
-            foreign = sorted(p.name for p in path.iterdir() if not _is_extractor_output(p))
-            if foreign:
-                raise ContractError(
-                    f"{path} holds files this extractor did not write ({foreign[:5]}). "
-                    "--overwrite replaces a previous extraction; it will not delete anything "
-                    "else. Point the extraction at a directory of its own."
-                )
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-    (work_dir / "scans").mkdir(parents=True, exist_ok=True)
+    if work_dir.is_symlink():
+        # Publishing renames the target aside, which would replace the *link* and leave what
+        # it points at untouched — the opposite of what --overwrite says it does.
+        raise ContractError(
+            f"{work_dir} is a symlink. Extraction publishes by renaming the target into "
+            "place, which would replace the link rather than what it points at. Pass the "
+            "real directory."
+        )
+    if work_dir.exists() and not work_dir.is_dir():
+        raise ContractError(
+            f"{work_dir} exists and is not a directory. Extraction writes a staging tree, so "
+            "it needs a directory of its own."
+        )
+    if not work_dir.exists() or not any(work_dir.iterdir()):
+        return
+    foreign = foreign_entries(work_dir)
+    if foreign:
+        raise ContractError(
+            f"{work_dir} holds files this extractor did not write ({foreign[:5]}). Extraction "
+            "replaces a whole staging tree, and it will not delete anything else. Point it at "
+            "a directory of its own."
+        )
+    if not overwrite:
+        raise ContractError(
+            f"{work_dir} already holds extraction output. Writing into it would mix two runs "
+            "whose scans cannot be told apart afterwards. Use a new directory, or pass "
+            "--overwrite to replace it."
+        )
 
 
-_OUTPUT_NAME = re.compile(r"^(scan_\d{3}\.(ply|pose\.json)|image_\d{3}\.(jpg|png))$")
+def _discard(path: Path, what: str) -> None:
+    """Remove a directory this extractor owns, refusing if anything else is inside it."""
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise ContractError(f"{path} is {what}, but it is not a directory. Remove it and re-run.")
+    foreign = foreign_entries(path)
+    if foreign:
+        raise ContractError(
+            f"{path} is {what} and holds files this extractor did not write ({foreign[:5]}). "
+            "Inspect it and remove it yourself; this tool will not delete it."
+        )
+    shutil.rmtree(path)
 
 
-def _is_extractor_output(path: Path) -> bool:
-    return path.is_file() and bool(_OUTPUT_NAME.match(path.name))
+@contextmanager
+def staging_dir(work_dir: Path, overwrite: bool) -> Iterator[Path]:
+    """Write a run into a sibling temporary tree and publish it only once it is complete.
+
+    Extraction writes point clouds one scan at a time and the manifest last. Writing those
+    straight into ``work_dir`` means a failure on scan 12 of 40 leaves twelve scans, no
+    manifest, and a directory that looks like a finished run to anything that only checks for
+    PLYs — and with ``--overwrite`` it means the previous *good* run was already deleted to
+    make room for the one that just failed.
+
+    So the run lands in ``.<name>.minegs-partial`` next to the target (same directory, hence
+    the same filesystem, hence an atomic rename) and is moved into place at the end. On the
+    way there the old tree is moved aside rather than deleted, and put back if the final
+    rename fails. A failure anywhere leaves ``work_dir`` exactly as it was.
+    """
+    _prepare_target(work_dir, overwrite)
+    work_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp = work_dir.parent / f".{work_dir.name}.minegs-partial"
+    _discard(tmp, "left over from an interrupted extraction")
+    (tmp / "scans").mkdir(parents=True)
+    try:
+        yield tmp
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    try:
+        _publish(tmp, work_dir)
+    except ContractError:
+        raise
+    except OSError as e:
+        # The run itself succeeded, so the completed tree is kept and named rather than
+        # deleted; only the move failed. ContractError keeps this on the exit-code contract.
+        raise ContractError(
+            f"the extraction completed but could not be published into {work_dir} ({e}). "
+            f"Nothing there was changed; the finished run is at {tmp}."
+        ) from e
+
+
+def _publish(tmp: Path, work_dir: Path) -> None:
+    """Move a complete staging tree into place, restoring the previous one if that fails."""
+    if not work_dir.exists():
+        tmp.rename(work_dir)
+        return
+    previous = work_dir.parent / f".{work_dir.name}.minegs-previous"
+    _discard(previous, "left over from an interrupted publish")
+    work_dir.rename(previous)
+    try:
+        tmp.rename(work_dir)
+    except OSError as e:
+        previous.rename(work_dir)
+        raise ContractError(
+            f"the extraction completed but could not be moved into {work_dir} ({e}). The "
+            f"previous contents are back in place and the new run is at {tmp}."
+        ) from e
+    # The run is published; failing it now over a leftover backup would be a lie about what
+    # happened. The next run's target check finds and removes it.
+    shutil.rmtree(previous, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- image extraction
@@ -512,8 +647,10 @@ def extract_image(handle: Any, asset: ImageAsset, out_dir: Path) -> tuple[Path, 
 def _image_results(
     handle: Any,
     report: PanoMappingReport,
+    staged: Path,
     work_dir: Path,
 ) -> tuple[list[ImageOutput], list[SkippedImage], list[str]]:
+    """Write each supported image into ``staged``, recording its published ``work_dir`` path."""
     outputs: list[ImageOutput] = []
     skipped: list[SkippedImage] = []
     issues: list[str] = []
@@ -549,7 +686,7 @@ def _image_results(
             )
             continue
         try:
-            path, size, fmt = extract_image(handle, asset, work_dir / "images")
+            path, size, fmt = extract_image(handle, asset, staged / "images")
         except ContractError as e:
             issues.append(str(e))
             skipped.append(
@@ -564,7 +701,7 @@ def _image_results(
         outputs.append(
             ImageOutput(
                 image_id=asset.image_id,
-                path=str(path),
+                path=str(work_dir / "images" / path.name),
                 source="e57_embedded",
                 extracted=True,
                 representation=asset.representation,
@@ -604,7 +741,10 @@ def _external_image_output(asset: ImageAsset, rec: MappingRecord) -> ImageOutput
         mapped_station_id=rec.station_id,
         mapping_status=rec.status,
         mapping_evidence_type=rec.evidence_type,
-        sha256=sha256_file(path) if path.is_file() else None,
+        # The digest discovery already computed for this file — hashing it a second time
+        # would double the I/O and could disagree if the file changed underneath us.
+        sha256=asset.sha256,
+        hash_skipped_reason=asset.hash_skipped_reason,
         issues=list(asset.issues),
     )
 
@@ -638,26 +778,36 @@ def extract(
     p = Path(path)
     work_dir = Path(work_dir)
 
+    # Cheapest refusal first: a mistyped or occupied target should not cost a 50 GB read. The
+    # staging context checks again at the moment it matters, so a race here is not a hole.
+    recovery_note = _prepare_target(work_dir, overwrite)
+
     inv = inventory(p, compute_hash=False)
     selected, memory_notes = plan_scans(inv, scan_ids, registered, max_scan_points)
+    # One digest for the whole staging tree. Hashing is O(file size), so it happens exactly
+    # once and only after the preflight — a refusal should not first stream 50 GB. All three
+    # artifacts written below then agree about which bytes they describe, which is what makes
+    # an index-derived id like scan_000 mean anything.
+    sha = sha256_file(p) if compute_hash else None
+    inv = with_source_hash(inv, sha)
     report = build_mapping_report(
         p,
         mapping=mapping,
         vendor_manifest=vendor_manifest,
         images_dir=images_dir,
         compute_hash=False,
+        source_sha256=sha,
         inv=inv,
     )
-    # Everything that can refuse has refused by now; only then is anything written.
-    _prepare_work_dir(work_dir, overwrite)
-
     issues: list[str] = []
-    notes: list[str] = list(memory_notes)
+    notes: list[str] = ([recovery_note] if recovery_note else []) + list(memory_notes)
     scan_outputs: list[ScanOutput] = []
     image_outputs: list[ImageOutput] = []
     skipped: list[SkippedImage] = []
 
-    with _nodes.open_e57(p) as handle:
+    # Everything that can refuse from metadata alone has refused by now. What follows can
+    # still fail on a scan's payload, so it lands in a temporary tree and is published whole.
+    with staging_dir(work_dir, overwrite) as staged, _nodes.open_e57(p) as handle:
         for s in selected:
             header = handle.get_header(s.scan_index)
             pose, pose_status = scan_pose(header)
@@ -675,13 +825,15 @@ def extract(
             masked = len(cloud)
             if voxel_m:
                 cloud = cloud.select(voxel_downsample(cloud.xyz, voxel_m))
-            out_path = write_ply(cloud, work_dir / "scans" / f"{s.scan_id}.ply", xyz_dtype="f8")
-            _write_pose_json(work_dir / "scans" / f"{s.scan_id}.pose.json", s, pose, frame)
+            out_path = write_ply(cloud, staged / "scans" / f"{s.scan_id}.ply", xyz_dtype="f8")
+            _write_pose_json(staged / "scans" / f"{s.scan_id}.pose.json", s, pose, frame)
             scan_outputs.append(
                 ScanOutput(
                     scan_id=s.scan_id,
                     scan_index=s.scan_index,
-                    path=str(out_path),
+                    # The path this file will have once the tree is published, not the
+                    # temporary one it is being written to.
+                    path=str(work_dir / "scans" / f"{s.scan_id}.ply"),
                     point_count_input=s.point_count,
                     point_count_masked=masked,
                     point_count_output=len(cloud),
@@ -702,48 +854,52 @@ def extract(
                 )
             )
         if with_images:
-            image_outputs, skipped, image_issues = _image_results(handle, report, work_dir)
+            image_outputs, skipped, image_issues = _image_results(handle, report, staged, work_dir)
             issues.extend(image_issues)
 
-    inv.save(work_dir / "inventory.json")
-    report.save(work_dir / "pano_mapping.json")
+        inv.save(staged / "inventory.json")
+        report.save(staged / "pano_mapping.json")
 
-    issues.extend(report.issues)
-    notes.extend(report.notes)
-    if not with_images and report.images:
-        notes.append(f"{len(report.images)} images discovered but not extracted (--no-images)")
-    # Deliberately phrased without naming the later frames: a grep of any Phase 0B artifact
-    # for those names must be a true positive, so not even a disclaimer may contain one.
-    notes.append(
-        "these outputs are in the "
-        + ("SOURCE" if registered else "SCANNER")
-        + " frame. Declaring a registered global frame, choosing a metric origin and building "
-        "dataset/ are Phase 0C (docs/ROADMAP.md)"
-    )
+        issues.extend(report.issues)
+        notes.extend(report.notes)
+        if not with_images and report.images:
+            notes.append(f"{len(report.images)} images discovered but not extracted (--no-images)")
+        # Deliberately phrased without naming the later frames: a grep of any Phase 0B
+        # artifact for those names must be a true positive, so not even a disclaimer may
+        # contain one.
+        notes.append(
+            "these outputs are in the "
+            + ("SOURCE" if registered else "SCANNER")
+            + " frame. Declaring a registered global frame, choosing a metric origin and "
+            "building dataset/ are Phase 0C (docs/ROADMAP.md)"
+        )
 
-    sha = sha256_file(p) if compute_hash else None
-    manifest = E57ExtractionManifest(
-        source_e57=str(p.resolve()),
-        source_sha256=sha,
-        hash_skipped_reason=None if compute_hash else "requested with --no-hash",
-        work_dir=str(work_dir.resolve()),
-        registration="registered" if registered else "unregistered",
-        output_frame=SOURCE_FRAME if registered else SCANNER_FRAME,
-        scan_outputs=scan_outputs,
-        image_outputs=image_outputs,
-        skipped_images=skipped,
-        mapping_report=report,
-        issues=issues,
-        notes=notes,
-        provenance=ProvenanceRecord(
-            git_commit=git_commit(),
-            source_assets=[
-                SourceAsset(path=str(p.resolve()), sha256=sha or "", size_bytes=p.stat().st_size)
-            ],
-            tool_versions=tool_versions(),
-        ),
-    )
-    manifest.save(work_dir / "extraction_manifest.json")
+        manifest = E57ExtractionManifest(
+            source_e57=str(p.resolve()),
+            source_sha256=sha,
+            hash_skipped_reason=None if sha is not None else "requested with --no-hash",
+            work_dir=str(work_dir.resolve()),
+            registration="registered" if registered else "unregistered",
+            output_frame=SOURCE_FRAME if registered else SCANNER_FRAME,
+            scan_outputs=scan_outputs,
+            image_outputs=image_outputs,
+            skipped_images=skipped,
+            mapping_report=report,
+            issues=issues,
+            notes=notes,
+            provenance=ProvenanceRecord(
+                git_commit=git_commit(),
+                # The mapping report already enumerated every input that shaped this run —
+                # the E57, each mapping file, the external image set. Rebuilding the list
+                # here would let the two artifacts drift about what was read.
+                source_assets=list(report.provenance.source_assets),
+                tool_versions=tool_versions(),
+            ),
+        )
+        # Written last, inside the staging tree: a directory holding a manifest is a complete
+        # run, and one is only ever published whole.
+        manifest.save(staged / "extraction_manifest.json")
+
     return manifest
 
 

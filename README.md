@@ -123,7 +123,15 @@ minegs ingest e57 pano-map tunnel.e57 --images-dir ./panoramas --mapping mapping
 
 근거가 없으면 `unmapped`, 하나의 근거가 여러 scan 을 가리키면 `ambiguous`, 근거가 가리키는
 scan 이 없으면 `orphan`, 사람이 쓴 매핑이 파일 자체 근거와 다르면 (덮어쓰기가 아니라) `conflict`
-로 보고한다. 매핑 파일은 헤더가 있는 CSV 또는 JSON 이고, 이미지 열
+로 보고한다. E57 이 선언한 GUID 가 이 파일에 없을 때도 마찬가지다 — target 이 없다는 것은 파일의
+진술이 해석 불가능하다는 뜻이지 진술이 없다는 뜻이 아니라서, 그 경우에도 매핑 파일이 이기지 않고
+`conflict` 가 된다.
+
+결과를 바꾸는 입력은 전부 hash 되어 리포트에 남는다: E57, 매핑 파일, vendor manifest, 외부
+이미지 각각. 같은 E57 을 다른 CSV 로 매핑하면 다른 결과이므로 E57 만 적힌 provenance 로는 둘을
+구분할 수 없다. `--no-hash` 는 전부에 일관되게 적용되고 이유를 남긴다.
+
+매핑 파일은 헤더가 있는 CSV 또는 JSON 이고, 이미지 열
 (`image_id`/`image_name`/`image_guid`) 과 대상 열(`scan_id`/`scan_guid`/`station_id`) 을 하나씩
 갖는다:
 
@@ -161,6 +169,15 @@ invalid-state 마스크는 좌표·RGB·intensity·row/column 에 **동일하게
 없으면 8-bit 라고 가정하지 않고 raw 로 보존한다. 임베디드 이미지는 spherical·cylindrical 만
 꺼내며 바이트가 선언한 코덱과 맞는지 확인한다 — pinhole 등은 이유와 함께 `skipped_images` 에
 기록되고 다른 projection 으로 재해석되지 않는다.
+
+추출은 전부 성공했을 때만 publish 된다. run 은 `.<name>.minegs-partial` 임시 트리에 쓰이고
+마지막에 `work_dir` 로 rename 되므로, 40개 중 12번째 scan 에서 실패해도 "scan 12개 + manifest
+없음" 같은 완성처럼 보이는 디렉토리가 남지 않는다. `--overwrite` 는 이전 트리를 지우고 시작하는
+것이 아니라 옆으로 옮겨 두었다가 새 run 이 성공한 뒤에 치우므로, 실패한 재실행이 직전의 정상
+결과를 파괴하지 않는다. 이 추출기가 쓰지 않은 파일이 하나라도 있는 디렉토리는 `--overwrite`
+여부와 무관하게 거부한다. inventory·pano_mapping·extraction_manifest 세 산출물은 한 번만 계산한
+같은 source digest 를 공유한다 — `scan_000` 은 특정 파일 안의 index 라서, 어느 바이트를 읽었는지
+말할 수 없는 산출물은 자기 ID 가 무엇을 가리키는지도 말할 수 없다.
 
 pye57 에는 chunked reader 가 없어 scan 을 통째로 읽는다. 큰 scan 은 예상 peak memory 를 note 로
 알려주고 `--max-scan-points` 로 fail-closed 할 수 있다. production 규모 타일링은

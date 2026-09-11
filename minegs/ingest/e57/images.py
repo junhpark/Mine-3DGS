@@ -9,10 +9,15 @@ Two sources:
 * **embedded** — entries under an E57's ``/images2D``.
 * **external** — image files in a directory next to the survey.
 
-Both produce the same :class:`ImageAsset` contract. Discovery never opens an image's pixel
-data: an E57 blob's byte count comes from the node, and an external file's dimensions come
-from the header PIL reads, so a directory of 4096x4096 panoramas costs no more than its
+Both produce the same :class:`ImageAsset` contract. Discovery never *decodes* an image: an
+E57 blob's byte count comes from the node, and an external file's dimensions come from the
+header PIL reads, so classifying a directory of 4096x4096 panoramas costs no more than its
 directory listing plus a few hundred header bytes each.
+
+External discovery does hash each file by default, which is O(bytes) — an external image is
+an input that shapes the result, so provenance has to be able to name the bytes that were
+read. Pass ``compute_hash=False`` (``--no-hash``) to skip it; the asset then records *why*
+the digest is absent so it can never be mistaken for a hashed one.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from minegs.core.provenance import sha256_file
 from minegs.ingest.e57 import _nodes
 from minegs.ingest.e57.exceptions import (
     E57FileNotFoundError,
@@ -77,6 +83,12 @@ class ImageAsset(BaseModel):
     blob_bytes: int | None = None
     #: External only: the file on disk.
     path: str | None = None
+
+    #: External files only: this file's own digest. An embedded image's bytes live inside the
+    #: E57, so the source file's SHA-256 already covers them and this stays ``None``.
+    sha256: str | None = None
+    #: Why ``sha256`` is absent, when it could have been computed and was not.
+    hash_skipped_reason: str | None = None
 
     vendor_metadata: dict[str, Any] | None = None
     #: Problems: this image cannot be interpreted or extracted as declared.
@@ -232,7 +244,9 @@ def _as_int(v: Any) -> int | None:
 
 
 def discover_external_images(
-    directory: str | Path, suffixes: tuple[str, ...] = _EXTERNAL_SUFFIXES
+    directory: str | Path,
+    suffixes: tuple[str, ...] = _EXTERNAL_SUFFIXES,
+    compute_hash: bool = True,
 ) -> list[ImageAsset]:
     """Enumerate image files in a directory, sorted by name for a deterministic index.
 
@@ -240,6 +254,9 @@ def discover_external_images(
     about its projection: an equirectangular panorama and a pinhole photo are the same file
     format, and the file name is not evidence (§10). Declaring it is the user's job, and
     mapping it needs an explicit mapping file.
+
+    Each file is hashed unless ``compute_hash=False``: it is an input to the result, so the
+    report has to be able to say which bytes it read.
     """
     d = Path(directory)
     if not d.exists():
@@ -276,6 +293,8 @@ def discover_external_images(
                 width=width,
                 height=height,
                 path=str(p),
+                sha256=sha256_file(p) if compute_hash else None,
+                hash_skipped_reason=None if compute_hash else "requested with --no-hash",
                 issues=issues,
                 notes=notes,
             )

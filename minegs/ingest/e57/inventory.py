@@ -405,6 +405,28 @@ def inventory(path: str | Path, compute_hash: bool = True) -> E57Inventory:
     )
 
 
+def with_source_hash(inv: E57Inventory, sha256: str | None) -> E57Inventory:
+    """The same inventory, stamped with a digest the caller already computed.
+
+    Extraction writes three artifacts describing one read of one file. Letting each compute
+    its own SHA-256 would stream a 50 GB scan three times; letting only one of them compute it
+    leaves a staging tree whose inventory cannot say which bytes it describes — and
+    ``scan_000`` means nothing without the digest of the file it is the first scan of. So the
+    digest is computed once and stamped onto every artifact that reports it.
+
+    ``None`` (hashing was skipped) returns the inventory unchanged, keeping its skip reason.
+    """
+    if sha256 is None:
+        return inv
+    file_info = inv.file.model_copy(update={"sha256": sha256, "hash_skipped_reason": None})
+    assets = [
+        a.model_copy(update={"sha256": sha256}) if a.path == inv.file.path else a
+        for a in inv.provenance.source_assets
+    ]
+    provenance = inv.provenance.model_copy(update={"source_assets": assets})
+    return inv.model_copy(update={"file": file_info, "provenance": provenance})
+
+
 def _file_findings(
     scans: list[E57ScanInventory], images: ImageSummary
 ) -> tuple[list[str], list[str]]:

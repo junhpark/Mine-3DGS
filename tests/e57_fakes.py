@@ -121,13 +121,14 @@ class FakeHeader:
         node: FakeNode,
         point_fields: list[str],
         point_count: int | None,
-        point_data: dict[str, Any] | None = None,
+        point_data: dict[str, Any] | BaseException | None = None,
     ) -> None:
         self.node = node
         self.point_fields = point_fields
         self._point_count = point_count
         #: Column arrays returned by ``read_scan_raw``. ``None`` means reading is a test
         #: failure, which is how the inventory's "never reads points" guarantee is enforced.
+        #: An exception instance is raised instead, standing in for a truncated payload.
         self.point_data = point_data
 
     @property
@@ -170,6 +171,8 @@ class FakeE57:
         if data is None:
             raise AssertionError("this reader must never read point data (§17)")
         self.reads.append(index)
+        if isinstance(data, BaseException):
+            raise data
         return {k2: np.asarray(v) for k2, v in data.items()}
 
     def close(self) -> None:
@@ -207,7 +210,7 @@ def make_scan(
     pose: FakeNode | None = None,
     bounds: dict[str, float] | None = None,
     extra: dict[str, Any] | None = None,
-    point_data: dict[str, Any] | None = None,
+    point_data: dict[str, Any] | BaseException | None = None,
 ) -> FakeHeader:
     children: dict[str, Any] = {}
     if guid is not None:
@@ -230,7 +233,7 @@ def make_scan(
             "intensity",
         ]
     )
-    if point_data is not None and point_fields is None:
+    if isinstance(point_data, dict) and point_fields is None:
         fields = list(point_data)
     return FakeHeader(FakeNode("data3D", children), fields, point_count, point_data)
 

@@ -24,11 +24,17 @@ Such observations may be printed as *hints* — a hint tells the user where to l
 write a mapping file; it never becomes a ``MappingRecord`` with a target. The cost of being
 wrong here is silent: a panorama attributed to the wrong station produces a reconstruction
 that trains, converges and is geometrically meaningless.
+
+Evidence is never overridden, only reconciled. Where two sources disagree the record is a
+``conflict`` with no target — including when the E57's own association names a scan this file
+does not contain. A statement whose target is missing is still a statement, and the moment we
+understand the file least is the worst moment to let something else quietly win.
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -115,6 +121,24 @@ class UnresolvedReference(_Strict):
     reason: str
 
 
+class MappingInput(_Strict):
+    """A mapping file that shaped this report.
+
+    Hashed because it is an *input*: the same E57 mapped with two different CSVs produces two
+    different reports, so a provenance record naming only the E57 cannot tell them apart or
+    reproduce either.
+    """
+
+    role: Literal["explicit_mapping", "vendor_manifest"]
+    path: str
+    sha256: str | None = None
+    #: Why ``sha256`` is absent, when it could have been computed and was not.
+    hash_skipped_reason: str | None = None
+    size_bytes: int
+    #: Rows the file contributed. A file that parsed to nothing is refused before this point.
+    row_count: int
+
+
 class MappingRecord(_Strict):
     """What we know about one image's station, and why we know it."""
 
@@ -153,6 +177,11 @@ class PanoMappingReport(VersionedModel):
     hash_skipped_reason: str | None = None
     #: Set when the images came from a directory rather than from the E57 itself.
     image_root: str | None = None
+    #: Digest over the discovered images' own digests — one value identifying the image set
+    #: that was read, without a second pass over the bytes. ``None`` when any went unhashed.
+    image_root_sha256: str | None = None
+    #: Every mapping file that shaped ``mappings``, hashed.
+    mapping_inputs: list[MappingInput] = Field(default_factory=list)
     scan_count: int = 0
 
     images: list[ImageAsset] = Field(default_factory=list)
@@ -176,6 +205,25 @@ class PanoMappingReport(VersionedModel):
 
     def has_any_issue(self) -> bool:
         return bool(self.issues) or bool(self.unresolved_references)
+
+
+def image_set_digest(images: list[ImageAsset]) -> str | None:
+    """One digest over the discovered images' own digests, or ``None`` if any is missing.
+
+    Derived from hashes already computed during discovery, so identifying the image set costs
+    nothing beyond the pass that had to happen anyway. ``None`` rather than a partial digest:
+    a value covering only the files that happened to be hashed would be worse than none.
+
+    An empty directory is a real input state with a real digest — "I looked here and found
+    nothing" is a fact about the run, and returning ``None`` for it would be indistinguishable
+    from having skipped hashing.
+    """
+    h = hashlib.sha256()
+    for im in images:
+        if im.sha256 is None:
+            return None
+        h.update(f"{im.image_id}\0{im.name or ''}\0{im.sha256}\n".encode())
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------- mapping file readers
@@ -531,9 +579,9 @@ def _record_for(
     # Several rows may name the same image. If they disagree, that is a conflict in the
     # mapping file itself and neither row wins.
     targets = {tuple(sorted(scans)) for _entry, scans, _hint in rows}
-    entry, scans, hint = rows[0]
-    if hint:
-        hints.append(hint)
+    entry, scans, _first_hint = rows[0]
+    # Every row's hint, not just the first: a near-miss on row 7 is the one the user needs.
+    hints += [h for _e, _s, h in rows if h]
     if len(targets) > 1:
         return MappingRecord(
             image_id=image.image_id,
@@ -571,23 +619,30 @@ def _record_for(
     scan_id = scans[0]
     # The file's own association is machine evidence. A mapping file that contradicts it is a
     # conflict, never an override: whichever is wrong, we do not know which (§13).
-    if emb_status in ("confirmed", "ambiguous") and scan_id not in emb_scans:
+    #
+    # ``orphan`` counts as a contradiction too. "The E57 says GUID_C" and "the user says
+    # scan_000" are different statements about the same image whether or not GUID_C happens to
+    # be in this file — a missing target makes the file's statement unresolvable, not absent.
+    # Treating it as absent would let a mapping file override the file's own evidence exactly
+    # when we understand that evidence least. An explicit override policy could exist one day;
+    # it would be a declared flag, not a side effect of the target being missing.
+    if emb_status in ("confirmed", "ambiguous", "orphan") and scan_id not in emb_scans:
+        declares = (
+            f"associates it with {emb_scans}"
+            if emb_scans
+            else f"associates it with scan GUID {emb_value}, which is not in this file"
+        )
         return MappingRecord(
             image_id=image.image_id,
             status="conflict",
             evidence_type=entry.evidence_type,
             evidence_value=f"{entry.origin} -> {entry.target}; "
-            f"E57 associatedData3DGuid {emb_value} -> {emb_scans}",
-            reason=f"{entry.origin} maps this image to {scan_id}, but the E57 itself associates "
-            f"it with {emb_scans}. A mapping file does not silently overwrite the file's own "
-            "evidence; resolve the disagreement and re-run",
+            f"E57 associatedData3DGuid {emb_value} -> {emb_scans or 'no scan in this file'}",
+            reason=f"{entry.origin} maps this image to {scan_id}, but the E57 itself {declares}. "
+            "A mapping file does not silently overwrite the file's own evidence; resolve the "
+            "disagreement and re-run",
             candidate_scan_ids=sorted({scan_id, *emb_scans}),
             hints=hints,
-        )
-    if emb_status == "orphan":
-        hints.append(
-            f"the E57 associates this image with scan GUID {emb_value}, which is not in this "
-            "file; the mapping file was used instead"
         )
 
     confirmed = entry.evidence_type == "vendor_manifest"
@@ -623,28 +678,62 @@ def build_mapping_report(
     images_dir: str | Path | None = None,
     compute_hash: bool = True,
     inv: E57Inventory | None = None,
+    source_sha256: str | None = None,
 ) -> PanoMappingReport:
     """Discover images, map them to scans by evidence, and report what was and was not mapped.
 
     ``images_dir`` discovers external image files instead of the E57's embedded ``/images2D``.
     An external file declares neither a projection nor an association, so without ``mapping``
     every one of them comes back ``unmapped`` — by design (§15).
+
+    Every input that can change the result is hashed: the E57, each mapping file, and each
+    external image. ``source_sha256`` lets a caller that already hashed the E57 (extraction
+    does, for three artifacts at once) hand the digest over instead of streaming the file
+    again. ``compute_hash=False`` skips hashing entirely and records why on each artifact.
     """
     from minegs.ingest.e57.inventory import inventory
 
     p = Path(path)
     inv = inv or inventory(p, compute_hash=False)
+    hashing = compute_hash or source_sha256 is not None
+    skipped_reason = None if hashing else "requested with --no-hash"
 
     if images_dir is not None:
-        images = discover_external_images(images_dir)
+        images = discover_external_images(images_dir, compute_hash=hashing)
     else:
         images = discover_embedded_images(p)
 
+    if (
+        mapping is not None
+        and vendor_manifest is not None
+        and Path(mapping).resolve() == Path(vendor_manifest).resolve()
+    ):
+        raise ContractError(
+            f"{Path(mapping).resolve()} was given as both --mapping and --vendor-manifest. "
+            "The two differ only in what they claim about who wrote the file, so one file "
+            "cannot be both; passing it twice would make it agree with itself and report the "
+            "result as confirmed."
+        )
+
+    # Vendor manifests first, so a report naming both files reads in evidence-tier order.
     entries: list[ExplicitEntry] = []
-    if vendor_manifest is not None:
-        entries.extend(read_vendor_manifest(vendor_manifest))
-    if mapping is not None:
-        entries.extend(read_mapping_file(mapping))
+    mapping_inputs: list[MappingInput] = []
+    for role, src in (("vendor_manifest", vendor_manifest), ("explicit_mapping", mapping)):
+        if src is None:
+            continue
+        rows = read_vendor_manifest(src) if role == "vendor_manifest" else read_mapping_file(src)
+        entries.extend(rows)
+        f = Path(src)
+        mapping_inputs.append(
+            MappingInput(
+                role=role,  # type: ignore[arg-type]
+                path=str(f.resolve()),
+                sha256=sha256_file(f) if hashing else None,
+                hash_skipped_reason=skipped_reason,
+                size_bytes=f.stat().st_size,
+                row_count=len(rows),
+            )
+        )
 
     records, unresolved, issues, notes = map_images(inv, images, entries)
 
@@ -653,16 +742,47 @@ def build_mapping_report(
             f"no images discovered in {images_dir or p}; panoramas for this survey, if any, "
             "are somewhere else"
         )
+    if images_dir is not None:
+        notes.append(
+            "these images came from a directory, so none of them carries the E57's own "
+            "associatedData3DGuid: on this path a mapping file has nothing to contradict and "
+            "is always accepted. Re-mapping images that were extracted OUT of an E57 will "
+            "therefore not reproduce the conflicts the E57 itself would have raised — map "
+            "against the E57 for that. Note also that image_000 here is the first file in "
+            "name order, not the first entry in /images2D"
+        )
     for im in images:
         for msg in im.issues:
             issues.append(f"{im.image_id}: {msg}")
 
-    sha = sha256_file(p) if compute_hash else None
+    sha = source_sha256 if source_sha256 is not None else (sha256_file(p) if compute_hash else None)
+    image_root = str(Path(images_dir).resolve()) if images_dir is not None else None
+    image_digest = image_set_digest(images) if images_dir is not None and hashing else None
+
+    # Every input, so the report can be reproduced from the record alone.
+    assets = [SourceAsset(path=str(p.resolve()), sha256=sha or "", size_bytes=p.stat().st_size)]
+    assets += [
+        SourceAsset(path=m.path, sha256=m.sha256 or "", size_bytes=m.size_bytes)
+        for m in mapping_inputs
+    ]
+    if image_root is not None:
+        # One entry for the directory, carrying the digest of the images actually read; the
+        # per-file digests are on the assets themselves rather than repeated here.
+        assets.append(
+            SourceAsset(
+                path=image_root,
+                sha256=image_digest or "",
+                size_bytes=sum(Path(im.path).stat().st_size for im in images if im.path),
+            )
+        )
+
     return PanoMappingReport(
         source_file=str(p.resolve()),
         source_sha256=sha,
-        hash_skipped_reason=None if compute_hash else "requested with --no-hash",
-        image_root=str(Path(images_dir).resolve()) if images_dir is not None else None,
+        hash_skipped_reason=None if sha is not None else "requested with --no-hash",
+        image_root=image_root,
+        image_root_sha256=image_digest,
+        mapping_inputs=mapping_inputs,
         scan_count=inv.scan_count,
         images=images,
         mappings=records,
@@ -671,9 +791,7 @@ def build_mapping_report(
         notes=notes,
         provenance=ProvenanceRecord(
             git_commit=git_commit(),
-            source_assets=[
-                SourceAsset(path=str(p.resolve()), sha256=sha or "", size_bytes=p.stat().st_size)
-            ],
+            source_assets=assets,
             tool_versions=tool_versions(),
         ),
     )
