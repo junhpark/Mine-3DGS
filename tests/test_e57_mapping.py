@@ -526,6 +526,73 @@ def test_external_images_map_with_an_explicit_mapping(fake_e57, tmp_path):
     ]
 
 
+def test_external_path_that_is_not_a_directory_fails_closed(tmp_path, fake_e57):
+    from minegs.ingest.e57.exceptions import E57NotAFileError
+
+    f = tmp_path / "a.jpg"
+    _write_png(f)
+    path, _ = fake_e57(_scans(GUID_A))
+    with pytest.raises(E57NotAFileError):
+        build_mapping_report(path, images_dir=f, compute_hash=False)
+
+
+def test_an_unreadable_external_image_is_reported_not_skipped(tmp_path):
+    d = tmp_path / "images"
+    d.mkdir()
+    (d / "broken.jpg").write_bytes(b"not an image")
+    (a,) = discover_external_images(d)
+    assert a.image_id == "image_000" and (a.width, a.height) == (None, None)
+    assert any("could not read image header" in i for i in a.issues)
+
+
+def test_vendor_pose_and_intrinsics_are_kept_verbatim(fake_e57):
+    """Recorded for later phases, interpreted by none of them here."""
+    node = image_node(
+        rep_extra={"focalLength": 0.012, "principalPointX": 2048.0},
+        extra={
+            "pose": FakeNode(
+                "pose",
+                {
+                    "rotation": FakeNode("rotation", {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}),
+                    "translation": FakeNode("translation", {"x": 1.0, "y": 2.0, "z": 3.0}),
+                },
+            )
+        },
+    )
+    path, _ = fake_e57(_scans(GUID_A), root=root_with_images(node))
+    (a,) = discover_embedded_images(path)
+    assert a.vendor_metadata == {
+        "focalLength": 0.012,
+        "principalPointX": 2048.0,
+        "pose_rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "pose_translation": [1.0, 2.0, 3.0],
+    }
+
+
+def test_vendor_export_refuses_to_read_stations_from_file_names(tmp_path):
+    """§10: an undocumented naming convention holds until an export renumbers, then every
+    panorama is attributed to the wrong station silently."""
+    from minegs.ingest.e57.pano.vendor_export import VendorExport
+
+    root = tmp_path / "vendor"
+    root.mkdir()
+    for name in ("Station_01.jpg", "Station_02.jpg"):
+        _write_png(root / name)
+
+    with pytest.raises(ContractError, match="not inferred from file names"):
+        VendorExport(root)
+    with pytest.raises(ContractError, match="vendor index not found"):
+        VendorExport(root, index=root / "nope.csv")
+
+    index = tmp_path / "index.csv"
+    index.write_text("station_id,pano_id\nS000,Station_01.jpg\nS001,Station_02.jpg\n")
+    src = VendorExport(root, index=index)
+    assert [(r.station_id, r.pano_id) for r in src.list_panoramas()] == [
+        ("S000", "Station_01.jpg"),
+        ("S001", "Station_02.jpg"),
+    ]
+
+
 def test_missing_external_directory_fails_closed(tmp_path, fake_e57):
     from minegs.ingest.e57.exceptions import E57FileNotFoundError
 
