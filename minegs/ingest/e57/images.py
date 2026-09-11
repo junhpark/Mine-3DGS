@@ -23,6 +23,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from minegs.ingest.e57 import _nodes
+from minegs.ingest.e57.exceptions import (
+    E57FileNotFoundError,
+    E57NotAFileError,
+    E57UnsupportedStructureError,
+)
 
 #: How an E57 says an image is projected. ``unknown`` covers both "the file declares a
 #: representation we do not model" and "an external file, whose projection nothing states".
@@ -179,7 +184,9 @@ def discover_embedded_images(path: str | Path) -> list[ImageAsset]:
             images = root["images2D"]
             count = int(images.childCount())
         except Exception as e:
-            raise _unenumerable(path, e) from e
+            raise E57UnsupportedStructureError(
+                path, f"/images2D could not be enumerated ({e})"
+            ) from e
         assets: list[ImageAsset] = []
         for i in range(count):
             node = images.get(i)
@@ -217,12 +224,6 @@ def discover_embedded_images(path: str | Path) -> list[ImageAsset]:
     return assets
 
 
-def _unenumerable(path: str | Path, error: Exception) -> Exception:
-    from minegs.ingest.e57.exceptions import E57UnsupportedStructureError
-
-    return E57UnsupportedStructureError(path, f"/images2D could not be enumerated ({error})")
-
-
 def _as_int(v: Any) -> int | None:
     try:
         return int(v) if v is not None else None
@@ -242,12 +243,8 @@ def discover_external_images(
     """
     d = Path(directory)
     if not d.exists():
-        from minegs.ingest.e57.exceptions import E57FileNotFoundError
-
         raise E57FileNotFoundError(d)
     if not d.is_dir():
-        from minegs.ingest.e57.exceptions import E57NotAFileError
-
         raise E57NotAFileError(d)
 
     files = sorted(
