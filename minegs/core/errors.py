@@ -31,10 +31,10 @@ class MissingDependencyError(MinegsError):
 
 
 class NotYetImplementedError(MinegsError):
-    """Interface exists, implementation is scheduled for a later phase (§13)."""
+    """Interface exists, implementation is scheduled for a later phase (docs/ROADMAP.md §3)."""
 
     def __init__(self, what: str, phase: str) -> None:
-        super().__init__(f"{what} is scheduled for Phase {phase} (docs/ARCHITECTURE.md §13).")
+        super().__init__(f"{what} is scheduled for Phase {phase} (docs/ROADMAP.md §3).")
         self.phase = phase
 
 

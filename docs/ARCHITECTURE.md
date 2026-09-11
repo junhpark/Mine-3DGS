@@ -36,7 +36,7 @@ minegs/
       video/     frames(ffmpeg), dedup_blur, masks,
                  sfm/   SfMBackend: COLMAPIncremental · COLMAPGlobal · (exp) GLUEMAP
                  rig.py 360 크롭 → COLMAP rig 정의
-    train/
+    train/     staging (쓰기 가능 복사본 · max_images 서브셋 · init_points→points3D)
       backends/  base.py(BackendCapabilities), gsplat.py
                  (later) splatfacto.py, pgsr.py — INRIA 는 외부 호출만, 저장소 미포함
       runner/    base.py, local.py, runpod.py, sync.py(rclone)
@@ -163,6 +163,12 @@ dataset/
 평가 모듈은 manifest 의 `split`·`initialization` 을 읽어 프로토콜을 판정하고,
 `reconstruction` run 에 대해 형상 정확도 수치를 내는 요청을 거부한다.
 
+단, **`change` 는 pair-level 프로토콜이다.** 단일 manifest 를 보는 `judge(manifest)` 는
+`Protocol.CHANGE` 도 `Claim.CHANGE_VOLUME` 도 절대 생성하지 않는다 (`capture_epoch` 가 있어도
+마찬가지). epoch 호환성(서로 다른 epoch id, 프레임·scale basis, 공통 reference axis, 겹치는
+평가 구간, 누수 없는 초기화)을 검사하는 pair evaluator `judge_change(a, b)` 는 Phase 7
+(ROADMAP.md). 그 전까지 두 단면 시계열의 차분은 `geometry_diagnostic` 이다.
+
 ## 6. 입력 경로
 
 ### 6.1 E57 (TLS)
@@ -271,6 +277,7 @@ run_id 예: `gsplat_20260910_a91f2c`. 6개월 뒤 "이 .ply 는 어느 E57·어�
 * **설계 대비**: 설계 프로파일이 있으면 Design vs TLS vs 3DGS 를 동일 단면에서 비교해
   overbreak / underbreak / reconstruction error 를 분리한다.
 * **change**: 두 epoch 의 동일 chainage 구간 차분 → 차분 체적 가설 검증.
+  단일 manifest 로는 주장할 수 없다 (§5, pair protocol = Phase 7).
 
 ## 12. 시각화
 

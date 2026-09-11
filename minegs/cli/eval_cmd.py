@@ -161,7 +161,7 @@ def geometry(
         rep.chainage_range_m = rng
         rep.claim = claim.value
         console.print(
-            f"[{claim.value}] acc median={rep.accuracy.median_m * 1000:.1f}mm p95={rep.accuracy.p95_m * 1000:.1f}mm  comp median={rep.completeness.median_m * 1000:.1f}mm p95={rep.completeness.p95_m * 1000:.1f}mm  chamfer={rep.chamfer_m * 1000:.1f}mm"
+            f"\\[{claim.value}] acc median={rep.accuracy.median_m * 1000:.1f}mm p95={rep.accuracy.p95_m * 1000:.1f}mm  comp median={rep.completeness.median_m * 1000:.1f}mm p95={rep.completeness.p95_m * 1000:.1f}mm  chamfer={rep.chamfer_m * 1000:.1f}mm"
         )
         dump_json(rep, out)
 
@@ -231,7 +231,7 @@ def volume(
         rep = integrate_sections(ser, axis)
         rep.claim = claim.value
         console.print(
-            f"[{claim.value}] V = {rep.volume_m3:.2f} m³ over {rep.start_chainage_m}-{rep.end_chainage_m} m ({rep.valid_section_count} valid / {rep.missing_section_count} missing sections)"
+            f"\\[{claim.value}] V = {rep.volume_m3:.2f} m³ over {rep.start_chainage_m}-{rep.end_chainage_m} m ({rep.valid_section_count} valid / {rep.missing_section_count} missing sections)"
         )
         result = {"volume": rep}
         if design_radius_m:
@@ -267,7 +267,7 @@ def change(
         b = SectionSeries.model_validate(json.loads(b_json.read_text()))
         rep = diff_sections(a, b, epoch_a, epoch_b, "centerline")
         console.print(
-            f"[{rep.claim}] ΔV = {rep.delta_volume_m3:+.2f} m³ over "
+            f"\\[{rep.claim}] ΔV = {rep.delta_volume_m3:+.2f} m³ over "
             f"{rep.start_chainage_m}-{rep.end_chainage_m} m"
         )
         console.print(

@@ -187,6 +187,41 @@ def test_cli_dry_runs(tmp_path):
     assert runner.invoke(app, ["train", "profiles"]).exit_code == 0
 
 
+def test_cli_prints_the_claim_label(tmp_path):
+    """rich treats [foo] as markup: the claim label must be escaped or it never reaches the user."""
+    root = tmp_path / "syn"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "dataset",
+                "synthetic",
+                str(root),
+                "--length-m",
+                "45",
+                "--n-stations",
+                "3",
+                "--image-size",
+                "32",
+            ],
+        ).exit_code
+        == 0
+    )
+    ds = root / "dataset"
+    r = runner.invoke(
+        app,
+        [
+            "eval",
+            "geometry",
+            str(ds / "init_points.ply"),
+            str(ds),
+            "--tls-ply",
+            str(root / "raw" / "tls_full.ply"),
+        ],
+    )
+    assert r.exit_code == 0 and "[geometry_accuracy]" in r.output
+
+
 def test_cli_heavy_profile_fails_closed(tmp_path):
     """heavy requires depth_loss, refused under TLS staging; the message names the reason."""
     root = tmp_path / "syn"
@@ -233,7 +268,11 @@ def test_cli_runpod_is_not_runnable(tmp_path):
         ).exit_code
         == 0
     )
+    # light is runnable in principle, so the RunPod path is what refuses it
     r = runner.invoke(
-        app, ["train", "run", str(root / "dataset"), "--profile", "heavy", "--runner", "runpod"]
+        app, ["train", "run", str(root / "dataset"), "--profile", "light", "--runner", "runpod"]
     )
-    assert r.exit_code == 4 and "Phase 1" in r.output
+    assert r.exit_code == 4 and "Phase 6" in r.output
+    # heavy must report ITS OWN reason (depth_loss), not whatever its default runner says first
+    r = runner.invoke(app, ["train", "run", str(root / "dataset"), "--profile", "heavy"])
+    assert r.exit_code == 2 and "depth_loss" in r.output and "Phase 4" in r.output

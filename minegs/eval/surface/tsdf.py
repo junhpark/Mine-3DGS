@@ -16,4 +16,4 @@ def fuse_tsdf(
         raise MissingDependencyError("open3d", "eval", "TSDF fusion") from e
     from minegs.core.errors import NotYetImplementedError
 
-    raise NotYetImplementedError("TSDF fusion", "3")
+    raise NotYetImplementedError("TSDF fusion", "1")

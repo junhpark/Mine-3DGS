@@ -36,8 +36,9 @@ minegs dataset info      data/synthetic_tunnel/dataset
 minegs eval    protocol  data/synthetic_tunnel/dataset
 # → protocols: ['novel_view', 'geometry_holdout']
 
+# 단면 간격·슬랩 두께·각도 bin 은 점밀도에 맞춰야 한다. 출력의 "valid n/N" 로 확인할 것
 minegs eval sections data/synthetic_tunnel/raw/tls_full.ply data/synthetic_tunnel/dataset \
-       --interval-m 1 --thickness-m 0.2 --out sections.json
+       --interval-m 2 --thickness-m 0.5 --angle-bins 72 --out sections.json
 minegs eval volume   sections.json data/synthetic_tunnel/dataset --design-radius-m 2.4
 minegs eval geometry <pred.ply> data/synthetic_tunnel/dataset --tls-ply data/synthetic_tunnel/raw/tls_full.ply
 minegs train command data/synthetic_tunnel/dataset --profile light     # 실행할 gsplat 커맨드 확인
@@ -58,9 +59,9 @@ minegs/
     common/  geometry(PanoConvention) · equirect(링 크롭) · colmap_io(rigs.txt/frames.txt 포함)
     e57/     inventory · scan_split · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
     video/   frames(ffmpeg) · dedup_blur · masks · rig(360 → COLMAP rig) · sfm/{COLMAPIncremental,COLMAPGlobal,GLUEMAP(exp)}
-  train/
+  train/     staging(쓰기 가능 복사본 + max_images 서브셋 + init_points→points3D)
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
-    runner/    base · local(docker + staging) · staging · runpod(Phase 6, fail-closed) · sync(rclone)
+    runner/    base · local(docker) · runpod(Phase 6, fail-closed) · sync(rclone)
     profiles/  light.yaml · heavy.yaml
   eval/      protocol · register(Sim3 → ICP → diagnostics) · surface · geometry(양방향) · sections(A(s)) · volume(∫A ds, 설계대비) · change · render(PSNR/SSIM/LPIPS)
   viz/       viewer(Viser) · overlay(규약 캘리브레이션 = 골든 게이트) · compare · export(.spz/.splat)

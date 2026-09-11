@@ -76,6 +76,23 @@ def locate_trainer(require: bool = True) -> Path | None:
     return None
 
 
+# Options whose *enabled* form must never appear in an assembled command, whatever route
+# (capability request, raw backend_args, future edit) tried to put it there.
+REFUSED_FLAGS = {"depth_loss": DEPTH_LOSS_REFUSAL, "normalize_world_space": NORMALIZE_REFUSAL}
+
+
+def _assert_no_refused_flags(argv: list[str]) -> None:
+    """Last line of defence: scan the assembled argv, not just the inputs that built it."""
+    for token in argv:
+        if not token.startswith("--"):
+            continue
+        name = token[2:].split("=", 1)[0].replace("-", "_")
+        if name.startswith("no_"):  # --no-<opt> disables it; that is the safe direction
+            continue
+        if name in REFUSED_FLAGS:
+            raise ContractError(REFUSED_FLAGS[name])
+
+
 class GsplatBackend(TrainBackend):
     name = "gsplat"
     capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL}
@@ -118,7 +135,18 @@ class GsplatBackend(TrainBackend):
     ) -> TrainCommand:
         """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
         enabled = self.resolve_requests(profile)
-        args = dict(profile.backend_args)
+        # tyro (gsplat's CLI parser) accepts --depth-loss and --depth_loss alike, so a hyphen
+        # spelling in backend_args would otherwise slip past the refusals below and be forwarded
+        # verbatim by the passthrough loop. Canonicalise to underscores first: one key, one guard.
+        args: dict[str, object] = {}
+        for raw_key, value in profile.backend_args.items():
+            key = str(raw_key).replace("-", "_")
+            if key in args:
+                raise ContractError(
+                    f"backend_args has two spellings of the same option ({raw_key!r} collides with "
+                    f"{key!r}); keep one"
+                )
+            args[key] = value
         strategy = str(args.pop("strategy", "default"))
         if strategy not in STRATEGIES:
             raise ContractError(f"gsplat strategy must be one of {STRATEGIES}, got {strategy!r}")
@@ -175,6 +203,7 @@ class GsplatBackend(TrainBackend):
             )
             if ck:
                 argv += ["--ckpt", str(ck[-1])]
+        _assert_no_refused_flags(argv)
         # identity by construction: normalisation is refused above (BACKEND_INTERNAL == LOCAL_METRIC)
         return TrainCommand(
             argv=argv,

@@ -286,7 +286,10 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `normalize_world_space: true` | `ContractError` (exit 2) | upstream equivalence 미검증 | Phase 4 |
 | `--profile heavy` 실행 | `ContractError` — depth_loss 때문에 | 위와 동일 | Phase 4 |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
-| `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 3/4 |
+| `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
+| surface 추출(depth 렌더·TSDF) | `NotYetImplementedError` | 미구현 | Phase 1 |
+| GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |
+| `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 4 |
 | `inria` backend | `ContractError` | non-commercial 라이선스 | 해당 없음 |
 | gsplat trainer 미탐지 | `ContractError` | wheel 에 trainer 없음 | 해당 없음 (docker 로 해결) |
 | `raw/` push | `ContractError` | 원본은 로컬에만 (§1.4) | 해당 없음 (설계) |

@@ -71,12 +71,17 @@ def run(
     wait: bool = typer.Option(False),
 ) -> None:
     """Submit a training run. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8)."""
+    from minegs.train.backends import get_backend
     from minegs.train.profiles import load_profile
     from minegs.train.runner import RunConfig, get_runner
     from minegs.train.runner.base import RunnerConfig
 
     def go() -> None:
         prof = load_profile(profile)
+        # Check the (profile, backend) capability contract BEFORE dispatching to a runner, so a
+        # profile that cannot run says why (e.g. heavy -> depth_loss) instead of surfacing
+        # whatever its default runner happens to complain about first.
+        get_backend(backend or prof.backend).resolve_requests(prof)
         rname = runner or prof.default_runner
         rcfg = RunnerConfig.load(config) if config else RunnerConfig(runner=rname, native=native)
         if native:
@@ -129,6 +134,6 @@ def fetch(run_dir: Path = typer.Argument(...), config: Path | None = typer.Optio
             return
         from minegs.core.errors import NotYetImplementedError
 
-        raise NotYetImplementedError("fetching RunPod run artifacts", "1")
+        raise NotYetImplementedError("fetching RunPod run artifacts", "6")
 
     run_guarded(go)

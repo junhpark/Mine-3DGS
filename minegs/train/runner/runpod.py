@@ -1,7 +1,7 @@
-"""RunPodRunner (§8.2) — **Phase 1, not runnable yet**.
+"""RunPodRunner (§8.2) — **Phase 6, not runnable yet**.
 
 ``submit`` raises ``NotYetImplementedError`` before touching any external service, so the
-CLI/README cannot present this path as working. What Phase 1 has to deliver, in order:
+CLI/README cannot present this path as working. What Phase 6 has to deliver, in order:
 
 1. ``sync.push`` dataset/ (never raw/) to an rclone remote that is *mounted as the pod's
    network volume* (or a pod-side ``rclone copy`` from that remote into ``/data``). The
@@ -28,16 +28,16 @@ class RunPodRunner(Runner):
 
     def submit(self, run: RunConfig) -> RunHandle:
         raise NotYetImplementedError(
-            "RunPodRunner (pod creation, volume sync in/out, exit-code polling)", "1"
+            "RunPodRunner (pod creation, volume sync in/out, exit-code polling)", "6"
         )
 
     def terminate(self, handle: RunHandle) -> None:
-        raise NotYetImplementedError("RunPodRunner.terminate", "1")
+        raise NotYetImplementedError("RunPodRunner.terminate", "6")
 
 
 def _cli_note() -> str:
     return (
-        "RunPod execution is Phase 1 and not implemented; run locally "
+        "RunPod execution is Phase 6 and not implemented; run locally "
         "(--runner local) or see minegs/train/runner/runpod.py for the plan."
     )
 

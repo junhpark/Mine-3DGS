@@ -12,4 +12,4 @@ class GLUEMAP(SfMBackend):
     name = "gluemap"
 
     def commands(self, images_dir: Path, work_dir: Path, opts: SfMOptions) -> list[list[str]]:
-        raise NotYetImplementedError("GLUEMAP experimental SfM backend", "2+")
+        raise NotYetImplementedError("GLUEMAP experimental SfM backend", "3")

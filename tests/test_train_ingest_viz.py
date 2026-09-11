@@ -88,12 +88,62 @@ def test_depth_loss_is_refused_under_tls_staging(synthetic, tmp_path):
     assert "--depth_loss" not in light_cmd.argv and light_cmd.T_local_from_internal.is_identity()
 
 
+def test_refused_options_cannot_be_smuggled_by_spelling(synthetic, tmp_path):
+    """tyro accepts --depth-loss and --depth_loss alike, so both spellings must be refused."""
+    be = get_backend("gsplat")
+    ds, out = synthetic.dataset_dir, tmp_path / "out"
+    for key in ("depth_loss", "depth-loss"):
+        prof = load_profile("light")
+        prof.backend_args[key] = True
+        with pytest.raises(ContractError, match="observation tracks"):
+            be.build_command(ds, out, prof, check_trainer=False)
+    for key in ("normalize_world_space", "normalize-world-space"):
+        prof = load_profile("light")
+        prof.backend_args.pop("normalize_world_space", None)
+        prof.backend_args[key] = True
+        with pytest.raises(ContractError, match="normalize_world_space=true is not enabled"):
+            be.build_command(ds, out, prof, check_trainer=False)
+    # two spellings of one option is itself a contract error, not a last-one-wins merge
+    clash = load_profile("light")
+    clash.backend_args["max-steps"] = 10
+    clash.backend_args["max_steps"] = 20
+    with pytest.raises(ContractError, match="two spellings"):
+        be.build_command(ds, out, clash, check_trainer=False)
+
+
+def test_declined_capabilities_are_not_enabled_opportunistically(synthetic, tmp_path):
+    """requests[cap]=false means off, even though the backend supports it (ROADMAP invariant 11)."""
+    be = get_backend("gsplat")
+    light = load_profile("light")
+    assert light.requests["appearance_embedding"] is False
+    assert be.capabilities().has("appearance_embedding") and be.capabilities().has("bilateral_grid")
+    cmd = be.build_command(synthetic.dataset_dir, tmp_path / "out", light, check_trainer=False)
+    for flag in ("--app_opt", "--use_bilateral_grid", "--antialiased", "--depth_loss"):
+        assert flag not in cmd.argv
+    # opting in still works
+    opt_in = load_profile("light")
+    opt_in.requests["antialiasing"] = True
+    assert (
+        "--antialiased"
+        in be.build_command(
+            synthetic.dataset_dir, tmp_path / "out", opt_in, check_trainer=False
+        ).argv
+    )
+
+
 def test_runner_refuses_heavy_profile_before_staging(synthetic, tmp_path):
-    """`minegs train run --profile heavy` fails closed in prepare(), before any work."""
+    """`minegs train run --profile heavy` fails closed in prepare(), before any work.
+
+    The assertion watches the directory a run would really create (``<dataset>/../runs/<id>``),
+    so moving the capability check after mkdir/stage_dataset makes this test fail.
+    """
+    runs = synthetic.dataset_dir.parent / "runs"
+    before = sorted(p.name for p in runs.iterdir()) if runs.exists() else []
     r = get_runner("local", RunnerConfig(runner="local", image="x@sha256:abc"))
     with pytest.raises(ContractError, match="depth_loss"):
         r.prepare(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="heavy"))
-    assert not (tmp_path / "staged").exists()
+    after = sorted(p.name for p in runs.iterdir()) if runs.exists() else []
+    assert after == before, "refusal must happen before any run directory or staging is created"
 
 
 def test_gsplat_trainer_contract(synthetic, tmp_path, monkeypatch):
@@ -170,8 +220,9 @@ def test_dataset_hash_covers_images(synthetic, tmp_path):
 
 def test_runpod_runner_is_explicitly_unimplemented(synthetic):
     r = get_runner("runpod", RunnerConfig(runner="runpod", image="x@sha256:abc"))
-    with pytest.raises(NotYetImplementedError, match="Phase 1"):
-        r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="heavy"))
+    # light, not heavy: heavy is refused earlier for depth_loss, which would mask this path
+    with pytest.raises(NotYetImplementedError, match="Phase 6"):
+        r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light"))
 
 
 def test_gsplat_normalization_is_invertible(synthetic):
@@ -213,7 +264,7 @@ def test_local_runner_refuses_without_gpu(synthetic, monkeypatch):
 
     monkeypatch.setattr(local, "cuda_available", lambda: False)
     r = get_runner("local", RunnerConfig(runner="local", native=True))
-    with pytest.raises(NoGpuError, match="runpod"):
+    with pytest.raises(NoGpuError, match="Phase 6 and not implemented"):
         r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light"))
 
 

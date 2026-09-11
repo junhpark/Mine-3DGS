@@ -57,4 +57,4 @@ def depth_to_points(
 
 def render_depths(run_dir: str | Path, dataset_dir: str | Path, out_dir: str | Path) -> Path:
     """Render depth per training/test view with the run's backend. GPU only (Phase 0D/3)."""
-    raise NotYetImplementedError("depth rendering from a trained run", "0D")
+    raise NotYetImplementedError("depth rendering from a trained run", "1")

@@ -62,8 +62,9 @@ class LocalRunner(Runner):
 
         if not cuda_available():
             raise NoGpuError(
-                "No CUDA device found. Training needs a GPU. Either run on a GPU host with docker, or "
-                f"route this run to RunPod: `minegs train run {run.dataset_dir} --profile {profile.name} --runner runpod`"
+                "No CUDA device found. Training needs a GPU. Run on a CUDA host (docker with "
+                "--gpus all), or use --native for a developer run in the current environment. "
+                "Cloud routing (RunPod) is Phase 6 and not implemented yet — see docs/ROADMAP.md."
             )
 
         staged = stage_dataset(

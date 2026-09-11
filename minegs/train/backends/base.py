@@ -89,7 +89,11 @@ class TrainBackend(ABC):
         return [c for c in profile.required_capabilities() if not caps.has(c)]
 
     def resolve_requests(self, profile: Profile) -> dict[str, bool]:
-        """Capabilities that will actually be enabled (required ones must exist; optional if present)."""
+        """Capabilities this run will actually enable.
+
+        ``requests[cap] is True`` means required: the backend must declare it or this raises.
+        ``requests[cap] is False`` means off, even if the backend supports it.
+        """
         missing = self.check_profile(profile)
         if missing:
             msg = (
@@ -99,7 +103,11 @@ class TrainBackend(ABC):
             notes = [self.capability_notes[c] for c in missing if c in self.capability_notes]
             raise ContractError(". ".join([msg, *notes]))
         caps = self.capabilities()
-        return {c: caps.has(c) for c in profile.requests}
+        # A profile's request value is the answer to "enable this?": true = required (and the
+        # backend must have it, checked above), false = off. Never opportunistically enable a
+        # capability the profile declined — a reader of light.yaml must be able to trust it, and
+        # Phase-deferred features must not leak into a baseline run (ROADMAP invariant 6, 11).
+        return {c: bool(v) and caps.has(c) for c, v in profile.requests.items()}
 
 
 def get_backend(name: str) -> TrainBackend:
@@ -110,7 +118,7 @@ def get_backend(name: str) -> TrainBackend:
     if name in ("splatfacto", "pgsr", "2dgs"):
         from minegs.core.errors import NotYetImplementedError
 
-        raise NotYetImplementedError(f"backend {name}", "3" if name != "splatfacto" else "1+")
+        raise NotYetImplementedError(f"backend {name}", "4")  # advanced GS backends
     if name == "inria":
         raise ContractError(
             "INRIA 3DGS is non-commercial and not shipped (§8.1); call it externally for baselines"
