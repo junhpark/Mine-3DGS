@@ -1,24 +1,26 @@
-"""Per-station scan extraction (pye57): scanner-frame points + the scanner pose.
+"""Per-station scanner-frame extraction — the Phase 0A flat layout.
 
-Spherical-only scans are converted to cartesian in the scanner frame.
+Superseded by ``minegs ingest e57 extract`` (``minegs.ingest.e57.extract``), which writes the
+Phase 0B.3 staging tree, supports registered output and records an extraction manifest. This
+module is kept as the flat ``<out_dir>/<scan_id>.ply`` layout the Phase 0A dataset builder
+reads, and now shares the extractor's payload reader so the two cannot disagree about the
+same scan: in particular the invalid-state mask is applied to every attribute here too (it
+used to slice colour to the coordinates' length, which shifts colour onto the wrong points).
 
-Full extraction (tiling, downsampling policy, chunked writes) is Phase 0B.3. What this module
-must already honour is the Phase 0B.1 pose contract: it reads poses through
-``inventory.scan_pose`` and refuses scans whose pose is missing, unreadable or invalid, so the
-same file can never be reported as "no usable pose" by the inventory and written out with an
-identity pose by the splitter.
+It stays stricter than the new ``--raw`` path: a scan with no pose is refused, because this
+layout carries no ``registration_status`` and an unregistered cloud sitting next to a
+registered one is indistinguishable.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-import numpy as np
-
-from minegs.core.pointcloud import PointCloud, voxel_downsample, write_ply
-from minegs.ingest.common.geometry import spherical_to_cart
+from minegs.core.pointcloud import PointCloud, voxel_downsample
 from minegs.ingest.e57 import _nodes
 from minegs.ingest.e57.exceptions import E57PoseUnusableError
+from minegs.ingest.e57.extract import SCANNER_FRAME, SOURCE_FRAME, read_scan_points
 from minegs.ingest.e57.inventory import scan_pose
 from minegs.ingest.e57.models import ScanPose
 
@@ -41,22 +43,7 @@ def read_scan(
                 f"scan index {index} has pose status {status!r}"
                 + (f" ({'; '.join(pose.validation.issues)})" if pose is not None else "")
             )
-        data = e57.read_scan_raw(index)
-        if "cartesianX" in data:
-            xyz = np.column_stack(
-                [data["cartesianX"], data["cartesianY"], data["cartesianZ"]]
-            ).astype(np.float64)
-        else:
-            xyz = spherical_to_cart(
-                data["sphericalRange"], data["sphericalAzimuth"], data["sphericalElevation"]
-            )
-        if "cartesianInvalidState" in data:
-            xyz = xyz[np.asarray(data["cartesianInvalidState"]) == 0]
-        rgb = None
-        if "colorRed" in data:
-            rgb = np.column_stack([data["colorRed"], data["colorGreen"], data["colorBlue"]])
-            rgb = rgb[: len(xyz)]
-    pc = PointCloud(xyz, rgb, frame="SOURCE")
+        pc, _meta = read_scan_points(e57, index, h)
     if voxel_m:
         pc = pc.select(voxel_downsample(pc.xyz, voxel_m))
     return pc, pose
@@ -71,11 +58,10 @@ def split_scans(
     """Write ``<out_dir>/<scan_id>.ply`` in the SCANNER frame + ``<scan_id>.pose.json``.
 
     Refuses the whole run if any selected scan's pose is unusable, naming the scans and
-    pointing at the inventory. Extraction that tolerates unregistered scans is a Phase 0B.3
-    decision with its own contract, not a default.
+    pointing at the inventory. Extraction that tolerates unregistered scans is the Phase 0B.3
+    ``--raw`` contract, which marks its output accordingly; it is not a default here.
     """
-    import json
-
+    from minegs.core.pointcloud import write_ply
     from minegs.ingest.e57.inventory import inventory
 
     out_dir = Path(out_dir)
@@ -95,7 +81,7 @@ def split_scans(
     written = []
     for s in selected:
         pc, pose = read_scan(path, s.scan_index, voxel_m)
-        p = write_ply(pc, out_dir / f"{s.scan_id}.ply")
+        p = write_ply(pc, out_dir / f"{s.scan_id}.ply", xyz_dtype="f8")
         # The E57's own coordinates are SOURCE until a later phase declares TLS_GLOBAL (§3).
         (out_dir / f"{s.scan_id}.pose.json").write_text(
             json.dumps(
@@ -103,7 +89,8 @@ def split_scans(
                     "scan_id": s.scan_id,
                     "scan_index": s.scan_index,
                     "guid": s.guid,
-                    "source_frame": pose.source_frame,
+                    "point_frame": SCANNER_FRAME,
+                    "source_frame": SOURCE_FRAME,
                     "T_source_from_scanner": pose.T_source_from_scan,
                 },
                 indent=2,

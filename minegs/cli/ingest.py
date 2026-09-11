@@ -242,20 +242,132 @@ def _print_mapping(rep) -> None:
     )
 
 
+@e57_app.command("extract")
+def e57_extract(
+    file: Path = typer.Argument(..., help="Path to the .e57 file"),
+    work_dir: Path = typer.Argument(..., help="Staging directory to write (NOT a dataset/)"),
+    voxel: float | None = typer.Option(None, "--voxel", help="Voxel size in metres, e.g. 0.01"),
+    scan: list[str] = typer.Option(
+        [], "--scan", help="Extract only these scan ids (repeatable), e.g. --scan scan_000"
+    ),
+    mapping: Path | None = typer.Option(None, "--mapping", help="Explicit image mapping file"),
+    vendor_manifest: Path | None = typer.Option(
+        None, "--vendor-manifest", help="Machine-generated vendor index (JSON)"
+    ),
+    images_dir: Path | None = typer.Option(
+        None, "--images-dir", help="Map external image files in this directory"
+    ),
+    no_images: bool = typer.Option(False, "--no-images", help="Extract scans only"),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Write scanner-frame clouds marked unregistered instead of SOURCE-frame ones",
+    ),
+    max_scan_points: int | None = typer.Option(
+        None, "--max-scan-points", help="Refuse scans larger than this (pye57 reads a scan whole)"
+    ),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace existing output"),
+    no_hash: bool = typer.Option(False, "--no-hash", help="Skip the source SHA-256"),
+) -> None:
+    """Extract scans and supported images into a Phase 0B staging directory.
+
+    Writes inventory.json, pano_mapping.json, scans/<scan_id>.ply + .pose.json,
+    images/<image_id>.jpg and extraction_manifest.json. The result is staging, not a dataset:
+    points stay in the E57's own SOURCE frame (or, with --raw, each scan's SCANNER frame).
+    Declaring TLS_GLOBAL, choosing a LOCAL_METRIC origin and building dataset/ are Phase 0C.
+
+    By default every selected scan must declare a usable pose. --raw writes unregistered
+    scanner-frame clouds instead; a broken pose is refused either way, and neither path ever
+    substitutes identity for a missing one.
+    """
+    from minegs.ingest.e57.extract import extract
+
+    def go() -> None:
+        manifest = extract(
+            file,
+            work_dir,
+            scan_ids=list(scan) or None,
+            voxel_m=voxel,
+            registered=not raw,
+            with_images=not no_images,
+            mapping=mapping,
+            vendor_manifest=vendor_manifest,
+            images_dir=images_dir,
+            compute_hash=not no_hash,
+            overwrite=overwrite,
+            max_scan_points=max_scan_points,
+        )
+        _print_extraction(manifest)
+
+    run_guarded(go)
+
+
+def _print_extraction(m) -> None:
+    console.print(f"[bold]Extracted:[/] {m.source_e57}")
+    console.print(f"  into:   {m.work_dir}")
+    console.print(
+        f"  frame:  [bold]{m.output_frame}[/] ({m.registration}) "
+        "[dim]— not TLS_GLOBAL, not a dataset[/]"
+    )
+    for s in m.scan_outputs:
+        console.print(f"\n[bold]{s.scan_id}[/]  {Path(s.path).name}")
+        console.print(
+            f"  points:      {s.point_count_output:,}"
+            + (
+                f"  [dim](declared {s.point_count_input:,}"
+                if s.point_count_input is not None
+                else "  [dim]("
+            )
+            + f", {s.invalid_points_removed:,} invalid removed)[/]"
+        )
+        console.print(f"  pose:        {s.pose_status}")
+        console.print(f"  attributes:  {', '.join(s.attributes) or '[dim]none[/]'}")
+        if s.color_conversion:
+            console.print(f"  colour:      {s.color_conversion}")
+        if s.voxel_m:
+            console.print(f"  voxel:       {s.voxel_m} m")
+        for msg in s.issues:
+            console.print(f"  [red]problem:[/] {msg}")
+    for im in m.image_outputs:
+        console.print(
+            f"\n[bold]{im.image_id}[/]  {Path(im.path).name}  {im.representation}  "
+            f"mapping: {im.mapping_status}"
+            + ("" if im.extracted else "  [dim](referenced, not copied)[/]")
+        )
+    for sk in m.skipped_images:
+        console.print(f"\n[yellow]{sk.image_id} skipped[/]  {sk.reason}")
+    if m.issues:
+        console.print("\n[bold red]Problems[/]")
+        for msg in m.issues:
+            console.print(f"  [red]•[/] {msg}")
+    if m.notes:
+        console.print("\n[bold]Notes[/]")
+        for msg in m.notes:
+            console.print(f"  [yellow]•[/] {msg}")
+
+
 @e57_app.command("split")
 def e57_split(
     file: Path = typer.Argument(...),
     out_dir: Path = typer.Argument(...),
     voxel_m: float = typer.Option(0.01),
 ) -> None:
-    """Write one scanner-frame PLY + pose JSON per station."""
+    """Deprecated: flat scanner-frame PLY + pose JSON per scan. Use `extract` instead.
+
+    Kept for the Phase 0A dataset builder. `extract` writes the same points plus the mapping
+    report, the image outputs and an extraction manifest, and can place points in the SOURCE
+    frame.
+    """
     from minegs.ingest.e57.scan_split import split_scans
 
-    run_guarded(
-        lambda: console.print(
-            f"wrote {len(split_scans(file, out_dir, voxel_m))} stations to {out_dir}"
+    def go() -> None:
+        console.print(
+            "[yellow]`split` is deprecated; use `minegs ingest e57 extract` "
+            "(docs/ROADMAP.md Phase 0B.3).[/]"
         )
-    )
+        console.print(f"wrote {len(split_scans(file, out_dir, voxel_m))} stations to {out_dir}")
+
+    run_guarded(go)
 
 
 @e57_app.command("tiles")
