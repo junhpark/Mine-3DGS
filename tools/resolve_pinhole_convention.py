@@ -46,11 +46,13 @@ def quat_to_R(q):
     w, x, y, z = np.asarray(q, float)
     n = np.linalg.norm([w, x, y, z])
     w, x, y, z = w / n, x / n, y / n, z / n
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
 
 
 def load_faces(root, scan_guid):
@@ -84,11 +86,18 @@ def load_faces(root, scan_guid):
         buf = np.frombuffer(bytes(blob.read_buffer()), dtype=np.uint8)
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)  # BGR
 
-        faces.append({
-            "index": i, "name": _val(s, "name"),
-            "K": (fx, fy, cx, cy), "W": W, "H": H,
-            "R": quat_to_R(q), "t": t, "img": img,
-        })
+        faces.append(
+            {
+                "index": i,
+                "name": _val(s, "name"),
+                "K": (fx, fy, cx, cy),
+                "W": W,
+                "H": H,
+                "R": quat_to_R(q),
+                "t": t,
+                "img": img,
+            }
+        )
     return faces
 
 
@@ -137,7 +146,7 @@ def score(faces, pts, rgb, R_axis, collect=False):
 
         ui = u[inside].astype(np.int32)
         vi = v[inside].astype(np.int32)
-        px = f["img"][vi, ui][:, ::-1].astype(np.float32)       # BGR→RGB
+        px = f["img"][vi, ui][:, ::-1].astype(np.float32)  # BGR→RGB
         pc_rgb = rgb[ok][inside].astype(np.float32)
 
         tot_err += float(np.abs(px - pc_rgb).sum())
@@ -176,8 +185,10 @@ def main():
     print(f"점군 중심 {pts.mean(0).round(3)}  범위 {(pts.max(0) - pts.min(0)).round(2)} m")
 
     faces = load_faces(root, guid)
-    print(f"면 {len(faces)} 장, 내부파라미터 fx={faces[0]['K'][0]:.1f} "
-          f"(90도 화각이면 {faces[0]['W'] / 2:.0f})")
+    print(
+        f"면 {len(faces)} 장, 내부파라미터 fx={faces[0]['K'][0]:.1f} "
+        f"(90도 화각이면 {faces[0]['W'] / 2:.0f})"
+    )
     print(f"카메라 중심 {faces[0]['t'].round(4)}\n")
 
     results = []
@@ -191,7 +202,7 @@ def main():
     for err, n, M in results[:6]:
         print(f"{label(M):<22} {err:>8.2f} {n:>10,}")
 
-    best_err, best_n, best_M = results[0]
+    best_err, _best_n, best_M = results[0]
     second = results[1][0]
     print(f"\n최적: {label(best_M)}")
     print(best_M.astype(int))

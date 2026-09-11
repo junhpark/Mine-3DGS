@@ -17,11 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import subprocess
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -58,11 +58,13 @@ def quat_to_R(q):
     w, x, y, z = np.asarray(q, float)
     n = np.linalg.norm([w, x, y, z])
     w, x, y, z = w / n, x / n, y / n, z / n
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
 
 
 def R_to_quat(R):
@@ -86,9 +88,14 @@ def R_to_quat(R):
 
 
 def file_sha256(path: Path, skip=False):
-    """스트리밍 SHA-256. 같은 파일은 사이드카에 캐시해 재계산하지 않는다."""
+    """스트리밍 SHA-256, 또는 건너뛰었으면 None.
+
+    건너뛸 때 0 을 64개 쓰면 진짜 digest 처럼 보이고, 더 나쁘게는 --no-hash 로 뽑은
+    서로 다른 데이터셋들이 같은 provenance 해시를 갖게 된다. None 을 돌려주고
+    호출부가 명시적으로 처리하게 한다.
+    """
     if skip:
-        return "0" * 64
+        return None
     st = path.stat()
     cache = path.with_suffix(path.suffix + ".sha256")
     if cache.exists():
@@ -98,21 +105,18 @@ def file_sha256(path: Path, skip=False):
                 return c["sha256"]
         except Exception:
             pass
-    print(f"SHA-256 계산 중 ({st.st_size/1e9:.1f} GB, 한 번만)...", flush=True)
+    print(f"SHA-256 계산 중 ({st.st_size / 1e9:.1f} GB, 한 번만)...", flush=True)
     h = hashlib.sha256()
     done = 0
     with open(path, "rb") as f:
         while chunk := f.read(16 << 20):
             h.update(chunk)
             done += len(chunk)
-            print(f"\r  {done/st.st_size*100:5.1f}%", end="", flush=True)
+            print(f"\r  {done / st.st_size * 100:5.1f}%", end="", flush=True)
     print()
     d = h.hexdigest()
-    try:
-        cache.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime),
-                                     "sha256": d}))
-    except Exception:
-        pass
+    with contextlib.suppress(Exception):  # a cache we cannot write is not an error
+        cache.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime), "sha256": d}))
     return d
 
 
@@ -152,18 +156,21 @@ def collect(root):
         pose = libe57.StructureNode(s.get("pose"))
         rot = libe57.StructureNode(pose.get("rotation"))
         tr = libe57.StructureNode(pose.get("translation"))
-        faces[idx].append({
-            "img_index": i,
-            "name": _val(s, "name"),
-            "W": W, "H": H,
-            "fx": f_m / pw if (f_m and pw) else W / 2.0,
-            "fy": f_m / ph if (f_m and ph) else H / 2.0,
-            "cx": _val(r, "principalPointX", W / 2.0),
-            "cy": _val(r, "principalPointY", H / 2.0),
-            "R": quat_to_R([_val(rot, k, 0.0) for k in ("w", "x", "y", "z")]),
-            "t": np.array([_val(tr, k, 0.0) for k in ("x", "y", "z")]),
-            "node": r,
-        })
+        faces[idx].append(
+            {
+                "img_index": i,
+                "name": _val(s, "name"),
+                "W": W,
+                "H": H,
+                "fx": f_m / pw if (f_m and pw) else W / 2.0,
+                "fy": f_m / ph if (f_m and ph) else H / 2.0,
+                "cx": _val(r, "principalPointX", W / 2.0),
+                "cy": _val(r, "principalPointY", H / 2.0),
+                "R": quat_to_R([_val(rot, k, 0.0) for k in ("w", "x", "y", "z")]),
+                "t": np.array([_val(tr, k, 0.0) for k in ("x", "y", "z")]),
+                "node": r,
+            }
+        )
     for v in faces.values():
         v.sort(key=lambda e: e["img_index"])
     return names, faces
@@ -181,8 +188,10 @@ def write_ply(path, xyz, rgb, comment):
         "property uchar red\nproperty uchar green\nproperty uchar blue\n"
         "end_header\n"
     ).encode("ascii")
-    rec = np.zeros(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                                    ("r", "u1"), ("g", "u1"), ("b", "u1")])
+    rec = np.zeros(
+        len(xyz),
+        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")],
+    )
     rec["x"], rec["y"], rec["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     rec["r"], rec["g"], rec["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
     with open(path, "wb") as f:
@@ -209,17 +218,32 @@ def main():
     ap.add_argument("--point-stride", type=int, default=40)
     ap.add_argument("--voxel", type=float, default=0.05, help="복셀 크기 m, 0 이면 생략")
     ap.add_argument("--max-points", type=int, default=3_000_000)
-    ap.add_argument("--nadir-mask", action="store_true",
-                    help="점 커버리지가 없는 나디르 영역 마스크 생성")
+    ap.add_argument(
+        "--nadir-mask", action="store_true", help="점 커버리지가 없는 나디르 영역 마스크 생성"
+    )
     ap.add_argument("--dataset-id", default=None)
-    ap.add_argument("--test-every", type=int, default=8,
-                    help="N 스윕마다 하나를 테스트 그룹으로. 0 이면 테스트 없음")
-    ap.add_argument("--init-groups", choices=["train", "all"], default="train",
-                    help="초기점에 쓸 그룹. train 이면 테스트 스윕 점을 제외한다")
-    ap.add_argument("--write-points3d", action="store_true",
-                    help="points3D.txt 에도 초기점을 직접 기록 (스테이징이 안 채워줄 때)")
-    ap.add_argument("--no-hash", action="store_true",
-                    help="SHA-256 생략 (매니페스트 검증에 실패한다)")
+    ap.add_argument(
+        "--test-every",
+        type=int,
+        default=8,
+        help="N 스윕마다 하나를 테스트 그룹으로. 0 이면 테스트 없음",
+    )
+    ap.add_argument(
+        "--init-groups",
+        choices=["train", "all"],
+        default="train",
+        help="초기점에 쓸 그룹. train 이면 테스트 스윕 점을 제외한다",
+    )
+    ap.add_argument(
+        "--write-points3d",
+        action="store_true",
+        help="points3D.txt 에도 초기점을 직접 기록 (스테이징이 안 채워줄 때)",
+    )
+    ap.add_argument(
+        "--no-hash",
+        action="store_true",
+        help="SHA-256 생략. manifest.json 을 쓰지 않는다 (provenance 성립 불가)",
+    )
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -236,8 +260,10 @@ def main():
     # LOCAL_METRIC 원점 = 선택 스윕 카메라 중심의 평균
     centers = np.array([faces[i][0]["t"] for i in sel])
     origin = centers.mean(axis=0)
-    print(f"LOCAL_METRIC 원점 {origin.round(3)}  "
-          f"카메라 분포 {(centers.max(0) - centers.min(0)).round(1)} m")
+    print(
+        f"LOCAL_METRIC 원점 {origin.round(3)}  "
+        f"카메라 분포 {(centers.max(0) - centers.min(0)).round(1)} m"
+    )
 
     # split 을 먼저 정한다 — 초기점에서 테스트 스윕을 실제로 빼야 하기 때문
     gid_of = {si: f"S{si:03d}" for si in sel}
@@ -248,21 +274,24 @@ def main():
     train_gids = [gid_of[si] for si in sel if si not in test_idx]
     test_gids = [gid_of[si] for si in sel if si in test_idx]
     init_idx = [si for si in sel if args.init_groups == "all" or si not in test_idx]
-    print(f"train {len(train_gids)} / test {len(test_gids)} 그룹, "
-          f"초기점 스윕 {len(init_idx)} 개 ({args.init_groups})")
+    print(
+        f"train {len(train_gids)} / test {len(test_gids)} 그룹, "
+        f"초기점 스윕 {len(init_idx)} 개 ({args.init_groups})"
+    )
 
     ds = args.downscale
     f0 = faces[sel[0]][0]
     W, H = f0["W"] // ds, f0["H"] // ds
     fx, fy = f0["fx"] / ds, f0["fy"] / ds
     cx, cy = f0["cx"] / ds, f0["cy"] / ds
-    print(f"이미지 {W}x{H}, fx={fx:.1f}, 화각 {2*np.degrees(np.arctan(W/2/fx)):.1f}도")
+    print(f"이미지 {W}x{H}, fx={fx:.1f}, 화각 {2 * np.degrees(np.arctan(W / 2 / fx)):.1f}도")
 
     # ---------------- cameras.txt / images.txt / 이미지 추출
     (out / "sparse" / "0" / "cameras.txt").write_text(
         "# camera_id, model, width, height, params[]\n"
         f"1 PINHOLE {W} {H} {fx:.10f} {fy:.10f} {cx:.10f} {cy:.10f}\n",
-        encoding="utf-8")
+        encoding="utf-8",
+    )
 
     groups, lines, image_id = {}, [], 0
     nadir_acc = None
@@ -273,29 +302,33 @@ def main():
             image_id += 1
             fname = f"{gid}_f{k}.jpg"
             blob = libe57.BlobNode(fc["node"].get("jpegImage"))
-            img = cv2.imdecode(np.frombuffer(bytes(blob.read_buffer()), np.uint8),
-                               cv2.IMREAD_COLOR)
+            img = cv2.imdecode(np.frombuffer(bytes(blob.read_buffer()), np.uint8), cv2.IMREAD_COLOR)
             if ds != 1:
                 img = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
-            cv2.imwrite(str(out / "images" / fname), img,
-                        [cv2.IMWRITE_JPEG_QUALITY, 94])
+            cv2.imwrite(str(out / "images" / fname), img, [cv2.IMWRITE_JPEG_QUALITY, 94])
 
             R_cw = R_AXIS @ fc["R"].T
             t_cw = -R_cw @ (fc["t"] - origin)
             q = R_to_quat(R_cw)
-            lines.append(f"{image_id} {q[0]:.10f} {q[1]:.10f} {q[2]:.10f} {q[3]:.10f} "
-                         f"{t_cw[0]:.10f} {t_cw[1]:.10f} {t_cw[2]:.10f} 1 {fname}")
+            lines.append(
+                f"{image_id} {q[0]:.10f} {q[1]:.10f} {q[2]:.10f} {q[3]:.10f} "
+                f"{t_cw[0]:.10f} {t_cw[1]:.10f} {t_cw[2]:.10f} 1 {fname}"
+            )
             lines.append("")
             members.append(fname)
-        groups[gid] = {"type": "tls_station", "members": members,
-                       "source_translation": faces[si][0]["t"].round(4).tolist()}
+        groups[gid] = {
+            "type": "tls_station",
+            "members": members,
+            "source_translation": faces[si][0]["t"].round(4).tolist(),
+        }
         if n % 10 == 0 or n == len(sel):
             print(f"  이미지 {n}/{len(sel)} 스윕 처리")
 
     (out / "sparse" / "0" / "images.txt").write_text(
         "# image_id, qw, qx, qy, qz, tx, ty, tz, camera_id, name\n"
         "# (points2d line intentionally empty)\n" + "\n".join(lines) + "\n",
-        encoding="utf-8")
+        encoding="utf-8",
+    )
 
     # ---------------- 점군 → init_points.ply (+ 나디르 커버리지)
     acc_xyz, acc_rgb = [], []
@@ -337,20 +370,21 @@ def main():
         keep.sort()
         xyz, rgb = xyz[keep], rgb[keep]
     write_ply(out / "init_points.ply", xyz, rgb, "frame=LOCAL_METRIC unit=m")
-    print(f"init_points.ply: {len(xyz):,} 점, 범위 {(xyz.max(0)-xyz.min(0)).round(1)} m")
+    print(f"init_points.ply: {len(xyz):,} 점, 범위 {(xyz.max(0) - xyz.min(0)).round(1)} m")
 
     (out / "sparse" / "0" / "points3D.txt").write_text(
         "# point3D_id, x, y, z, r, g, b, error, track[]\n"
         "# 초기점은 init_points.ply 에 있다 (스테이징이 여기로 변환)\n",
-        encoding="utf-8")
+        encoding="utf-8",
+    )
 
     # ---------------- 나디르 마스크
     if args.nadir_mask and nadir_acc is not None:
         k = np.ones((9, 9), np.uint8)
         cov = cv2.morphologyEx(nadir_acc, cv2.MORPH_CLOSE, k, iterations=3)
         hole = (cov == 0).astype(np.uint8)
-        num, lab, stats, _ = cv2.connectedComponentsWithStats(hole, 8)
-        mask = np.full((H, W), 255, np.uint8)   # 255 = 사용, 0 = 제외
+        _num, lab, stats, _ = cv2.connectedComponentsWithStats(hole, 8)
+        mask = np.full((H, W), 255, np.uint8)  # 255 = 사용, 0 = 제외
         cid = lab[H // 2, W // 2]
         if cid != 0 and stats[cid, cv2.CC_STAT_AREA] > 0.01 * H * W:
             m = (lab == cid).astype(np.uint8) * 255
@@ -359,7 +393,7 @@ def main():
             frac = (mask == 0).mean()
             (out / "masks").mkdir(exist_ok=True)
             cv2.imwrite(str(out / "masks" / "face5_nadir.png"), mask)
-            print(f"나디르 마스크: 하면의 {frac*100:.1f}% 제외 → masks/face5_nadir.png")
+            print(f"나디르 마스크: 하면의 {frac * 100:.1f}% 제외 → masks/face5_nadir.png")
         else:
             print("나디르 구멍을 찾지 못했다 — 마스크 생략")
 
@@ -367,12 +401,17 @@ def main():
     e57_path = Path(args.e57)
     digest = file_sha256(e57_path, skip=args.no_hash)
     try:
-        commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                                text=True).stdout.strip() or None
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
     except Exception:
-        commit = None
+        commit = ""
+    # provenance.git_commit 은 필수 문자열이다. None 을 넣으면 manifest 가 스키마를
+    # 통과하지 못하고, 도구는 그걸 모른 채 파일을 써버린다.
+    commit = commit or "unknown"
     try:
         import minegs
+
         version = getattr(minegs, "__version__", "0.0.0")
     except Exception:
         version = "0.0.0"
@@ -388,8 +427,9 @@ def main():
             "unit": "m",
             "T_tls_from_local": T.tolist(),
         },
-        "capture_groups": {g: {"type": v["type"], "members": v["members"]}
-                           for g, v in groups.items()},
+        "capture_groups": {
+            g: {"type": v["type"], "members": v["members"]} for g, v in groups.items()
+        },
         "split": {
             "train_groups": train_gids,
             "test_groups": test_gids,
@@ -402,36 +442,85 @@ def main():
         "provenance": {
             "minegs_version": version,
             "git_commit": commit,
-            "source_assets": [{"path": str(e57_path), "sha256": digest}],
+            "source_assets": [
+                {"path": str(e57_path), "sha256": digest, "size_bytes": e57_path.stat().st_size}
+            ],
         },
         "source": "tls",
         "scale": {"basis": "tls_pose", "factor": 1.0},
     }
 
     # 스키마가 금지하는 추가 기록은 사이드카로 분리한다
-    (out / "export_notes.json").write_text(json.dumps({
-        "pano_convention": {
-            "id": CONVENTION_ID,
-            "R_axis": R_AXIS.astype(int).tolist(),
-            "verified_by": "tools/resolve_pinhole_convention.py",
-            "verified_scans": [10, 60, 100],
-        },
-        "sweeps": {g: v["source_translation"] for g, v in groups.items()},
-        "export": {"downscale": ds, "point_stride": args.point_stride,
-                   "voxel_m": args.voxel, "init_point_count": int(len(xyz)),
-                   "nadir_mask": bool(args.nadir_mask)},
-        "frame_note": ("evaluation 은 스키마가 TLS_GLOBAL 리터럴만 허용해 그렇게 적었다. "
-                       "실제로는 E57 파일 자체의 SOURCE 프레임이며 측지 좌표계가 아니다."),
-    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out / "export_notes.json").write_text(
+        json.dumps(
+            {
+                "pano_convention": {
+                    "id": CONVENTION_ID,
+                    "R_axis": R_AXIS.astype(int).tolist(),
+                    "verified_by": "tools/resolve_pinhole_convention.py",
+                    "verified_scans": [10, 60, 100],
+                },
+                "sweeps": {g: v["source_translation"] for g, v in groups.items()},
+                "export": {
+                    "downscale": ds,
+                    "point_stride": args.point_stride,
+                    "voxel_m": args.voxel,
+                    "init_point_count": len(xyz),
+                    "nadir_mask": bool(args.nadir_mask),
+                },
+                "frame_note": (
+                    "evaluation 은 스키마가 TLS_GLOBAL 리터럴만 허용해 그렇게 적었다. "
+                    "실제로는 E57 파일 자체의 SOURCE 프레임이며 측지 좌표계가 아니다."
+                ),
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    print(f"\nimages/   {image_id} 장  {W}x{H}")
+
+    if digest is None:
+        # --help 가 약속한 대로 실제로 실패한다. 검증 불가능한 manifest 를 쓰는 것보다
+        # 안 쓰는 편이 낫다 — 없으면 즉시 눈에 띄지만, 가짜 해시는 눈에 안 띈다.
+        (out / "manifest.json").unlink(missing_ok=True)
+        print("\n--no-hash 를 썼으므로 manifest.json 을 쓰지 않았다.")
+        print("  provenance 는 원본 SHA-256 없이는 성립하지 않는다 (ROADMAP invariant 9).")
+        print(f"  이미지·sparse·init_points 는 {out} 에 있으니, --no-hash 없이 다시 돌리면")
+        print("  해시는 사이드카에 캐시되어 한 번만 계산된다.")
+        f57.close()
+        return
 
     (out / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    f57.close()
+
+    # ---------------- 쓴 것을 그 자리에서 검증한다
+    # 0A 계약이 존재하는 이유가 이것이다. 여기서 안 보면 학습 시작할 때 본다.
+    try:
+        from minegs.core.manifest import Manifest
+    except Exception as e:
+        print(f"\n경고: minegs 를 import 할 수 없어 데이터셋 검증을 건너뛰었다 ({e}).")
+        print(f"  직접 확인할 것: minegs dataset validate {out}")
+        return
+    m = Manifest.load_dataset(out)
+    issues = m.consistency_issues()
 
     print(f"\n완료: {out}")
-    print(f"  images/   {image_id} 장  {W}x{H}")
-    print(f"  test 그룹 {len(manifest['split']['test_groups'])} 개 (8스윕마다 1개)")
+    print(
+        f"  검증 통과 — dataset_id={m.dataset_id}, 그룹 {len(m.capture_groups)}, "
+        f"이미지 {len(m.all_images())}"
+    )
+    print(f"  test 그룹 {len(m.split.test_groups)} 개 ({args.test_every}스윕마다 1개)")
+    for i in issues:
+        print(f"  주의: {i}")
     print("  split 은 초안이다 — 형상 홀드아웃은 chainage 구간으로 다시 잡을 것")
-    f57.close()
+    print(
+        "  chainage 가 없으므로 이 데이터셋은 형상 정확도를 주장할 수 없다 "
+        "(novel_view / geometry_diagnostic 만)"
+    )
 
 
 if __name__ == "__main__":

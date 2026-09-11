@@ -132,9 +132,7 @@ def main():
     print(f"images2D: {len(imgs)} 장\n")
 
     kinds = Counter(e["rep"]["type"] if e["rep"] else "NONE" for e in imgs)
-    sizes = Counter(
-        (e["rep"]["w"], e["rep"]["h"]) if e["rep"] else None for e in imgs
-    )
+    sizes = Counter((e["rep"]["w"], e["rep"]["h"]) if e["rep"] else None for e in imgs)
     print("표현 방식 :", dict(kinds))
     print("해상도    :", dict(sizes))
 
@@ -162,7 +160,7 @@ def main():
         print(
             f"         {r.get('w')}x{r.get('h')}  "
             f"f={r.get('focalLength')}  pp=({r.get('ppx')}, {r.get('ppy')})  "
-            f"{r.get('blob_bytes', 0)/1e6:.2f}MB"
+            f"{r.get('blob_bytes', 0) / 1e6:.2f}MB"
         )
         if q:
             print(f"         q={tuple(round(v, 6) for v in q)}  t={tuple(round(v, 4) for v in t)}")
@@ -172,10 +170,7 @@ def main():
     if len(ts) > 1:
         import itertools
 
-        d = [
-            max(abs(a[k] - b[k]) for k in range(3))
-            for a, b in itertools.combinations(ts, 2)
-        ]
+        d = [max(abs(a[k] - b[k]) for k in range(3)) for a, b in itertools.combinations(ts, 2)]
         print(f"\n  그룹 내 translation 최대 차이: {max(d):.6f} m")
         print("  → 0 에 가까우면 큐브맵(같은 광학중심), 크면 별개 카메라 위치")
 
