@@ -1,0 +1,73 @@
+# minegs GPU training image (§1.2, §8.2).
+# One image, used by LocalRunner and RunPodRunner *by digest*. Build, push, then pin:
+#   docker build -f docker/Dockerfile.gpu -t <registry>/minegs:gpu .
+#   docker push <registry>/minegs:gpu            # note the sha256 digest
+#   configs/runner/*.yaml -> image: <registry>/minegs:gpu@sha256:<digest>
+#
+# Contents: CUDA 12.4, PyTorch 2.4, gsplat (pinned), COLMAP >= 4.0 (global mapper), minegs[train].
+# INRIA 3DGS is *not* included (non-commercial license, §8.1).
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PYTHON=3.11
+ARG TORCH_VERSION=2.4.1
+ARG TORCH_CUDA=cu124
+ARG GSPLAT_VERSION=1.5.3
+ARG COLMAP_REF=4.0.0
+# Restrict CUDA archs to what we actually run (RunPod: A4000/A5000/3090/4090/A100/L4/L40).
+ARG TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+ARG CMAKE_CUDA_ARCHITECTURES="75;80;86;89;90"
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    MINEGS_RUNTIME=gpu
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      software-properties-common ca-certificates curl git build-essential cmake ninja-build \
+      libboost-program-options-dev libboost-graph-dev libboost-system-dev libeigen3-dev \
+      libflann-dev libfreeimage-dev libmetis-dev libgoogle-glog-dev libgtest-dev libgmock-dev \
+      libsqlite3-dev libglew-dev qtbase5-dev libqt5opengl5-dev libcgal-dev libceres-dev \
+      libcurl4-openssl-dev \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      python${PYTHON} python${PYTHON}-dev python${PYTHON}-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# COLMAP >= 4.0 from source (global mapper = former GLOMAP, §6.2). Headless (no GUI).
+RUN git clone --depth 1 --branch ${COLMAP_REF} https://github.com/colmap/colmap.git /tmp/colmap \
+    && cmake -S /tmp/colmap -B /tmp/colmap/build -G Ninja \
+         -DCMAKE_BUILD_TYPE=Release -DGUI_ENABLED=OFF -DCUDA_ENABLED=ON \
+         -DCMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} \
+    && cmake --build /tmp/colmap/build --target install \
+    && rm -rf /tmp/colmap
+
+RUN python${PYTHON} -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+RUN pip install --upgrade pip \
+    && pip install torch==${TORCH_VERSION} --index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
+    && pip install gsplat==${GSPLAT_VERSION}
+
+# The trainer is NOT part of the PyPI package: gsplat ships it as examples/simple_trainer.py
+# in the repository, with its own requirements (pycolmap fork, nerfview, fused-ssim, ...).
+# Pin the checkout to the same version as the wheel; minegs invokes it via MINEGS_GSPLAT_TRAINER.
+RUN git clone --depth 1 --branch v${GSPLAT_VERSION} https://github.com/nerfstudio-project/gsplat.git /opt/gsplat \
+    && pip install -r /opt/gsplat/examples/requirements.txt \
+    && python /opt/gsplat/examples/simple_trainer.py default --help > /dev/null
+ENV MINEGS_GSPLAT_TRAINER=/opt/gsplat/examples/simple_trainer.py
+
+WORKDIR /opt/minegs
+COPY pyproject.toml README.md ./
+COPY minegs ./minegs
+RUN pip install -e . \
+    && python -c "import minegs, gsplat; print('minegs', minegs.__version__, 'gsplat', gsplat.__version__)"
+
+COPY docker/entrypoint.sh /usr/local/bin/minegs-entrypoint
+RUN chmod +x /usr/local/bin/minegs-entrypoint
+
+# /data/dataset  <- dataset contract (only thing pushed to a pod, §1.4)
+# /data/runs     <- run outputs (LOCAL_METRIC .ply, ckpt, log, run.json)
+VOLUME ["/data"]
+ENTRYPOINT ["minegs-entrypoint"]
+CMD ["--help"]

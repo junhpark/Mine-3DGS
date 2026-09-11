@@ -1,0 +1,47 @@
+schema_version: "1.0"
+kind: e57
+dataset_id: kigam_tunnelA_ep1_v001
+source_assets:
+  - raw/tunnelA.e57
+capture_epoch: { id: ep1, date: "2026-10-14" }
+
+# §6.1 — E57 에 파노라마가 있다고 가정하지 않는다. station_id <-> panorama_id 계약만 요구.
+pano:
+  source: E57Embedded          # E57Embedded | ExternalJpeg | VendorExport
+  root: null                   # ExternalJpeg/VendorExport 일 때 디렉토리
+  mapping: null                # station_id,pano_id CSV (없으면 스캔 순서 = 파노 순서)
+  convention:                  # 골든 게이트 (§13 0C) 로 캘리브레이션한 값
+    az_sign: 1
+    el_flip: false
+    az_offset_deg: 0.0
+    vendor: Leica
+
+ring_crop:                     # equirect -> pinhole 링 크롭 (K 는 합성이므로 정확)
+  n_yaw: 8
+  fov_deg: 90.0
+  pitches_deg: [0.0]
+  width: 1600
+  height: 1600
+
+points:                        # 대형 Cartesian 스캔은 PDAL 로 타일·다운샘플
+  voxel_m: 0.02
+  tile_length_m: 80
+  max_init_points: 2000000
+
+frames:                        # §3 — LOCAL_METRIC 원점 = 갱도(또는 청크) 중심
+  local_origin: centroid       # centroid | first_station | chunk
+
+centerline:
+  file: raw/centerline.csv     # 설계 중심선 우선, 없으면 TLS 에서 추출 (core/centerline.py)
+  source: design
+
+chunks:
+  length_m: 80
+  overlap_m: 15
+
+split:
+  test_groups: []              # 비우면 reconstruction 프로토콜 (성능 주장 불가)
+  geometry_holdout:
+    chainage_ranges_m: []
+    points_excluded: true
+    images_excluded: false

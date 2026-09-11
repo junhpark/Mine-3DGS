@@ -1,0 +1,319 @@
+# minegs 아키텍처 v2
+
+지하 갱도 metric Gaussian Splatting 연구 프레임워크. TLS(E57) 와 영상(일반·360)
+두 입력 경로, 로컬/RunPod 이중 실행, 정합·형상·체적 평가, 웹 기반 시각화.
+
+## 1. 원칙
+
+1. **데이터셋 계약 하나.** 입력 경로가 무엇이든 `dataset/` 은 같은 모양.
+   학습·평가·시각화는 이 계약만 읽는다.
+2. **코드 한 벌, 목적별 런타임.** GPU 학습 이미지는 로컬과 RunPod 에서
+   digest 까지 동일하게 쓴다. CPU 인제스트는 네이티브 파이썬 또는 CPU 컨테이너를
+   허용한다. 거대 단일 컨테이너는 만들지 않는다.
+3. **CLI 가 진실의 원천.** UI 는 CLI 가 노출하는 파이썬 API 의 얇은 껍데기.
+4. **원본은 로컬에만.** E57·원본 영상은 파드에 올리지 않는다. `dataset/` 만 간다.
+5. **좌표 프레임 3계층.** 평가·공간 산출물은 TLS_GLOBAL(m) 로 환원 가능해야 한다.
+   학습은 수치안정성을 위해 LOCAL_METRIC(m) 을 쓴다. 프레임 간 변환은 manifest 에
+   반드시 명시한다 (§3).
+6. **평가 누수는 계약 수준에서 차단.** 어떤 TLS 데이터가 초기화·학습에 들어갔는지
+   manifest 가 선언하고, 평가 모듈은 그 선언에 맞지 않는 주장을 거부한다 (§5).
+7. **가우시안 중심은 표면이 아니다.** 형상 평가는 항상
+   GS → 깊이/메시/표면 표현 → TLS 비교 순서를 따른다.
+8. **모든 산출물에 계보.** raw → dataset → run → eval → export 각 단계가
+   입력 해시·설정 해시·git SHA·도구 버전·부모 ID 를 기록한다 (§9).
+
+## 2. 디렉토리
+
+```
+minegs/
+  minegs/
+    core/        config 스키마(pydantic, schema_version + migration), manifest,
+                 frames(SE3/Sim3), centerline, chunking, provenance
+    ingest/
+      common/    geometry, equirect, colmap_io               ← 두 경로가 공유
+      e57/       inventory(pye57), scan_split(pye57), tiles(PDAL), pose_to_colmap,
+                 pano/  PanoSource 어댑터: E57Embedded · ExternalJpeg · VendorExport
+      video/     frames(ffmpeg), dedup_blur, masks,
+                 sfm/   SfMBackend: COLMAPIncremental · COLMAPGlobal · (exp) GLUEMAP
+                 rig.py 360 크롭 → COLMAP rig 정의
+    train/     staging (쓰기 가능 복사본 · max_images 서브셋 · init_points→points3D)
+      backends/  base.py(BackendCapabilities), gsplat.py
+                 (later) splatfacto.py, pgsr.py — INRIA 는 외부 호출만, 저장소 미포함
+      runner/    base.py, local.py, runpod.py, sync.py(rclone)
+      profiles/  light.yaml, heavy.yaml
+    eval/        register/ (initial_alignment, sim3, rigid_icp, diagnostics)
+                 surface/  (depth·TSDF·mesh 추출)
+                 geometry/ (accuracy, completeness, chamfer, 분위수)
+                 sections/ (중심선 기준 단면 A(s))
+                 volume/   (∫A(s)ds, 메시 체적, 설계 대비 여굴·미굴)
+                 change/   (epoch 간 차분)
+                 render/   (홀드아웃 그룹 PSNR·SSIM·LPIPS)
+    viz/         viewer(Viser), overlay(규약 검증), compare(히트맵·단면), export(.spz)
+    cli/         typer: ingest / dataset / train / eval / viz / sync
+  docker/        Dockerfile.gpu (CUDA, PyTorch, gsplat, COLMAP ≥4.0)
+                 Dockerfile.cpu (PDAL, pye57, ffmpeg, COLMAP CPU) — 선택
+  configs/
+  tests/
+  data/                              (git 제외)
+    <dataset_id>/
+      raw/           E57, mp4, 설계 중심선
+      dataset/       ← 계약 (§3)
+      runs/<run_id>/     ckpt, point_cloud/*.ply (LOCAL_METRIC), log, run.json
+      eval/<eval_id>/    mesh, geometry.json, sections.json, volume.json, eval.json
+      export/<id>/       .spz (.splat 은 legacy, 선택)
+```
+
+## 3. 좌표 프레임
+
+```
+Source frame  (스캐너 로컬 / SfM 임의)
+   │
+   ▼
+TLS_GLOBAL     실제 계측 좌표, m        ← 평가·보고
+   │  SE(3), 병진·회전만
+   ▼
+LOCAL_METRIC   갱도 또는 청크 중심 원점, m ← 학습 입력·출력
+   │  백엔드 내부 정규화 (gsplat scene_scale 등)
+   ▼
+BACKEND_INTERNAL                        ← 어댑터가 반드시 역변환해서 .ply 를
+                                           LOCAL_METRIC 으로 내보낸다
+```
+
+* LOCAL_METRIC 도 1 unit = 1 m. 스케일은 건드리지 않는다.
+* UTM 급 좌표(10⁶ m)를 float32 에 넣으면 유효 정밀도가 수십 cm 로 떨어진다.
+  체적 계측에서 이 하나로 결과가 무의미해진다.
+* `T_tls_from_local` 은 manifest 필수 항목. run 이 청크 단위면 청크마다 하나.
+
+## 4. 데이터셋 계약
+
+```
+dataset/
+  images/              pinhole 이미지
+  sparse/0/            cameras.txt · images.txt · points3D.txt · (rigs.txt)
+  init_points.ply      초기 가우시안 위치, LOCAL_METRIC
+  masks/               선택 — 삼각대·작업자·나다르
+  manifest.json
+```
+
+### manifest.json — v1 필수 6 + 선택
+
+```jsonc
+{
+  "schema_version": "1.0",                          // 필수
+  "dataset_id": "kigam_tunnelA_ep1_v003",
+  "coordinate_frames": {                            // 필수
+    "evaluation": "TLS_GLOBAL", "training": "LOCAL_METRIC", "unit": "m",
+    "T_tls_from_local": [[1,0,0,318300.0],[0,1,0,4012300.0],[0,0,1,120.0],[0,0,0,1]]
+  },
+  "capture_groups": {                               // 필수 — 광학중심/궤적 단위
+    "S07":  {"type": "tls_station",        "members": ["S07_f00.jpg", ...],
+             "chainage_m": 63.2},
+    "V013": {"type": "trajectory_segment", "members": ["v_000412.jpg", ...],
+             "chainage_range_m": [58.0, 71.5]}
+  },
+  "split": {                                        // 필수
+    "train_groups": ["S01","S02","S03","S05","S06","S07"],
+    "test_groups":  ["S04","S08"],
+    "geometry_holdout": {                           // 스테이션이 아니라 구간으로
+      "chainage_ranges_m": [[38.0, 46.0], [94.0, 102.0]],
+      "points_excluded": true,                      // init_points 에서 제외
+      "images_excluded": false                      // 사진은 남김 = 복원 시험
+    }                                               // true 면 외삽 시험 (다른 질문)
+  },
+  "initialization": {                               // 필수
+    "source": "tls | sfm_sparse | random",
+    "file": "init_points.ply",
+    "groups": ["S01","S02","S03","S05","S06","S07"],
+    "excluded_chainage_ranges_m": [[38.0, 46.0], [94.0, 102.0]]
+  },
+  "provenance": {                                   // 필수
+    "minegs_version": "0.1.0", "git_commit": "...", "config_hash": "...",
+    "source_assets": [{"path": "raw/tunnelA.e57", "sha256": "..."}]
+  },
+
+  "source": "tls | video | video360",               // 이하 선택
+  "capture_epoch": {"id": "ep1", "date": "2026-10-14"},
+  "scale": {"basis": "tls_pose | sim3_to_tls | known_target", "factor": 1.0},
+  "registration": {"method": "sim3+icp", "scale": 1.0032, "rmse_m": 0.018,
+                   "inlier_ratio": 0.91, "transform": [...]},
+  "pano_convention": {"az_sign": 1, "el_flip": false, "az_offset": 0.0,
+                      "source": "E57Embedded", "vendor": "Leica"},
+  "centerline": {"file": "raw/centerline.csv", "source": "design | extracted"},
+  "chunks": {"basis": "centerline_chainage", "length_m": 80, "overlap_m": 15,
+             "list": [{"id": "C01", "range_m": [0, 80]}, ...]}
+}
+```
+
+* `capture_groups` 가 `stations` 를 대체한다. 타입은 `tls_station`,
+  `trajectory_segment`, 향후 `camera_rig`, `mobile_mapping_segment`.
+* 렌더 평가(PSNR 등)는 그룹 단위 분할. **형상 홀드아웃은 chainage 구간 단위.**
+  TLS 스캔은 인접 스테이션과 겹치므로 스테이션 단위로는 형상 누수를 못 막는다.
+* schema_version 은 첫날부터. `core/manifest.py` 에 migration 함수를 둔다.
+* `scale.basis` 없이 평가 모듈은 실행을 거부한다.
+
+## 5. 평가 프로토콜
+
+| 프로토콜 | 초기화 | 학습 이미지 | 평가 | 주장 가능 범위 |
+|---|---|---|---|---|
+| `reconstruction` | TLS 전부 | 전부 | 없음 | 실무용 최고품질. 성능 주장 불가 |
+| `novel_view` | train 그룹 | train 그룹 | test 그룹 이미지 | PSNR/SSIM/LPIPS |
+| `geometry_holdout` | 홀드아웃 구간 제외 | 설정에 따름 | 홀드아웃 구간 TLS | 형상·체적 정확도 |
+| `change` | epoch 별 위 중 하나 | | 두 epoch 의 동일 구간 | 차분 체적 |
+
+평가 모듈은 manifest 의 `split`·`initialization` 을 읽어 프로토콜을 판정하고,
+`reconstruction` run 에 대해 형상 정확도 수치를 내는 요청을 거부한다.
+
+단, **`change` 는 pair-level 프로토콜이다.** 단일 manifest 를 보는 `judge(manifest)` 는
+`Protocol.CHANGE` 도 `Claim.CHANGE_VOLUME` 도 절대 생성하지 않는다 (`capture_epoch` 가 있어도
+마찬가지). epoch 호환성(서로 다른 epoch id, 프레임·scale basis, 공통 reference axis, 겹치는
+평가 구간, 누수 없는 초기화)을 검사하는 pair evaluator `judge_change(a, b)` 는 Phase 7
+(ROADMAP.md). 그 전까지 두 단면 시계열의 차분은 `geometry_diagnostic` 이다.
+
+## 6. 입력 경로
+
+### 6.1 E57 (TLS)
+inventory(pye57, 헤더만) → 규약 캘리브레이션(포인트를 파노라마에 재투영, **골든 게이트**)
+→ `PanoSource` 어댑터로 파노라마 획득 → 링 크롭 → 스캐너 포즈 → COLMAP
+→ 대형 Cartesian 스캔은 PDAL 로 타일·다운샘플 → `init_points.ply`.
+
+* E57 에 파노라마가 반드시 있다고 가정하지 않는다. 요구하는 것은
+  `station_id ↔ panorama_id` 매핑 계약뿐이다.
+* PDAL `readers.e57` 은 내부 클라우드를 병합해 읽고 공통 dimension 만 취하며
+  spherical 은 미지원 → 인벤토리·스캔 분리는 pye57, 대용량 타일링만 PDAL.
+
+### 6.2 영상 · 360
+ffmpeg → 블러·중복 제거 → (360: equirect → 링 크롭, K 는 합성이므로 정확히 알려짐,
+**같은 프레임의 크롭은 COLMAP rig 로 등록**) → 마스킹 → SfM → 희소점 →
+`init_points.ply` → `register` (§7).
+
+```yaml
+sfm:
+  backend: colmap          # ≥ 4.0
+  mapper: global | incremental   # 반복 패턴·저텍스처면 incremental 폴백 유지
+  fix_intrinsics: true     # 360 크롭·보정된 카메라
+  rig: auto                # 360 이면 자동 생성
+  experimental: gluemap    # 저텍스처·저겹침 특화, 의존성 무거움 — Phase 2 이후
+```
+
+지하 조명 변동은 백엔드 capability 로 처리 (§8).
+
+## 7. 정합 (register)
+
+영상 SfM 은 similarity geometry. 좌표계가 전혀 다르니 ICP 부터 넣지 않는다.
+
+```
+알려진 타깃 / 스테이션 대응
+      ↓  initial_alignment
+   Sim(3)  (scale + R + t)
+      ↓  robust refine
+   SE(3) ICP
+      ↓
+   diagnostics → manifest.registration (scale, rmse_m, inlier_ratio, transform)
+```
+
+TLS 경로는 항등. 품질 지표 없는 정합 결과는 평가에 쓸 수 없다.
+
+## 8. 학습 엔진
+
+### 8.1 백엔드
+v0.1 은 **gsplat 하나**. `BackendCapabilities(appearance_embedding, bilateral_grid,
+depth_loss, ...)` 를 어댑터가 선언하고 프로파일은 capability 로 옵션을 요청한다 —
+gsplat 버전이 바뀌어도 프로파일 계약이 깨지지 않는다.
+Phase 0 은 pinned `simple_trainer` 래퍼, 장기적으로 gsplat 라이브러리 위의 얇은
+`MineGSTrainer`. splatfacto 는 rasterizer 만 같고 실행 계약이 다르므로 별도 어댑터
+(later). PGSR/2DGS 는 Phase 3. INRIA 원본은 non-commercial 라이선스 → 저장소·Docker
+미포함, 베이스라인 비교 시 외부 호출.
+
+어댑터 책임: `(dataset, profile) → 커맨드`, 그리고 **출력 .ply 를
+LOCAL_METRIC 으로 역변환**해 `runs/<id>/` 규약으로 정규화.
+
+### 8.2 러너
+```
+Runner.submit(run_config) -> RunHandle
+RunHandle.status() / .logs() / .fetch_artifacts()
+```
+* `LocalRunner` — `docker run --gpus all minegs:gpu@sha256:...`. CUDA 없으면 거부하고
+  RunPod 저가 GPU 라우팅 제안.
+* `RunPodRunner` — 파드 생성(네트워크 볼륨) → `sync.push`(dataset 만) → 엔트리 →
+  폴링 → `sync.pull`(ply·로그) → 종료. 체크포인트는 볼륨에, `--resume`.
+* 두 러너의 GPU 이미지 digest 는 동일. run.json 에 기록.
+
+### 8.3 프로파일
+| | light | heavy |
+|---|---|---|
+| 이미지 | ≤100 장 | 전체 (또는 청크) |
+| 해상도 | 1/4 | 1/2 또는 원본 |
+| iter | 7k | 30k |
+| 기본 러너 | local | runpod |
+
+## 9. 계보 (provenance)
+
+```
+raw ──▶ dataset ──▶ run ──▶ eval ──▶ export
+ sha256   dataset_id   run_id    eval_id    export_id
+          config_hash  config_hash + dataset_hash + git_commit
+          git_commit   + docker_digest + backend{name, version}
+```
+
+run_id 예: `gsplat_20260910_a91f2c`. 6개월 뒤 "이 .ply 는 어느 E57·어느 크롭
+설정·어느 commit 에서 나왔나"에 즉답할 수 있어야 한다.
+
+## 10. 청킹 · 중심선
+
+장거리 갱도(100 m–1 km)는 단일 모델로 안 간다. 청킹 기준은 XYZ 격자가 아니라
+**중심선 chainage**. 청크는 v1 에서 파일을 실제로 쪼개지 않아도 manifest 에 예약.
+
+`centerline` 은 1급 산출물: 설계 중심선(DXF/측점표) 임포트가 기본, 없으면 TLS
+클라우드에서 추출(`core/centerline.py`). 청킹·단면·체적·change 가 모두 이걸 참조한다.
+
+## 11. 형상 · 체적 평가
+
+* **형상**: 양방향 — TLS→GS(accuracy) 와 GS→TLS(completeness) 를 따로. 대칭 Chamfer,
+  median, P90/P95, RMSE. 한 방향만 보면 큰 hole 을 놓친다.
+* **단면**: 중심선 따라 일정 간격 단면 → A(s).
+* **체적**: 기본 ∫A(s)ds (여굴·미굴 산정 관행), 보조 닫힌 메시 체적.
+  `volume.json` 필수 항목: `start_chainage, end_chainage, section_interval,
+  valid_section_count, missing_section_count, reference_axis`.
+* **설계 대비**: 설계 프로파일이 있으면 Design vs TLS vs 3DGS 를 동일 단면에서 비교해
+  overbreak / underbreak / reconstruction error 를 분리한다.
+* **change**: 두 epoch 의 동일 chainage 구간 차분 → 차분 체적 가설 검증.
+  단일 manifest 로는 주장할 수 없다 (§5, pair protocol = Phase 7).
+
+## 12. 시각화
+
+Viser(파이썬 API, WebGL) 를 연구용 UI 로. 프러스텀·초기 포인트·스플랫·TLS 토글·
+거리 히트맵·단면 슬라이더·chainage 스크러버. 규약 검증용 2D `overlay`.
+`export`: 연구 산출물 `.ply` → 배포 `.spz` (SuperSplat) → legacy `.splat` 선택.
+다중 사용자가 필요해지면 FastAPI 를 CLI 위에 얹는다.
+
+## 13. 단계 · 게이트
+
+구현 순서, Phase 별 범위, validation gate(G0–G3), Definition of Done 은
+[ROADMAP.md](ROADMAP.md) 가 source of truth 다. 이 문서는 invariant 만 다룬다.
+
+큰 흐름: **0A** Foundation & Contract Freeze → **0B** 실제 E57 ingest → **0C** Metric dataset
+golden gate → **0D** Local GS baseline → **1** Metric surface & evaluation → **2** E57
+end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced GS / heavy →
+**5** 장거리 청킹 → **6** RunPod → **7** Multi-epoch change → **8** Viewer/Export/Web.
+
+두 가지만 여기서 못박는다.
+
+* Phase 는 Gate 를 통과해야 완료다. 코드가 있다는 사실(implemented)과 실데이터에서
+  확인됐다는 사실(validated)을 구분해 표기한다.
+* 검증되지 않은 경로는 부분 지원하지 않고 fail-closed 한다 (§1.6). 현재 거부 목록은
+  ROADMAP.md §6 에 있다.
+
+## 14. 결정 이력
+
+* 2026-09 — Phase 0A closeout: 단일 manifest 는 change claim 불가(§5 change 는 2 epoch),
+  `depth_loss` 는 TLS staging 이 COLMAP observation track 을 제거하므로 거부(Phase 4 재설계),
+  `normalize_world_space=true` 는 upstream equivalence 검증 전까지 거부. Phase/게이트 정의는
+  ROADMAP.md 로 분리.
+* 2026-09 — 리포 `e57gs` → `minegs`. `ingest/common/` 은 기존 모듈 그대로.
+* 2026-09 — UI 는 웹(Viser → FastAPI). 3DGS 뷰어가 전부 WebGL, 데스크톱 패키징 비용 과다.
+* 2026-09 — TLS 단독 경로 순환논증 → 영상 경로 Phase 2, 평가 프로토콜을 계약으로 승격.
+* 2026-09 — v2 반영: TLS_GLOBAL/LOCAL_METRIC 분리, capture_groups, chainage 구간
+  홀드아웃, COLMAP ≥4.0 global mapper(GLOMAP 독립 저장소 2026-03 아카이브), 360 rig,
+  epoch/change, PanoSource 어댑터, v0.1 백엔드 gsplat 단일, INRIA 저장소 미포함,
+  CPU/GPU 런타임 분리, Sim3→SE3, 양방향 형상 지표, provenance 계층, Phase 0 을 0A–0D 로 분할.
+* 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.

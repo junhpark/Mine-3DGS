@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minegs"
+version = "0.1.0"
+description = "Metric Gaussian Splatting research framework for underground mine tunnels (TLS/E57 + video/360 inputs)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "minegs contributors" }]
+keywords = ["gaussian-splatting", "3dgs", "tls", "e57", "mining", "tunnel", "photogrammetry"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+]
+
+# Core: pure-python/numpy stack. Everything here must import on a CPU-only box.
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "pydantic>=2.11",
+  "typer>=0.12",
+  "pyyaml>=6",
+  "rich>=13",
+  "pillow>=10",
+]
+
+[project.optional-dependencies]
+# 6.1 E57 (TLS) ingest — CPU runtime (native or docker/Dockerfile.cpu)
+e57 = ["pye57>=0.4", "pdal>=3.2"]
+# 6.2 video / 360 ingest — ffmpeg + COLMAP >= 4.0 must be on PATH or in docker/Dockerfile.cpu
+video = ["opencv-python-headless>=4.9", "pycolmap>=3.11"]
+# 8 training — GPU runtime (docker/Dockerfile.gpu). torch/gsplat versions are pinned in the image.
+train = ["torch>=2.2", "gsplat>=1.4"]
+# 11 surface extraction (TSDF / mesh) + LPIPS
+eval = ["open3d>=0.18", "scikit-image>=0.22", "lpips>=0.1.4"]
+# 12 visualisation
+viz = ["viser>=0.2.7"]
+# 8.2 RunPod runner
+runpod = ["runpod>=1.6"]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "types-PyYAML",
+]
+all = ["minegs[e57,video,eval,viz,runpod,dev]"]
+
+[project.scripts]
+minegs = "minegs.cli.main:app"
+
+[project.urls]
+Repository = "https://github.com/junhpark/Mine-3DGS"
+
+[tool.setuptools.packages.find]
+include = ["minegs*"]
+
+[tool.setuptools.package-data]
+"minegs.train.profiles" = ["*.yaml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["minegs", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = [
+  "E501",  # formatter wraps code; long strings/docstrings/comments are allowed
+  "N802", "N803", "N806", "N815",  # matrices/frames named K, R, T_tls_from_local are conventional
+  "RUF001", "RUF002", "RUF003",  # Korean/unicode in comments and docstrings
+  "RUF012",
+  "B008",  # typer.Option in defaults
+  "SIM108",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+filterwarnings = ["error::DeprecationWarning:minegs.*"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]

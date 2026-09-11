@@ -1,0 +1,8 @@
+schema_version: "1.0"
+runner: local
+# GPU image pinned by digest — must be identical to runner/runpod.yaml (§8.2).
+image: "ghcr.io/junhpark/minegs:gpu@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+data_root: ./data
+gpus: all
+shm_size: 16g
+native: false                  # true: docker 없이 현재 파이썬 환경에서 직접 실행 (개발용)
