@@ -75,8 +75,12 @@ data/        (git 제외) <dataset_id>/{raw,dataset,runs,eval,export}
 
 ## 실제 E57 검사 (Phase 0B.1)
 
-E57 파일이 실제로 무엇을 담고 있는지 **점군을 읽지 않고** 조사한다. header 메타데이터만 보므로
-수십 GB 파일에서도 빠르고 메모리를 쓰지 않는다.
+E57 파일이 실제로 무엇을 담고 있는지 **점군을 읽지 않고** 조사한다.
+
+비용은 두 부분으로 나뉜다. **메타데이터 파싱은 O(scan 수)** 이고 점 배열을 전혀 적재하지 않으므로
+수십 GB 파일에서도 메모리를 쓰지 않는다. 반면 **provenance 용 SHA-256 은 O(파일 크기)** 다 —
+1 MB 씩 스트리밍하므로 메모리는 일정하지만, 50 GB 스캔이면 50 GB 를 읽는 시간이 든다.
+빠르게 훑어보려면 `--no-hash` 를 쓴다(리포트에 건너뛴 사실이 기록된다).
 
 ```bash
 pip install -e ".[e57]"          # pye57 만 있으면 된다 (휠 제공, 네이티브 빌드 불필요)
@@ -90,7 +94,7 @@ minegs ingest e57 inventory D:\scan\tunnel.e57
 # 결과를 JSON 으로도 저장 (Phase 0B.2 로 넘길 입력)
 minegs ingest e57 inventory D:\scan\tunnel.e57 --json inventory.json
 
-# 아주 큰 파일에서 SHA-256 계산을 건너뛰고 빠르게 훑어보기 (리포트에 건너뛴 사실이 남는다)
+# SHA-256(O(파일 크기))을 건너뛰고 메타데이터만 빠르게 훑어보기 — 리포트에 건너뛴 사실이 남는다
 minegs ingest e57 inventory D:\scan\tunnel.e57 --no-hash
 ```
 

@@ -86,15 +86,22 @@ heavy profile 실행, 논문급 형상 검증, multi-epoch 검증.
 scan 하나가 station 하나라고, 모든 scan 에 pose·RGB·이름·GUID 가 있다고, 파노라마가 파일 안에
 있다고, 좌표가 TLS_GLOBAL 이라고 가정하지 않는다. 없는 것은 `None` 으로 기록하고 이유를 남긴다.
 
-* **식별자**: `scan_000`, `S000` 은 파일 순서와 무관하게 minegs 안에서 결정적이다. vendor GUID 는
-  있으면 함께 보존하되 identity 로 삼지 않는다.
+* **식별자**: `scan_000`, `S000` 은 **해당 source 파일 안의 scan index** 로 결정된다. vendor
+  name/GUID 에는 의존하지 않으므로 그것들이 없는 파일도 안정적으로 참조할 수 있지만, 파일 안의
+  scan 순서에는 의존한다. 파일의 SHA-256 과 함께 쓰면 scan 을 모호함 없이 지목할 수 있다.
+  vendor GUID 는 있으면 함께 보존하되 identity 로 삼지 않는다.
 * **좌표**: E57 자체 좌표는 `SOURCE` 다. `T_source_from_scan` 처럼 방향을 이름에 적는다.
   TLS_GLOBAL 선언과 LOCAL_METRIC 변환은 dataset materialization(0C) 의 몫이다.
-* **pose**: 없으면 `None`, 있으면 검증(finite·orthonormal·det ≈ +1·unit quaternion)한다.
+* **pose**: `absent`(선언 안 됨) · `unreadable`(선언됐으나 파싱 실패) · `invalid` · `identity` ·
+  `valid` 다섯 상태를 구분한다. 선언됐으나 읽히지 않은 pose 를 "없음"으로 합치지 않는다.
+  유효하지 않은 pose 에 `se3()` 를 호출하면 `E57PoseUnusableError` 로 거부된다 —
+  추출 경로(`split`)도 같은 리더를 쓰므로 inventory 와 다른 답을 낼 수 없다.
+  검증 항목은 finite·orthonormal·det ≈ +1·unit quaternion 이다.
   잘못된 pose 를 identity 로 바꾸지 않는다. 반올림된 회전(4~6자리)은 문제가 아니라 note 로 구분하고,
   변환용으로 orthonormalise 했다는 사실과 편차를 함께 기록한다.
-* **메모리**: header 만 읽는다. point count 는 `points.childCount()`, bounds 는 header 값이므로
-  inventory 비용이 점군 크기에 비례하지 않는다.
+* **비용**: header 만 읽는다. point count 는 `points.childCount()`, bounds 는 header 값이므로
+  **메타데이터 파싱은 O(scan 수)** 이고 점 배열을 적재하지 않는다. 단 provenance SHA-256 은
+  **O(파일 크기)** 다(`compute_hash=False` / `--no-hash` 로 생략 가능).
 * **station**: `mapping_status = inferred_from_scan`. 확정은 0B.2 가 파노라마 근거로 한다.
 
 **Gate (G2)**: 실제 E57 소구간 ingest 성공. 산출물 — scan/station inventory, pose table,

@@ -48,13 +48,17 @@ def _yn(value: bool) -> str:
 
 
 def _pose_label(scan) -> str:
-    if scan.pose is None:
+    """Render pose_status. "declared but unreadable" must never read as "none declared"."""
+    if scan.pose_status == "absent":
         return "[dim]none declared[/]"
-    if not scan.pose.validation.valid:
-        return "[red]INVALID[/] (" + "; ".join(scan.pose.validation.issues) + ")"
-    t = scan.pose.translation_m
-    if scan.pose.is_identity:
+    if scan.pose_status == "unreadable":
+        return "[red]DECLARED BUT UNREADABLE[/] (the file has a pose node we could not parse)"
+    if scan.pose_status == "invalid":
+        issues = "; ".join(scan.pose.validation.issues) if scan.pose else "validation failed"
+        return f"[red]INVALID[/] ({issues})"
+    if scan.pose_status == "identity":
         return "[yellow]identity[/] (file declares no displacement for this scan)"
+    t = scan.pose.translation_m
     return f"[green]yes[/]  translation = ({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}) m"
 
 
@@ -109,6 +113,8 @@ def _print_inventory(inv) -> None:
         "\n[bold]Images:[/] "
         + (
             f"images2D present with {inv.images.image_count} entries"
+            if inv.images.has_images2d and inv.images.image_count is not None
+            else "images2D present but the entry count could not be read"
             if inv.images.has_images2d
             else "no images2D structure"
         )

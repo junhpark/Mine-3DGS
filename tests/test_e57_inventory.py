@@ -24,6 +24,7 @@ from minegs.ingest.e57.exceptions import (
     E57FileNotFoundError,
     E57NoScansError,
     E57NotAFileError,
+    E57PoseUnusableError,
     E57ReadError,
     E57UnsupportedStructureError,
 )
@@ -37,6 +38,7 @@ from minegs.ingest.e57.models import (
     station_id_for,
     validate_rotation,
 )
+from minegs.ingest.e57.scan_split import read_scan, split_scans
 
 # ---------------------------------------------------------------- fake libE57 node tree
 
@@ -143,6 +145,18 @@ class FakeE57:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _rotmat_from_quat(q: list[float]) -> np.ndarray:
+    """Rotation from a quaternion WITHOUT normalising, matching what the reader builds."""
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
 
 
 def _pose_node(quat_wxyz: tuple[float, ...], xyz: tuple[float, ...]) -> FakeNode:
@@ -309,7 +323,8 @@ def test_missing_optional_metadata_does_not_crash(fake_e57):
     inv = inventory(path, compute_hash=False)
     s = inv.scans[0]
     assert s.name is None and s.guid is None and s.point_count is None
-    assert s.pose is None and s.has_pose is False and s.bounds is None
+    assert s.pose is None and s.pose_declared is False and s.pose_status == "absent"
+    assert s.bounds is None
     assert any("point count unavailable" in i for i in s.issues)
     assert any("declare no pose" in n for n in inv.notes)
 
@@ -342,7 +357,8 @@ def test_pose_absent_is_none_never_identity(fake_e57):
     """The forbidden behaviour: silently substituting identity for a missing pose (§10)."""
     path, _ = fake_e57([make_scan(pose=None)])
     s = inventory(path, compute_hash=False).scans[0]
-    assert s.has_pose is False and s.pose is None
+    assert s.pose_declared is False and s.pose_status == "absent" and s.pose is None
+    assert not s.pose_is_broken, "an unregistered scan is not a broken one"
 
 
 def test_valid_pose_becomes_named_transform(fake_e57):
@@ -350,7 +366,7 @@ def test_valid_pose_becomes_named_transform(fake_e57):
     c = np.sqrt(0.5)
     path, _ = fake_e57([make_scan(pose=_pose_node((c, 0.0, 0.0, c), (1.0, 2.0, 3.0)))])
     s = inventory(path, compute_hash=False).scans[0]
-    assert s.has_pose and s.pose is not None and s.pose.validation.valid
+    assert s.pose_declared and s.pose_status == "valid" and s.pose_is_usable
     assert s.pose.source_frame == "SOURCE" and s.pose.unit == "m"
     assert s.pose.translation_m == [1.0, 2.0, 3.0]
     T = s.pose.se3()  # raises unless the stored matrix is genuinely rigid
@@ -363,7 +379,7 @@ def test_invalid_pose_is_detected_and_reported(fake_e57):
     path, _ = fake_e57([make_scan(pose=_pose_node((2.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))])
     inv = inventory(path, compute_hash=False)
     s = inv.scans[0]
-    assert s.has_pose and s.pose is not None
+    assert s.pose_declared and s.pose is not None and s.pose_status == "invalid"
     assert s.pose.validation.valid is False
     assert any("not unit length" in i for i in s.pose.validation.issues)
     assert s.issues, "an invalid pose must surface on the scan"
@@ -483,23 +499,15 @@ def test_images_are_detected_but_not_mapped(fake_e57):
     assert inv.images.has_images2d and inv.images.image_count == 2
     assert "0B.2" in (inv.images.detection_note or "")
     # detection is a count and a flag; nothing associates an image with a station or scan
-    assert set(inv.images.model_dump()) == {"has_images2d", "image_count", "detection_note"}
+    assert set(inv.images.model_dump()) == {
+        "has_images2d",
+        "image_count",
+        "enumeration_status",
+        "detection_note",
+    }
     assert all(c.mapping_status == "inferred_from_scan" for c in inv.station_candidates)
     assert not any("image" in k or "pano" in k for k in inv.station_candidates[0].model_dump())
     assert not any("image" in k or "pano" in k for k in inv.scans[0].model_dump())
-
-
-def test_absent_and_unreadable_images_structures(fake_e57):
-    path, _ = fake_e57([make_scan()], root=FakeNode("root", {}))
-    inv = inventory(path, compute_hash=False)
-    assert not inv.images.has_images2d and inv.images.image_count == 0
-    assert any("no images2D" in n for n in inv.notes)
-
-    path2, _ = fake_e57(
-        [make_scan()], root=FakeNode("root", {"images2D": ExplodingNode("images2D")}), name="g.e57"
-    )
-    inv2 = inventory(path2, compute_hash=False)
-    assert inv2.images.detection_note and "not enumerable" in inv2.images.detection_note
 
 
 # ---------------------------------------------------------------- errors
@@ -615,6 +623,187 @@ def test_report_never_claims_a_tls_global_frame(fake_e57):
     assert "SOURCE" in dumped
 
 
+# ------------------------------------------------ BLOCKER 1: se3() is fail-closed
+
+
+def test_se3_refuses_every_invalid_pose():
+    """An unusable pose must never come back as a working transform (§10, invariant 6).
+
+    The dangerous case is a partial pose: rotation unknown, translation present. The stored
+    matrix looks perfectly ordinary, so without this gate the caller gets a plausible
+    identity-rotation SE(3) and never learns the file did not say which way the scanner faced.
+    """
+    missing_rotation = make_scan_pose(
+        np.eye(3), [1.0, 2.0, 3.0], None, extra_issues=["pose declares no rotation"]
+    )
+    missing_translation = make_scan_pose(
+        np.eye(3),
+        [0.0, 0.0, 0.0],
+        np.array([1.0, 0, 0, 0]),
+        extra_issues=["pose declares no translation"],
+    )
+    broken_quaternion = make_scan_pose(np.eye(3) * 3, [0.0, 0.0, 0.0], np.array([3.0, 0, 0, 0]))
+    for pose in (missing_rotation, missing_translation, broken_quaternion):
+        assert not pose.validation.valid
+        with pytest.raises(E57PoseUnusableError, match="cannot be used as a rigid transform"):
+            pose.se3()
+
+    # a merely rounded quaternion stays usable — the gate must not over-reject
+    rounded = make_scan_pose(
+        _rotmat_from_quat([0.7071, 0.0, 0.0, 0.7071]),
+        [1.0, 2.0, 3.0],
+        np.array([0.7071, 0.0, 0.0, 0.7071]),
+    )
+    assert rounded.validation.valid and rounded.validation.normalised
+    assert np.allclose(rounded.se3().t, [1.0, 2.0, 3.0])
+
+
+def test_inventory_invalid_pose_cannot_be_converted(fake_e57):
+    """End to end: the file says translation only, and nothing downstream gets a transform."""
+    only_translation = FakeNode(
+        "pose", {"translation": FakeNode("translation", {"x": 5.0, "y": 0.0, "z": 0.0})}
+    )
+    path, _ = fake_e57([make_scan(pose=only_translation)])
+    s = inventory(path, compute_hash=False).scans[0]
+    assert s.pose_status == "invalid" and s.pose is not None
+    with pytest.raises(E57PoseUnusableError):
+        s.pose.se3()
+
+
+# --------------------------- BLOCKER 3: declared-but-unreadable is not "absent"
+
+
+def test_declared_but_unreadable_pose_is_not_absent(fake_e57):
+    """pose=None for two different reasons; only one of them is a healthy scan."""
+    path, _ = fake_e57([make_scan(pose=ExplodingNode("pose")), make_scan(pose=None)])
+    inv = inventory(path, compute_hash=False)
+    unreadable, absent = inv.scans
+
+    assert unreadable.pose_declared is True and unreadable.pose_status == "unreadable"
+    assert unreadable.pose is None and unreadable.pose_is_broken
+    assert unreadable.issues, "an unreadable pose must be a problem, not silence"
+
+    assert absent.pose_declared is False and absent.pose_status == "absent"
+    assert absent.pose is None and not absent.pose_is_broken
+
+    # the broken one must not be counted as usable, and the two must not read alike
+    assert inv.usable_scan_count() == 1
+    assert any("could not be read" in i for i in inv.issues)
+    assert any("declare no pose" in n for n in inv.notes)
+    assert inv.scans_with_usable_pose() == []
+
+
+def test_unreadable_pose_is_visible_in_the_cli(fake_e57, capsys):
+    from minegs.cli.ingest import _print_inventory
+
+    path, _ = fake_e57([make_scan(pose=ExplodingNode("pose"))])
+    _print_inventory(inventory(path, compute_hash=False))
+    out = capsys.readouterr().out
+    assert "none declared" not in out, "an unreadable pose must not be shown as absent"
+    assert "unreadable" in out.lower()
+
+
+# ------------------------------ BLOCKER 2: extraction honours the pose contract
+
+
+def _fake_split_reader(monkeypatch):
+    """scan_split imported ``_pye57`` by value, so its own binding needs the fake too."""
+    import minegs.ingest.e57.inventory as _inv
+    import minegs.ingest.e57.scan_split as split_mod
+
+    monkeypatch.setattr(split_mod, "_pye57", _inv._pye57)
+
+
+def test_split_refuses_scans_without_a_usable_pose(fake_e57, tmp_path, monkeypatch):
+    """inventory and split must never disagree about the same file."""
+    path, _ = fake_e57(
+        [
+            make_scan(pose=_pose_node((1.0, 0.0, 0.0, 0.0), (1.0, 2.0, 3.0))),
+            make_scan(pose=None),
+            make_scan(pose=_pose_node((2.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0))),
+        ]
+    )
+    _fake_split_reader(monkeypatch)
+    with pytest.raises(E57PoseUnusableError) as err:
+        split_scans(path, tmp_path / "out")
+    message = str(err.value)
+    assert "scan_001 (absent)" in message and "scan_002 (invalid)" in message
+    assert "scan_000" not in message and "inventory" in message
+    assert not (tmp_path / "out").exists(), "nothing may be written on refusal"
+
+
+def test_read_scan_refuses_an_unusable_pose(fake_e57, monkeypatch):
+    """The guard sits before read_scan_raw, so no point data is touched either."""
+    path, _ = fake_e57([make_scan(pose=None)])
+    _fake_split_reader(monkeypatch)
+    with pytest.raises(E57PoseUnusableError, match="absent"):
+        read_scan(path, 0)
+
+
+def test_split_does_not_use_pye57_pose_fallback():
+    """The regression guard: pye57's rotation_matrix/translation must not appear here."""
+    import inspect
+
+    import minegs.ingest.e57.scan_split as split_mod
+
+    src = inspect.getsource(split_mod)
+    assert "rotation_matrix" not in src and ".translation" not in src
+    assert "scan_pose" in src, "poses must come from the Phase 0B.1 reader"
+    assert "T_tls_from_scanner" not in src, "the E57's own frame is SOURCE, not TLS_GLOBAL"
+    assert "T_source_from_scanner" in src
+
+
+def test_embedded_panorama_source_requires_an_explicit_mapping(tmp_path, monkeypatch):
+    """0B.1 detects images; guessing which one belongs to which station is 0B.2's contract."""
+    from minegs.core.errors import ContractError
+    from minegs.ingest.e57.pano.e57_embedded import E57Embedded
+
+    path = _write_real_e57(tmp_path / "pano.e57", [{"name": "A", "n": 3}])
+    src = E57Embedded(path)
+    assert src.images == [], "the fixture has no images2D entries"
+    with pytest.raises(ContractError, match="no embedded images2D entries"):
+        src.list_panoramas()
+
+    # with entries but no mapping, the refusal must name the phase rather than guess an order
+    monkeypatch.setattr(src, "images", [{"index": 0, "name": "pano_a", "width": 8, "height": 4}])
+    with pytest.raises(ContractError, match=r"Phase 0B\.2"):
+        src.list_panoramas()
+
+    mapping = tmp_path / "map.csv"
+    mapping.write_text("station_id,pano_id\nS000,pano_a\n")
+    src.mapping = {"S000": "pano_a"}
+    rec = src.list_panoramas()
+    assert len(rec) == 1 and rec[0].station_id == "S000" and rec[0].pano_id == "0"
+
+
+# ------------------------------ MAJOR 1: unreadable images2D is not "absent"
+
+
+def test_unreadable_images2d_reports_unknown_not_zero(fake_e57):
+    path, _ = fake_e57(
+        [make_scan()], root=FakeNode("root", {"images2D": ExplodingNode("images2D")})
+    )
+    inv = inventory(path, compute_hash=False)
+    assert inv.images.has_images2d is True
+    assert inv.images.image_count is None, "unknown must not be reported as zero"
+    assert inv.images.enumeration_status == "error"
+    assert any("not enumerable" in i for i in inv.issues)
+
+
+def test_absent_and_empty_images2d_are_distinct(fake_e57):
+    path, _ = fake_e57([make_scan()], root=FakeNode("root", {}))
+    absent = inventory(path, compute_hash=False).images
+    assert absent.has_images2d is False and absent.image_count == 0
+    assert absent.enumeration_status == "absent"
+
+    path2, _ = fake_e57(
+        [make_scan()], root=FakeNode("root", {"images2D": FakeNode("images2D", {})}), name="e.e57"
+    )
+    empty = inventory(path2, compute_hash=False).images
+    assert empty.has_images2d is True and empty.image_count == 0
+    assert empty.enumeration_status == "ok"
+
+
 # ---------------------------------------------------------------- real libE57 round trip
 
 pye57 = pytest.importorskip("pye57", reason="real-E57 round trip needs minegs[e57]")
@@ -688,6 +877,21 @@ def test_real_e57_with_zero_scans(tmp_path):
     f.close()
     with pytest.raises(E57NoScansError):
         inventory(path)
+
+
+def test_real_e57_split_writes_the_source_frame_contract(tmp_path):
+    """Extraction on a real file: scan_id-named outputs, SOURCE frame, no TLS_GLOBAL claim."""
+    path = _write_real_e57(
+        tmp_path / "split.e57",
+        [{"name": "A", "n": 5, "translation": [4.0, 5.0, 6.0]}],
+    )
+    written = split_scans(path, tmp_path / "out", voxel_m=None)
+    assert [p.name for p in written] == ["scan_000.ply"]
+    meta = json.loads((tmp_path / "out" / "scan_000.pose.json").read_text())
+    assert meta["scan_id"] == "scan_000" and meta["scan_index"] == 0
+    assert meta["source_frame"] == "SOURCE"
+    assert "T_tls_from_scanner" not in meta
+    assert [row[3] for row in meta["T_source_from_scanner"][:3]] == [4.0, 5.0, 6.0]
 
 
 def test_real_e57_inventory_does_not_read_points(tmp_path, monkeypatch):

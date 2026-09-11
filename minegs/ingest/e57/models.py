@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from minegs.core.config import VersionedModel
 from minegs.core.frames import SE3
 from minegs.core.provenance import ProvenanceRecord
+from minegs.ingest.e57.exceptions import E57PoseUnusableError
 
 #: Frame label for an E57's own coordinates. NOT TLS_GLOBAL — that mapping is decided later.
 SOURCE_FRAME = "SOURCE"
@@ -30,6 +31,13 @@ SOURCE_FRAME = "SOURCE"
 #: How a station candidate came to exist. Phase 0B.1 can only infer one-per-scan; Phase 0B.2
 #: confirms (or corrects) it with panorama evidence.
 MappingStatus = Literal["inferred_from_scan", "confirmed", "manual"]
+#: What the file gave us for a scan's pose.
+#: ``absent``     - no pose node at all (an unregistered scan; not an error)
+#: ``unreadable`` - a pose node exists but could not be parsed (a problem, NOT "absent")
+#: ``invalid``    - parsed, but not a rigid transform
+#: ``identity``   - valid, but the file declares no displacement
+#: ``valid``      - usable
+PoseStatus = Literal["absent", "unreadable", "invalid", "identity", "valid"]
 StationOrigin = Literal["e57_scan", "derived", "manual"]
 
 
@@ -81,7 +89,15 @@ class ScanPose(_Strict):
     validation: PoseValidation
 
     def se3(self) -> SE3:
-        """The pose as an ``SE3``. Raises ``FrameError`` if the rotation is not rigid."""
+        """The pose as an ``SE3``.
+
+        Fail-closed: a pose whose ``validation`` failed is never handed out as a working
+        transform. Without this gate a scan declaring only a translation would come back as a
+        perfectly ordinary identity-rotation SE(3), which is exactly the silent fallback the
+        inventory exists to prevent.
+        """
+        if not self.validation.valid:
+            raise E57PoseUnusableError("; ".join(self.validation.issues) or "validation failed")
         return SE3.from_matrix(self.T_source_from_scan)
 
 
@@ -121,8 +137,13 @@ class E57ScanInventory(_Strict):
     has_rgb: bool = False
     has_intensity: bool = False
     has_row_column: bool = False
-    has_pose: bool = False
 
+    #: The file declares a pose node. Says nothing about whether it could be read or is valid.
+    pose_declared: bool = False
+    #: Collapses declared/parsed/valid into the one word a reader actually needs.
+    pose_status: PoseStatus = "absent"
+    #: The parsed pose. ``None`` when absent OR unreadable — check ``pose_status`` to tell
+    #: those apart; a pose node that failed to parse must never look like no pose at all.
     pose: ScanPose | None = None
     bounds: ScanBounds | None = None
 
@@ -141,6 +162,15 @@ class E57ScanInventory(_Strict):
         """Whether point positions could be reconstructed at all (either coordinate system)."""
         return self.has_cartesian_xyz or self.has_spherical
 
+    @property
+    def pose_is_broken(self) -> bool:
+        """The file declares a pose but it cannot be used. Absent is not broken."""
+        return self.pose_status in ("unreadable", "invalid")
+
+    @property
+    def pose_is_usable(self) -> bool:
+        return self.pose is not None and self.pose.validation.valid
+
 
 class StationCandidate(_Strict):
     """A *candidate* capture station.
@@ -158,10 +188,17 @@ class StationCandidate(_Strict):
 
 
 class ImageSummary(_Strict):
-    """Detection only. Phase 0B.1 never decodes or extracts an image (Phase 0B.2 does)."""
+    """Detection only. Phase 0B.1 never decodes or extracts an image (Phase 0B.2 does).
+
+    ``image_count`` is ``None`` when the structure exists but could not be enumerated. An
+    unknown count must not be reported as zero: "present but unreadable" and "absent" are
+    different facts about the file, and flattening them is the interpretation this phase
+    refuses to make.
+    """
 
     has_images2d: bool = False
-    image_count: int = 0
+    image_count: int | None = 0
+    enumeration_status: Literal["ok", "absent", "error"] = "absent"
     detection_note: str | None = None
 
 
@@ -203,27 +240,31 @@ class E57Inventory(VersionedModel):
                 return s
         raise KeyError(scan_id)
 
-    def scans_with_pose(self) -> list[E57ScanInventory]:
-        return [s for s in self.scans if s.has_pose and s.pose is not None]
+    def scans_with_usable_pose(self) -> list[E57ScanInventory]:
+        return [s for s in self.scans if s.pose_is_usable]
 
     def has_any_issue(self) -> bool:
         return bool(self.issues) or any(s.issues for s in self.scans)
 
     def usable_scan_count(self) -> int:
-        """Scans that declare a coordinate triple and, if they declare a pose, a valid one."""
-        return sum(
-            1
-            for s in self.scans
-            if s.is_usable_for_points and (s.pose is None or s.pose.validation.valid)
-        )
+        """Scans that declare a coordinate triple and whose pose, if declared, is usable.
+
+        A scan with no pose at all is usable (it is simply unregistered). A scan whose pose
+        node exists but could not be read or is not a rotation is not.
+        """
+        return sum(1 for s in self.scans if s.is_usable_for_points and not s.pose_is_broken)
 
 
 # ---------------------------------------------------------------- deterministic identifiers
 
 
 def scan_id_for(index: int) -> str:
-    """``0 -> "scan_000"``. Position in the file is *presentation* order; this id is the one
-    minegs uses internally, so a vendor that omits GUIDs still gets stable references."""
+    """``0 -> "scan_000"``, from the scan's index inside its source file.
+
+    Independent of vendor metadata (name, GUID), so a file that omits those still gets stable
+    references; it is *not* independent of the order scans appear in the file. Paired with the
+    file's SHA-256 in provenance, that is enough to identify a scan unambiguously.
+    """
     if index < 0:
         raise ValueError("scan index must be >= 0")
     return f"scan_{index:03d}"

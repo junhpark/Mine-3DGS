@@ -6,7 +6,9 @@ Scope and non-scope, per docs/ROADMAP.md:
   identity, point count, which point fields exist, pose, header bounds. It also notes whether
   image structures are present.
 * It does **not** read point data. ``header.point_count`` is ``points.childCount()`` and the
-  bounds come from header metadata, so inventory cost does not scale with cloud size (§17).
+  bounds come from header metadata, so *metadata parsing* is O(scan count), not O(points),
+  and uses no meaningful memory (§17). Note that the default SHA-256 for provenance does read
+  the whole file byte by byte, so wall-clock is O(file size) unless ``compute_hash=False``.
 * It does **not** extract, decode or map panoramas. Detection only; the station↔panorama
   contract is Phase 0B.2.
 * It does **not** declare a coordinate system. An E57's own coordinates are ``SOURCE``.
@@ -45,6 +47,7 @@ from minegs.ingest.e57.models import (
     E57Inventory,
     E57ScanInventory,
     ImageSummary,
+    PoseStatus,
     ScanBounds,
     ScanPose,
     StationCandidate,
@@ -107,18 +110,31 @@ def _str_value(node: Any, *path: str) -> str | None:
 
 def _pose_from_header(
     header: Any, scan_fields: list[str]
-) -> tuple[ScanPose | None, list[str], list[str]]:
-    """Read the scan's pose node directly. Returns (pose or None, issues, notes)."""
+) -> tuple[ScanPose | None, PoseStatus, list[str], list[str]]:
+    """Read the scan's pose node directly. Returns (pose or None, status, issues, notes).
+
+    The status distinguishes the three ways a pose can fail to be usable. In particular a
+    declared-but-unreadable pose is ``unreadable``, never ``absent``: the pose object is
+    ``None`` in both cases, so without the status a parse failure would be indistinguishable
+    from an honestly unregistered scan and would count as a usable scan.
+    """
     issues: list[str] = []
     notes: list[str] = []
     if "pose" not in scan_fields:
-        return None, issues, notes
+        return None, "absent", issues, notes
     try:
         pose_node = header["pose"]
+        pose_fields = _fields(pose_node)
     except Exception as e:
-        return None, [f"pose node declared but unreadable: {e}"], notes
+        return None, "unreadable", [f"pose node declared but unreadable: {e}"], notes
+    if not pose_fields:
+        return (
+            None,
+            "unreadable",
+            ["pose node declared but its contents could not be enumerated"],
+            notes,
+        )
 
-    pose_fields = _fields(pose_node)
     quat = None
     R = np.eye(3)
     if "rotation" in pose_fields:
@@ -146,7 +162,24 @@ def _pose_from_header(
     pose = make_scan_pose(R, t, quat, extra_issues=list(issues))
     issues = list(pose.validation.issues)
     notes.extend(pose.validation.warnings)
-    return pose, issues, notes
+    if not pose.validation.valid:
+        status: PoseStatus = "invalid"
+    elif pose.is_identity:
+        status = "identity"
+    else:
+        status = "valid"
+    return pose, status, issues, notes
+
+
+def scan_pose(header: Any) -> tuple[ScanPose | None, PoseStatus]:
+    """The pose of one already-opened scan header, through the Phase 0B.1 contract.
+
+    The single entry point every caller must use. Reading ``pye57``'s ``rotation_matrix`` /
+    ``translation`` directly returns identity and zeros for a scan with no pose, so a second
+    reader would silently disagree with the inventory about the same file.
+    """
+    pose, status, _issues, _notes = _pose_from_header(header, _fields(header.node))
+    return pose, status
 
 
 def _quat_to_rotmat_unnormalised(q: np.ndarray) -> np.ndarray:
@@ -228,7 +261,7 @@ def _scan_inventory(header: Any, index: int) -> E57ScanInventory:
         )
 
     notes: list[str] = []
-    pose, pose_issues, pose_notes = _pose_from_header(header, scan_fields)
+    pose, pose_status, pose_issues, pose_notes = _pose_from_header(header, scan_fields)
     issues.extend(pose_issues)
     notes.extend(pose_notes)
     bounds, bounds_issues = _bounds_from_header(header, scan_fields)
@@ -250,7 +283,8 @@ def _scan_inventory(header: Any, index: int) -> E57ScanInventory:
         has_rgb=all(f in point_fields for f in RGB_FIELDS),
         has_intensity="intensity" in point_fields,
         has_row_column=all(f in point_fields for f in ROW_COLUMN_FIELDS),
-        has_pose=pose is not None,
+        pose_declared="pose" in scan_fields,
+        pose_status=pose_status,
         pose=pose,
         bounds=bounds,
         raw_point_fields=point_fields,
@@ -267,15 +301,31 @@ def _scan_inventory(header: Any, index: int) -> E57ScanInventory:
 def _image_summary(root: Any) -> ImageSummary:
     """Whether image structures exist. Nothing is decoded or mapped here (Phase 0B.2)."""
     try:
-        if not root.isDefined("images2D"):
-            return ImageSummary(has_images2d=False, image_count=0)
-        node = root["images2D"]
-        count = int(node.childCount())
+        defined = root.isDefined("images2D")
     except Exception as e:
-        return ImageSummary(detection_note=f"images2D present but not enumerable: {e}")
+        return ImageSummary(
+            has_images2d=False,
+            image_count=None,
+            enumeration_status="error",
+            detection_note=f"could not determine whether images2D exists: {e}",
+        )
+    if not defined:
+        return ImageSummary(has_images2d=False, image_count=0, enumeration_status="absent")
+    try:
+        count = int(root["images2D"].childCount())
+    except Exception as e:
+        # Present but unreadable. Reporting count=0 here would turn "unknown" into "none",
+        # which is the interpretation this phase refuses to make.
+        return ImageSummary(
+            has_images2d=True,
+            image_count=None,
+            enumeration_status="error",
+            detection_note=f"images2D present but not enumerable: {e}",
+        )
     return ImageSummary(
         has_images2d=True,
         image_count=count,
+        enumeration_status="ok",
         detection_note=(
             "images2D structure exists but is empty"
             if count == 0
@@ -337,8 +387,11 @@ def list_images2d(path: str | Path) -> list[dict[str, Any]]:
 def inventory(path: str | Path, compute_hash: bool = True) -> E57Inventory:
     """Inspect an E57 file and return the Phase 0B.1 contract.
 
-    Never reads point data. ``compute_hash=False`` skips the (potentially slow) SHA-256 of a
-    multi-gigabyte file and records *why* the hash is absent, so a report without a hash can
+    Never reads point data: metadata parsing is O(scan count) and holds no arrays.
+
+    ``compute_hash`` is the one part that is O(file size) — the provenance SHA-256 streams the
+    whole file in 1 MB chunks (bounded memory, unbounded time on a 50 GB scan). Pass
+    ``compute_hash=False`` to skip it; the report records *why* the hash is absent so it can
     never be mistaken for a hashed one.
     """
     pye57 = _pye57()
@@ -431,13 +484,19 @@ def _file_findings(
     issues: list[str] = []
     notes: list[str] = []
     n = len(scans)
-    no_pose = [s.scan_id for s in scans if not s.has_pose]
-    if no_pose:
-        notes.append(f"{len(no_pose)} of {n} scans declare no pose: {no_pose}")
-    bad_pose = [s.scan_id for s in scans if s.pose is not None and not s.pose.validation.valid]
+    absent = [s.scan_id for s in scans if s.pose_status == "absent"]
+    if absent:
+        notes.append(f"{len(absent)} of {n} scans declare no pose: {absent}")
+    unreadable = [s.scan_id for s in scans if s.pose_status == "unreadable"]
+    if unreadable:
+        issues.append(
+            f"{len(unreadable)} of {n} scans declare a pose that could not be read "
+            f"(this is not the same as having no pose): {unreadable}"
+        )
+    bad_pose = [s.scan_id for s in scans if s.pose_status == "invalid"]
     if bad_pose:
         issues.append(f"{len(bad_pose)} of {n} scans declare an invalid pose: {bad_pose}")
-    identity = [s.scan_id for s in scans if s.pose is not None and s.pose.is_identity]
+    identity = [s.scan_id for s in scans if s.pose_status == "identity"]
     if n > 1 and len(identity) == n:
         notes.append(
             f"all {n} scans have an identity pose; the file appears to carry no registration"
@@ -447,7 +506,9 @@ def _file_findings(
         issues.append(
             f"{len(no_coords)} of {n} scans declare no usable coordinate fields: {no_coords}"
         )
-    if not images.has_images2d:
+    if images.enumeration_status == "error":
+        issues.append(images.detection_note or "images2D could not be enumerated")
+    elif not images.has_images2d:
         notes.append("no images2D structure: panoramas, if any, are external to this file")
     elif images.image_count == 0:
         notes.append("images2D structure is present but empty")

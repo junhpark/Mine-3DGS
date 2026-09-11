@@ -56,3 +56,19 @@ class E57NoScansError(E57Error):
             f"E57 file opened successfully but contains no readable Data3D scans: {path}"
         )
         self.path = str(path)
+
+
+class E57PoseUnusableError(E57Error):
+    """A scan's pose was requested as a transform, but the file does not support one.
+
+    Raised by ``ScanPose.se3()``. The inventory deliberately keeps unusable poses in the
+    report (that is how a user learns what is wrong with their file); this is the gate that
+    stops such a pose from being silently turned into a working SE(3).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"pose cannot be used as a rigid transform: {reason}. Inspect it with "
+            "`minegs ingest e57 inventory` rather than treating it as identity."
+        )
+        self.reason = reason
