@@ -12,10 +12,21 @@ Executable contract (verified against gsplat v1.5.3 upstream):
   folder is missing, so the trainer must be pointed at a writable **staged** copy of the
   dataset (``minegs.train.staging``), never at the read-only dataset mount.
 
-Frame duties: we pass ``--no-normalize_world_space`` so BACKEND_INTERNAL == LOCAL_METRIC.
-If a profile insists on ``normalize_world_space: true`` we recompute gsplat's normalisation
-(``similarity_from_cameras`` + ``align_principle_axes``, re-implemented below) and invert it
-on export. Either way ``run.json`` records ``T_local_from_internal``.
+Phase 0A/0D refuses two requests outright rather than supporting them partially:
+
+* ``normalize_world_space: true`` — the baseline contract is BACKEND_INTERNAL == LOCAL_METRIC.
+  Our re-implementation of gsplat's normalisation below is *unvalidated* against upstream
+  (per-dataset orientation handling is not proven equivalent), and in the docker path the
+  command is built on the host from a container-side ``data_dir``, so the transform would be
+  computed from a path that does not exist there. Enabling it half-way would silently corrupt
+  every metric claim, so it raises ``ContractError``. The helpers stay for the future
+  equivalence test; nothing in the command path calls them.
+* ``depth_loss: true`` — upstream depth supervision reads COLMAP image→point observation
+  tracks, and TLS-initialised staging replaces ``points3D`` with ``init_points.ply`` and
+  clears those tracks (``minegs.train.staging``). Depth supervision is redesigned in Phase 4.
+
+``T_local_from_internal`` is therefore identity on every command this adapter builds, and
+``run.json`` records it explicitly.
 """
 
 from __future__ import annotations
@@ -38,6 +49,18 @@ TRAINER_ENV = "MINEGS_GSPLAT_TRAINER"
 TRAINER_IMAGE_PATH = "/opt/gsplat/examples/simple_trainer.py"  # set in docker/Dockerfile.gpu
 STRATEGIES = ("default", "mcmc")
 
+NORMALIZE_REFUSAL = (
+    "normalize_world_space=true is not enabled in the Phase 0A/0D baseline. Mine-3DGS requires "
+    "BACKEND_INTERNAL == LOCAL_METRIC until upstream transform equivalence is validated "
+    "(docs/ROADMAP.md). Set backend_args.normalize_world_space: false."
+)
+DEPTH_LOSS_REFUSAL = (
+    "depth_loss requested, but TLS initialization staging removes the COLMAP observation "
+    "tracks required by upstream gsplat depth supervision (minegs.train.staging writes "
+    "init_points.ply as points3D and clears image point3D_ids). This capability is deferred "
+    "to Phase 4 (docs/ROADMAP.md); set requests.depth_loss: false to run this profile."
+)
+
 
 def locate_trainer(require: bool = True) -> Path | None:
     """Path of gsplat's ``examples/simple_trainer.py`` (env override, else image default)."""
@@ -55,6 +78,7 @@ def locate_trainer(require: bool = True) -> Path | None:
 
 class GsplatBackend(TrainBackend):
     name = "gsplat"
+    capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL}
 
     def __init__(self, trainer: Path | None = None) -> None:
         self._trainer = trainer
@@ -71,7 +95,9 @@ class GsplatBackend(TrainBackend):
         return BackendCapabilities(
             appearance_embedding=True,
             bilateral_grid=True,
-            depth_loss=True,
+            # upstream gsplat supports depth supervision, but this adapter cannot deliver it
+            # while staging replaces points3D with TLS points (see DEPTH_LOSS_REFUSAL).
+            depth_loss=False,
             normal_loss=False,
             antialiasing=True,
             absgrad=True,
@@ -96,7 +122,12 @@ class GsplatBackend(TrainBackend):
         strategy = str(args.pop("strategy", "default"))
         if strategy not in STRATEGIES:
             raise ContractError(f"gsplat strategy must be one of {STRATEGIES}, got {strategy!r}")
-        normalize = bool(args.pop("normalize_world_space", False))
+        # Refusals cover both routes into a flag: a profile capability request, and a raw
+        # backend_args override that would otherwise be forwarded verbatim below.
+        if bool(args.pop("normalize_world_space", False)):
+            raise ContractError(NORMALIZE_REFUSAL)
+        if enabled.get("depth_loss") or bool(args.pop("depth_loss", False)):
+            raise ContractError(DEPTH_LOSS_REFUSAL)
         script = trainer or self._trainer
         if script is None:
             script = locate_trainer(require=check_trainer) or Path(TRAINER_IMAGE_PATH)
@@ -112,7 +143,7 @@ class GsplatBackend(TrainBackend):
             str(profile.data_factor),
             "--max_steps",
             str(profile.max_steps),
-            "--normalize_world_space" if normalize else "--no-normalize_world_space",
+            "--no-normalize_world_space",  # BACKEND_INTERNAL == LOCAL_METRIC (§3), enforced above
             "--disable_viewer",
         ]
         # profile.max_images is applied by minegs.train.staging (image subset written into the
@@ -120,10 +151,9 @@ class GsplatBackend(TrainBackend):
         for cap, flag in (
             ("appearance_embedding", "--app_opt"),
             ("bilateral_grid", "--use_bilateral_grid"),
-            ("depth_loss", "--depth_loss"),
             ("antialiasing", "--antialiased"),
             ("pose_refinement", "--pose_opt"),
-        ):
+        ):  # depth_loss is refused above, never emitted
             if enabled.get(cap):
                 argv.append(flag)
         if enabled.get("absgrad"):
@@ -145,10 +175,12 @@ class GsplatBackend(TrainBackend):
             )
             if ck:
                 argv += ["--ckpt", str(ck[-1])]
-        T = Sim3.identity()
-        if normalize:
-            T = gsplat_normalization(dataset_dir / "sparse" / "0").inverse()
-        return TrainCommand(argv=argv, env={"MINEGS_BACKEND": self.name}, T_local_from_internal=T)
+        # identity by construction: normalisation is refused above (BACKEND_INTERNAL == LOCAL_METRIC)
+        return TrainCommand(
+            argv=argv,
+            env={"MINEGS_BACKEND": self.name},
+            T_local_from_internal=Sim3.identity(),
+        )
 
     def normalize_outputs(
         self, out_dir: Path, run_dir: Path, T_local_from_internal: Sim3
@@ -173,7 +205,11 @@ class GsplatBackend(TrainBackend):
         return produced
 
 
-# ---------------------------------------------------------------- gsplat normalisation
+# ------------------------------------------------- gsplat normalisation (FUTURE WORK, unused)
+#
+# Kept for the upstream-equivalence test that must pass before normalize_world_space=true can
+# be enabled (see NORMALIZE_REFUSAL). No code path in this module calls gsplat_normalization;
+# it is exercised only by its own unit test.
 
 
 def similarity_from_cameras(
@@ -232,7 +268,11 @@ def align_principle_axes(point_cloud: np.ndarray) -> SE3:
 
 
 def gsplat_normalization(sparse_dir: Path) -> Sim3:
-    """``T_internal_from_local`` that gsplat's COLMAP parser applies with normalize=True."""
+    """``T_internal_from_local`` that gsplat's COLMAP parser applies with normalize=True.
+
+    FUTURE WORK — not equivalence-tested against upstream and not reachable from
+    ``build_command``; ``normalize_world_space=true`` is refused (see ``NORMALIZE_REFUSAL``).
+    """
     model = colmap_io.read_model(sparse_dir)
     c2w = np.stack([im.world_from_cam.matrix() for im in model.images.values()])
     T1 = similarity_from_cameras(c2w)

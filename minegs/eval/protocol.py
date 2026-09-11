@@ -7,6 +7,11 @@
 | geometry_holdout  | minus holdout range | per config   | holdout-range TLS     | geometry/volume |
 | change            | one of the above per epoch  |      | same range, 2 epochs  | change volume   |
 
+``judge(manifest)`` decides the first three rows. The ``change`` row is a *pair-level*
+protocol and is deliberately unreachable from one manifest: ``judge`` never returns
+``Protocol.CHANGE`` and never grants ``Claim.CHANGE_VOLUME``. The pair evaluator
+(``judge_change(manifest_a, manifest_b)``) is Phase 7 (docs/ROADMAP.md).
+
 ``judge(manifest)`` derives which claims a run on this dataset may make. ``require`` raises
 ``ProtocolViolation`` for anything else — e.g. asking for geometry accuracy from a
 ``reconstruction`` run.
@@ -26,14 +31,14 @@ class Protocol(str, Enum):
     RECONSTRUCTION = "reconstruction"
     NOVEL_VIEW = "novel_view"
     GEOMETRY_HOLDOUT = "geometry_holdout"
-    CHANGE = "change"
+    CHANGE = "change"  # pair-level; never produced by judge(manifest)
 
 
 class Claim(str, Enum):
     RENDER_QUALITY = "render_quality"  # PSNR/SSIM/LPIPS on test groups
     GEOMETRY_ACCURACY = "geometry_accuracy"  # accuracy/completeness/chamfer on holdout TLS
     VOLUME_ACCURACY = "volume_accuracy"  # sections / ∫A ds / overbreak on holdout range
-    CHANGE_VOLUME = "change_volume"  # epoch differencing
+    CHANGE_VOLUME = "change_volume"  # epoch differencing — pair protocol only (Phase 7)
     GEOMETRY_DIAGNOSTIC = (
         "geometry_diagnostic"  # numbers allowed, but *not* a claim (fit to train data)
     )
@@ -117,8 +122,17 @@ def judge(manifest: Manifest) -> Judgement:
             "no chainage holdout -> geometry numbers are diagnostic only (fit to training TLS)"
         )
 
-    if manifest.capture_epoch is not None and metric_ok and Protocol.GEOMETRY_HOLDOUT in protocols:
-        claims.append(Claim.CHANGE_VOLUME)
+    # ---- change: NEVER from a single manifest (§5 "change = same range, 2 epochs").
+    # A change claim needs an epoch *pair* contract (different epoch ids, compatible frames and
+    # scale basis, common reference axis, overlapping evaluation chainage, leak-free ranges).
+    # That is judge_change(manifest_a, manifest_b), Phase 7 — see docs/ROADMAP.md.
+    if manifest.capture_epoch is not None:
+        # Deliberately not naming the claim token here: a single manifest's judgement must
+        # never put it in front of a reader (or a grep) as if it were on offer.
+        reasons.append(
+            f"capture_epoch {manifest.capture_epoch.id!r} is declared; epoch-difference claims "
+            "need a two-epoch pair protocol and are out of scope for a single manifest (Phase 7)"
+        )
 
     if not protocols:
         protocols.append(Protocol.RECONSTRUCTION)
@@ -139,6 +153,12 @@ def judge(manifest: Manifest) -> Judgement:
 def require(manifest: Manifest, claim: Claim) -> Judgement:
     j = judge(manifest)
     if not j.allows(claim):
+        if claim is Claim.CHANGE_VOLUME:
+            raise ProtocolViolation(
+                "change_volume is a two-epoch claim and can never come from a single manifest "
+                f"({manifest.dataset_id!r}). The epoch-pair protocol (judge_change) is Phase 7; "
+                "see docs/ROADMAP.md."
+            )
         detail = "; ".join(j.refusals) or "manifest declares no split supporting it"
         raise ProtocolViolation(
             f"dataset {manifest.dataset_id!r} (protocol {j.primary.value}) cannot claim {claim.value}: {detail}"

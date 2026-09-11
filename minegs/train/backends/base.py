@@ -55,6 +55,9 @@ class TrainCommand:
 
 class TrainBackend(ABC):
     name: str = "abstract"
+    # capability -> why *this adapter, as integrated* cannot deliver it. Shown when a profile
+    # requires it, so a refusal explains the contract instead of just naming the gap.
+    capability_notes: dict[str, str] = {}
 
     @abstractmethod
     def version(self) -> str: ...
@@ -89,9 +92,12 @@ class TrainBackend(ABC):
         """Capabilities that will actually be enabled (required ones must exist; optional if present)."""
         missing = self.check_profile(profile)
         if missing:
-            raise ContractError(
-                f"backend {self.name} lacks required capabilities {missing} for profile {profile.name}"
+            msg = (
+                f"backend {self.name} cannot provide required capabilities {missing} "
+                f"for profile {profile.name}"
             )
+            notes = [self.capability_notes[c] for c in missing if c in self.capability_notes]
+            raise ContractError(". ".join([msg, *notes]))
         caps = self.capabilities()
         return {c: caps.has(c) for c in profile.requests}
 

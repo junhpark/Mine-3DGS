@@ -1,14 +1,19 @@
 schema_version: "1.0"
 name: heavy
-description: Full-quality run — all images (or one chunk), half/full resolution, 30k iters (§8.3).
+description: >-
+  Full-quality run — all images (or one chunk), half/full resolution, 30k iters (§8.3).
+  NOT RUNNABLE in Phase 0A/0D: it requires depth_loss, which the gsplat adapter refuses while
+  TLS-initialised staging clears the COLMAP observation tracks upstream depth supervision needs.
+  Depth supervision is redesigned in Phase 4 (docs/ROADMAP.md). This profile stays as the
+  declared target configuration; `minegs train run --profile heavy` fails closed until then.
 backend: gsplat
-default_runner: runpod             # Phase 1 — not runnable yet; pass --runner local for now
+default_runner: runpod             # RunPod is Phase 6 and not implemented; use --runner local
 max_images: null
 data_factor: 2
 max_steps: 30000
 requests:
-  depth_loss: true
-  appearance_embedding: true    # underground lighting variation (§6.2)
+  depth_loss: true              # refused today — see description (Phase 4)
+  appearance_embedding: true    # underground lighting variation (§6.2) — Phase 4 validates the gain
   bilateral_grid: false
   antialiasing: true
 backend_args:

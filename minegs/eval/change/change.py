@@ -1,4 +1,11 @@
-"""Epoch differencing (§11 change): ΔA(s) over the common chainage range -> ΔV."""
+"""Epoch differencing (§11 change): ΔA(s) over the common chainage range -> ΔV.
+
+``diff_sections`` is arithmetic over two section series: it does **not** establish that the
+two epochs are comparable (same frame, same scale basis, same reference axis, leak-free
+ranges, different epoch ids). That is the epoch-pair protocol ``judge_change``, Phase 7
+(docs/ROADMAP.md). Until it exists the result is labelled ``geometry_diagnostic`` and must
+not be reported as a validated change volume.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +29,8 @@ class ChangeReport(BaseModel):
     valid_section_count: int
     missing_section_count: int
     reference_axis: str
+    # never "change_volume": that claim needs the Phase 7 epoch-pair protocol (§5)
+    claim: str = "geometry_diagnostic"
 
 
 def diff_sections(

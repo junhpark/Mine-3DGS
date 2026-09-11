@@ -253,7 +253,10 @@ def change(
     epoch_b: str = typer.Option("ep2"),
     out: Path | None = typer.Option(None),
 ) -> None:
-    """ΔA(s), ΔV between two epochs' section series over the common chainage (§11)."""
+    """ΔA(s), ΔV between two epochs' section series over the common chainage (§11).
+
+    Diagnostic only: a validated change_volume claim needs the Phase 7 epoch-pair protocol.
+    """
     import json
 
     from minegs.eval.change import diff_sections
@@ -264,7 +267,12 @@ def change(
         b = SectionSeries.model_validate(json.loads(b_json.read_text()))
         rep = diff_sections(a, b, epoch_a, epoch_b, "centerline")
         console.print(
-            f"ΔV = {rep.delta_volume_m3:+.2f} m³ over {rep.start_chainage_m}-{rep.end_chainage_m} m"
+            f"[{rep.claim}] ΔV = {rep.delta_volume_m3:+.2f} m³ over "
+            f"{rep.start_chainage_m}-{rep.end_chainage_m} m"
+        )
+        console.print(
+            "[yellow]diagnostic only:[/] epoch comparability (frames, scale basis, reference "
+            "axis, leak-free ranges) is not verified; the epoch-pair protocol is Phase 7"
         )
         dump_json(rep, out)
 

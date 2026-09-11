@@ -32,7 +32,11 @@ def test_cli_phase0a_gate(tmp_path):
         "geometry_holdout",
     ]
     r = runner.invoke(app, ["eval", "protocol", str(ds), "--json"])
-    assert r.exit_code == 0 and "geometry_accuracy" in json.loads(r.output)["claims"]
+    claims = json.loads(r.output)["claims"]
+    assert r.exit_code == 0 and "geometry_accuracy" in claims
+    # a single-epoch dataset must never advertise a two-epoch claim (Phase 7 pair protocol)
+    assert "change_volume" not in claims and "change" not in json.loads(r.output)["protocols"]
+    assert "change_volume" not in runner.invoke(app, ["eval", "protocol", str(ds)]).output
     r = runner.invoke(app, ["train", "command", str(ds), "--profile", "light"])
     assert r.exit_code == 0 and "simple_trainer" in r.output
     sec = tmp_path / "sec.json"
@@ -181,6 +185,33 @@ def test_cli_dry_runs(tmp_path):
     )
     assert runner.invoke(app, ["ingest", "video", "rig", str(tmp_path / "rig.json")]).exit_code == 0
     assert runner.invoke(app, ["train", "profiles"]).exit_code == 0
+
+
+def test_cli_heavy_profile_fails_closed(tmp_path):
+    """heavy requires depth_loss, refused under TLS staging; the message names the reason."""
+    root = tmp_path / "syn"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "dataset",
+                "synthetic",
+                str(root),
+                "--length-m",
+                "45",
+                "--n-stations",
+                "3",
+                "--image-size",
+                "32",
+            ],
+        ).exit_code
+        == 0
+    )
+    r = runner.invoke(app, ["train", "command", str(root / "dataset"), "--profile", "heavy"])
+    assert r.exit_code == 2 and "depth_loss" in r.output and "Phase 4" in r.output
+    # light still builds a command
+    r = runner.invoke(app, ["train", "command", str(root / "dataset"), "--profile", "light"])
+    assert r.exit_code == 0 and "--no-normalize_world_space" in r.output
 
 
 def test_cli_runpod_is_not_runnable(tmp_path):

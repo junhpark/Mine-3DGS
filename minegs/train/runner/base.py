@@ -145,11 +145,7 @@ class Runner(ABC):
         for k, v in run.overrides.items():
             setattr(profile, k, v)
         backend = get_backend(run.backend or profile.backend)
-        missing = backend.check_profile(profile)
-        if missing:
-            raise ContractError(
-                f"profile {profile.name} requires {missing}, backend {backend.name} lacks them"
-            )
+        backend.resolve_requests(profile)  # raises ContractError naming the unmet capability
         if not run.run_id:
             run.run_id = make_id(backend.name)
         if not run.run_dir:

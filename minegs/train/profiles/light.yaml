@@ -1,6 +1,8 @@
 schema_version: "1.0"
 name: light
-description: Quick local baseline — small subset, quarter resolution, 7k iters (§8.3).
+description: >-
+  Quick local baseline — ≤100 images (subset written by minegs.train.staging), quarter
+  resolution, 7k iters (§8.3). The Phase 0D baseline profile.
 backend: gsplat
 default_runner: local
 max_images: 100
@@ -13,8 +15,8 @@ requests:                       # capability -> required? (true = refuse backend
   antialiasing: false
 backend_args:
   strategy: default
-  normalize_world_space: false  # keep BACKEND_INTERNAL == LOCAL_METRIC (§3)
-  init_type: sfm                # init_points.ply is written into sparse/0 as points3D
+  normalize_world_space: false  # BACKEND_INTERNAL == LOCAL_METRIC (§3); true is refused
+  init_type: sfm                # staging writes init_points.ply into sparse/0 as points3D
   sh_degree: 3
   eval_steps: [7000]
   save_steps: [7000]

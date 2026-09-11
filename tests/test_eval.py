@@ -26,6 +26,29 @@ def test_protocol_judgement_on_synthetic(synthetic):
     assert j.refusals == []
 
 
+def test_single_manifest_never_claims_change_volume(synthetic):
+    """§5: change = same range, TWO epochs. One manifest can never support it (Phase 7)."""
+    m = synthetic.manifest
+    assert m.capture_epoch is not None  # epoch declared, holdout present, metric scale present
+    j = judge(m)
+    assert Protocol.CHANGE not in j.protocols
+    assert not j.allows(Claim.CHANGE_VOLUME)
+    # the other claims this dataset legitimately supports are untouched
+    assert j.allows(Claim.GEOMETRY_ACCURACY) and j.allows(Claim.VOLUME_ACCURACY)
+    assert j.allows(Claim.RENDER_QUALITY) and j.allows(Claim.GEOMETRY_DIAGNOSTIC)
+    assert any("two-epoch" in r for r in j.reasons)
+    with pytest.raises(ProtocolViolation, match="two-epoch"):
+        require(m, Claim.CHANGE_VOLUME)
+
+
+def test_change_report_is_diagnostic_not_a_claim(synthetic):
+    """diff_sections is arithmetic; epoch comparability is the Phase 7 pair protocol."""
+    ser = extract_sections(synthetic.tls_points_global.xyz, synthetic.centerline_tls, 2.0, 0.5, 72)
+    rep = diff_sections(ser, ser, "ep1", "ep2", "cl")
+    assert rep.claim == "geometry_diagnostic"
+    assert rep.delta_volume_m3 == pytest.approx(0.0, abs=1e-9)
+
+
 def test_protocol_refuses_reconstruction_geometry_claims(synthetic):
     d = synthetic.manifest.model_dump(mode="json")
     d["split"] = {"train_groups": list(d["capture_groups"]), "test_groups": []}

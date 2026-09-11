@@ -29,8 +29,11 @@ from minegs.viz.overlay import calibrate_convention, render_overlay
 def test_profiles_and_capabilities():
     light, heavy = load_profile("light"), load_profile("heavy")
     be = get_backend("gsplat")
-    assert be.check_profile(light) == [] and be.check_profile(heavy) == []
+    assert be.check_profile(light) == []
+    # heavy requires depth_loss, which this adapter cannot deliver under TLS staging (Phase 4)
+    assert be.check_profile(heavy) == ["depth_loss"]
     assert heavy.required_capabilities() == ["antialiasing", "appearance_embedding", "depth_loss"]
+    assert be.capabilities().has("depth_loss") is False
     with pytest.raises(ContractError):
         load_profile("nope")
     with pytest.raises(NotYetImplementedError):
@@ -47,10 +50,50 @@ def test_gsplat_command_keeps_local_metric(synthetic, tmp_path):
     assert "--no-normalize_world_space" in cmd.argv and cmd.T_local_from_internal.is_identity()
     assert cmd.argv[1].endswith("simple_trainer.py") and cmd.argv[2] == "default"
     assert "--max_images" not in cmd.argv and "--absgrad" not in cmd.argv
+    assert "--depth_loss" not in cmd.argv
+
+
+def test_normalize_world_space_true_is_refused(synthetic, tmp_path):
+    """Phase 0A/0D contract: BACKEND_INTERNAL == LOCAL_METRIC, no partial support (§3)."""
+    be = get_backend("gsplat")
     prof = load_profile("light")
     prof.backend_args["normalize_world_space"] = True
-    cmd2 = be.build_command(synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False)
-    assert "--normalize_world_space" in cmd2.argv and not cmd2.T_local_from_internal.is_identity()
+    with pytest.raises(ContractError, match="normalize_world_space=true is not enabled"):
+        be.build_command(synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False)
+    # false stays the supported path: no normalisation, identity transform, explicit flag
+    prof.backend_args["normalize_world_space"] = False
+    cmd = be.build_command(synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False)
+    assert cmd.T_local_from_internal.is_identity()
+    assert "--no-normalize_world_space" in cmd.argv and "--normalize_world_space" not in cmd.argv
+
+
+def test_depth_loss_is_refused_under_tls_staging(synthetic, tmp_path):
+    """TLS staging clears COLMAP tracks that upstream depth supervision needs (Phase 4)."""
+    be = get_backend("gsplat")
+    heavy = load_profile("heavy")
+    with pytest.raises(ContractError, match="observation tracks"):
+        be.build_command(synthetic.dataset_dir, tmp_path / "out", heavy, check_trainer=False)
+    # the refusal explains itself wherever the capability gap is reported
+    with pytest.raises(ContractError, match=r"deferred\s+to Phase 4"):
+        be.resolve_requests(heavy)
+    # a raw backend_args override cannot smuggle the flag past the capability check
+    sneaky = load_profile("light")
+    sneaky.backend_args["depth_loss"] = True
+    with pytest.raises(ContractError, match="observation tracks"):
+        be.build_command(synthetic.dataset_dir, tmp_path / "out", sneaky, check_trainer=False)
+    # light (depth_loss requested as optional=false) is unaffected
+    light_cmd = be.build_command(
+        synthetic.dataset_dir, tmp_path / "out", load_profile("light"), check_trainer=False
+    )
+    assert "--depth_loss" not in light_cmd.argv and light_cmd.T_local_from_internal.is_identity()
+
+
+def test_runner_refuses_heavy_profile_before_staging(synthetic, tmp_path):
+    """`minegs train run --profile heavy` fails closed in prepare(), before any work."""
+    r = get_runner("local", RunnerConfig(runner="local", image="x@sha256:abc"))
+    with pytest.raises(ContractError, match="depth_loss"):
+        r.prepare(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="heavy"))
+    assert not (tmp_path / "staged").exists()
 
 
 def test_gsplat_trainer_contract(synthetic, tmp_path, monkeypatch):

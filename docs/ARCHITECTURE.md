@@ -281,19 +281,27 @@ Viser(파이썬 API, WebGL) 를 연구용 UI 로. 프러스텀·초기 포인트
 
 ## 13. 단계 · 게이트
 
-| Phase | 범위 | 게이트 |
-|---|---|---|
-| 0A Foundation | 패키지, pydantic config, manifest v1 + migration, CLI, tests/CI | 합성 데이터셋 통과 |
-| 0B E57 ingest | inventory, scan split, PDAL tile, pose, PanoSource | 실제 E57 소구간 |
-| 0C Dataset | 링 크롭, COLMAP export, init PLY, LOCAL↔TLS 프레임 | **골든 게이트**: 포인트 재투영이 파노라마와 일치 · Viser 정합 확인 |
-| 0D GS baseline | gsplat 어댑터 + LocalRunner + light | 소구간 학습 성공, .ply 가 LOCAL_METRIC |
-| 1 RunPod | GPU 이미지 pin, sync, resume, heavy | Local↔RunPod 재현성 |
-| 2 Image SfM | video/360 + COLMAP global/incremental + rig + Sim3 정합 | 독립 영상 재구성 |
-| 3 Metric geometry | PGSR/2DGS, 홀드아웃 프로토콜, 중심선·단면·체적, change | 논문용 형상 검증 |
-| 4 Web | 원격 공유 필요 시 FastAPI | 선택 |
+구현 순서, Phase 별 범위, validation gate(G0–G3), Definition of Done 은
+[ROADMAP.md](ROADMAP.md) 가 source of truth 다. 이 문서는 invariant 만 다룬다.
+
+큰 흐름: **0A** Foundation & Contract Freeze → **0B** 실제 E57 ingest → **0C** Metric dataset
+golden gate → **0D** Local GS baseline → **1** Metric surface & evaluation → **2** E57
+end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced GS / heavy →
+**5** 장거리 청킹 → **6** RunPod → **7** Multi-epoch change → **8** Viewer/Export/Web.
+
+두 가지만 여기서 못박는다.
+
+* Phase 는 Gate 를 통과해야 완료다. 코드가 있다는 사실(implemented)과 실데이터에서
+  확인됐다는 사실(validated)을 구분해 표기한다.
+* 검증되지 않은 경로는 부분 지원하지 않고 fail-closed 한다 (§1.6). 현재 거부 목록은
+  ROADMAP.md §6 에 있다.
 
 ## 14. 결정 이력
 
+* 2026-09 — Phase 0A closeout: 단일 manifest 는 change claim 불가(§5 change 는 2 epoch),
+  `depth_loss` 는 TLS staging 이 COLMAP observation track 을 제거하므로 거부(Phase 4 재설계),
+  `normalize_world_space=true` 는 upstream equivalence 검증 전까지 거부. Phase/게이트 정의는
+  ROADMAP.md 로 분리.
 * 2026-09 — 리포 `e57gs` → `minegs`. `ingest/common/` 은 기존 모듈 그대로.
 * 2026-09 — UI 는 웹(Viser → FastAPI). 3DGS 뷰어가 전부 WebGL, 데스크톱 패키징 비용 과다.
 * 2026-09 — TLS 단독 경로 순환논증 → 영상 경로 Phase 2, 평가 프로토콜을 계약으로 승격.
