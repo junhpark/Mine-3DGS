@@ -234,7 +234,26 @@ def image_set_digest(images: list[ImageAsset]) -> str | None:
 # ---------------------------------------------------------------- mapping file readers
 
 
+def _load_json(path: Path) -> Any:
+    """Parse a mapping file as JSON, or refuse.
+
+    A malformed or binary file is the user's problem to see, not a decode traceback: every
+    refusal on this path has to arrive as a sentence about their file.
+    """
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise ContractError(f"{path}: could not be read as JSON ({e})") from e
+
+
 def _rows_from_csv(path: Path) -> list[dict[str, str]]:
+    try:
+        return _csv_rows(path)
+    except (OSError, ValueError) as e:
+        raise ContractError(f"{path}: could not be read as CSV ({e})") from e
+
+
+def _csv_rows(path: Path) -> list[dict[str, str]]:
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
@@ -333,7 +352,7 @@ def read_mapping_file(path: str | Path) -> list[ExplicitEntry]:
         raise ContractError(f"mapping file not found: {p}")
     if p.suffix.lower() == ".json":
         return _entries_from_rows(
-            _rows_from_json(json.loads(p.read_text()), p), p, "explicit_mapping", "record"
+            _rows_from_json(_load_json(p), p), p, "explicit_mapping", "record"
         )
     return _entries_from_rows(_rows_from_csv(p), p, "explicit_mapping")
 
@@ -362,7 +381,7 @@ def read_vendor_manifest(path: str | Path) -> list[ExplicitEntry]:
             "A CSV cannot state who produced it — pass it with --mapping instead, which "
             "records the mapping as manual rather than confirmed."
         )
-    data = json.loads(p.read_text())
+    data = _load_json(p)
     if not isinstance(data, dict) or not data.get("vendor") or not data.get("generated_by"):
         raise ContractError(
             f"{p}: a vendor manifest must declare both 'vendor' and 'generated_by' at the top "
@@ -372,6 +391,15 @@ def read_vendor_manifest(path: str | Path) -> list[ExplicitEntry]:
     entries = _entries_from_rows(_rows_from_json(data, p), p, "vendor_manifest", "record")
     vendor = str(data["vendor"])
     return [e.model_copy(update={"origin": f"{vendor}:{e.origin}"}) for e in entries]
+
+
+def _same_file(a: str | Path, b: str | Path) -> bool:
+    """Whether two paths name one file — by inode where possible, so a hardlink counts."""
+    pa, pb = Path(a), Path(b)
+    try:
+        return pa.samefile(pb)
+    except OSError:
+        return pa.resolve() == pb.resolve()
 
 
 def _hash_input(path: Path, what: str) -> str:
@@ -397,11 +425,7 @@ def check_mapping_inputs(
     with a full pass over a 50 GB E57. Mapping files are small, so parsing them twice — once
     here and once for real — costs nothing next to what it saves.
     """
-    if (
-        mapping is not None
-        and vendor_manifest is not None
-        and Path(mapping).resolve() == Path(vendor_manifest).resolve()
-    ):
+    if mapping is not None and vendor_manifest is not None and _same_file(mapping, vendor_manifest):
         raise ContractError(
             f"{Path(mapping).resolve()} was given as both --mapping and --vendor-manifest. "
             "The two differ only in what they claim about who wrote the file, so one file "
@@ -514,6 +538,7 @@ def map_images(
 
     # ---- resolve every mapping row to concrete images, keeping the rows that resolve nowhere
     unresolved: list[UnresolvedReference] = []
+    ambiguous_refs: dict[str, list[str]] = defaultdict(list)
     by_image: dict[str, list[tuple[ExplicitEntry, list[str], str | None]]] = defaultdict(list)
     for entry in entries:
         targets = _resolve_image_ref(entry, images)
@@ -540,12 +565,24 @@ def map_images(
                     f"{[t.image_id for t in targets]}; refer to one image by image_id instead",
                 )
             )
+            # The row names none of them in particular, so it is evidence about no single
+            # image and cannot map or contradict one. Each candidate is told it was named,
+            # though, so a user reading one record is not left wondering why their row did
+            # nothing.
+            for t in targets:
+                ambiguous_refs[t.image_id].append(
+                    f"{entry.origin} names {entry.image_ref_kind} {entry.image_ref!r}, which "
+                    f"matches {len(targets)} images including this one, so it maps none of them"
+                )
             continue
         scan_ids, hint = index.resolve(entry.target)
         by_image[targets[0].image_id].append((entry, scan_ids, hint))
 
     records = [
-        _record_for(im, index, by_image.get(im.image_id, []), bool(entries)) for im in images
+        _record_for(
+            im, index, by_image.get(im.image_id, []), bool(entries), ambiguous_refs[im.image_id]
+        )
+        for im in images
     ]
 
     # ---- report-level findings
@@ -607,10 +644,11 @@ def _record_for(
     index: _Index,
     rows: list[tuple[ExplicitEntry, list[str], str | None]],
     mapping_given: bool = False,
+    ambiguous_refs: list[str] | None = None,
 ) -> MappingRecord:
     """One image's mapping, combining its own declaration with any mapping-file rows."""
     emb_status, emb_scans, emb_value, emb_hint = _embedded_evidence(image, index)
-    hints = [h for h in (emb_hint,) if h]
+    hints = [h for h in (emb_hint,) if h] + list(ambiguous_refs or [])
 
     if not rows:
         reason = {
@@ -645,14 +683,19 @@ def _record_for(
     # different things that both resolve to nothing, which would otherwise collapse into one
     # empty tuple and read as a single tidy orphan.
     if len(resolved) > 1 or (len(declared) > 1 and not next(iter(resolved))):
+        stated = "; ".join(f"{e.origin} -> {e.target}" for e, _s, _h in rows)
+        if emb_value is not None:
+            # The file's own account belongs in the record even when the mapping file has
+            # already disqualified itself: a reader resolving this conflict needs both sides.
+            stated += f"; E57 associatedData3DGuid {emb_value} -> {emb_scans or 'no scan here'}"
         return MappingRecord(
             image_id=image.image_id,
             status="conflict",
             evidence_type=entry.evidence_type,
-            evidence_value="; ".join(f"{e.origin} -> {e.target}" for e, _s, _h in rows),
+            evidence_value=stated,
             reason=f"{len(rows)} mapping rows name different scans for this image; a mapping "
             "file that contradicts itself is not evidence",
-            candidate_scan_ids=sorted({s for _e, ss, _h in rows for s in ss}),
+            candidate_scan_ids=sorted({s for _e, ss, _h in rows for s in ss} | set(emb_scans)),
             hints=hints,
         )
 

@@ -10,6 +10,7 @@ produces *no* mapping.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from minegs.core.errors import ContractError
@@ -869,6 +870,88 @@ def test_hints_from_every_mapping_row_survive(fake_e57, tmp_path):
     assert m.status == "conflict" and m.scan_id is None
     assert len(m.hints) == 2, m.hints
     assert all("differ only in case, braces or hyphens" in h for h in m.hints)
+
+
+def test_a_malformed_mapping_file_fails_closed(tmp_path):
+    """A decode traceback is not a sentence about the user's file."""
+    bad = tmp_path / "m.json"
+    bad.write_text("{not json at all")
+    with pytest.raises(ContractError, match="could not be read as JSON"):
+        read_mapping_file(bad)
+
+    binary = tmp_path / "m.csv"
+    binary.write_bytes(b"\xff\xfe\x00\x01\x02")
+    with pytest.raises(ContractError, match="could not be read as CSV"):
+        read_mapping_file(binary)
+
+    vendor = tmp_path / "v.json"
+    vendor.write_text("[[[")
+    with pytest.raises(ContractError, match="could not be read as JSON"):
+        read_vendor_manifest(vendor)
+
+
+def test_a_hardlink_cannot_smuggle_one_file_into_both_tiers(tmp_path, fake_e57):
+    body = json.dumps(
+        {
+            "vendor": "Acme",
+            "generated_by": "exporter",
+            "mappings": [{"image_id": "image_000", "scan_id": "scan_000"}],
+        }
+    )
+    original = tmp_path / "v.json"
+    original.write_text(body)
+    link = tmp_path / "also.json"
+    os.link(original, link)
+    path, _ = fake_e57(_scans(GUID_A), root=root_with_images(image_node()))
+    with pytest.raises(ContractError, match="both --mapping and --vendor-manifest"):
+        build_mapping_report(path, mapping=link, vendor_manifest=original, compute_hash=False)
+
+
+def test_a_self_contradicting_file_still_reports_the_e57s_own_account(fake_e57, tmp_path):
+    """A reader resolving the conflict needs both sides, not only the disqualified one."""
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\nscan_001,image_000\n")
+    rep = _report(
+        fake_e57,
+        _scans(GUID_A, GUID_B),
+        [image_node(associated_scan_guid=GUID_B)],
+        mapping=mapping,
+    )
+    m = rep.record_for("image_000")
+    assert m.status == "conflict" and m.scan_id is None
+    assert GUID_B in (m.evidence_value or ""), m.evidence_value
+    assert m.candidate_scan_ids == ["scan_000", "scan_001"]
+
+
+def test_a_row_matching_several_images_maps_none_and_tells_them_so(fake_e57, tmp_path):
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_name\nscan_000,pano\n")
+    rep = _report(
+        fake_e57,
+        _scans(GUID_A),
+        [image_node(name="pano"), image_node(name="pano")],
+        mapping=mapping,
+    )
+    assert [m.status for m in rep.mappings] == ["unmapped", "unmapped"]
+    for m in rep.mappings:
+        assert any("matches 2 images including this one" in h for h in m.hints), m.hints
+    assert rep.unresolved_references and rep.has_any_issue()
+
+
+def test_unresolved_records_are_reported_as_problems(fake_e57, tmp_path):
+    """A report where nothing could be mapped must not read as a clean bill of health."""
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\n")
+    rep = _report(
+        fake_e57, _scans(GUID_A), [image_node(associated_scan_guid=GUID_C)], mapping=mapping
+    )
+    assert [m.status for m in rep.mappings] == ["conflict"]
+    assert rep.has_any_issue()
+    assert any(i.startswith("image_000: conflict") for i in rep.issues), rep.issues
+    assert [m.image_id for m in rep.unresolved()] == ["image_000"]
+
+    clean = _report(fake_e57, _scans(GUID_A), [image_node(associated_scan_guid=GUID_A)])
+    assert clean.unresolved() == [] and not clean.has_any_issue()
 
 
 def test_report_never_claims_a_tls_global_frame(fake_e57):
