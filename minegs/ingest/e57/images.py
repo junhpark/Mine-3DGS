@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from minegs.core.errors import ContractError
 from minegs.core.provenance import sha256_file
 from minegs.ingest.e57 import _nodes
 from minegs.ingest.e57.exceptions import (
@@ -243,6 +244,17 @@ def _as_int(v: Any) -> int | None:
         return None
 
 
+def _hash_image(path: Path) -> str:
+    """Hash an external image, or refuse. Its bytes are an input to the mapping result."""
+    try:
+        return sha256_file(path)
+    except OSError as e:
+        raise ContractError(
+            f"could not hash the image {path}: {e}. Its bytes are an input to the result, so "
+            "the run stops rather than reporting a mapping it cannot account for."
+        ) from e
+
+
 def discover_external_images(
     directory: str | Path,
     suffixes: tuple[str, ...] = _EXTERNAL_SUFFIXES,
@@ -265,7 +277,9 @@ def discover_external_images(
         raise E57NotAFileError(d)
 
     files = sorted(
-        (p for p in d.iterdir() if p.is_file() and p.suffix.lower() in suffixes),
+        # Resolved: a provenance record whose paths only mean something from the directory the
+        # command happened to be run in is not a record of what was read.
+        (p.resolve() for p in d.iterdir() if p.is_file() and p.suffix.lower() in suffixes),
         key=lambda p: p.name,
     )
     assets: list[ImageAsset] = []
@@ -293,7 +307,7 @@ def discover_external_images(
                 width=width,
                 height=height,
                 path=str(p),
-                sha256=sha256_file(p) if compute_hash else None,
+                sha256=_hash_image(p) if compute_hash else None,
                 hash_skipped_reason=None if compute_hash else "requested with --no-hash",
                 issues=issues,
                 notes=notes,

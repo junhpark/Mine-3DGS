@@ -864,9 +864,9 @@ def test_hints_from_every_mapping_row_survive(fake_e57, tmp_path):
         fake_e57, _scans(GUID_A, GUID_B), [image_node(associated_scan_guid=None)], mapping=mapping
     )
     m = rep.record_for("image_000")
-    # neither GUID matches exactly, so both rows resolve to nothing: an orphan, with a
-    # near-miss hint from each row rather than only from the first
-    assert m.status == "orphan" and m.scan_id is None
+    # two rows naming two different scans that both resolve to nothing still contradict each
+    # other — and the near-miss hint from each row survives, not just the first
+    assert m.status == "conflict" and m.scan_id is None
     assert len(m.hints) == 2, m.hints
     assert all("differ only in case, braces or hyphens" in h for h in m.hints)
 

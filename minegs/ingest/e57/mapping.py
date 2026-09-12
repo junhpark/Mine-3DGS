@@ -51,6 +51,7 @@ from minegs.core.provenance import (
     sha256_file,
     tool_versions,
 )
+from minegs.ingest.e57.exceptions import E57FileNotFoundError, E57NotAFileError
 from minegs.ingest.e57.images import ImageAsset, discover_embedded_images, discover_external_images
 from minegs.ingest.e57.models import E57Inventory
 
@@ -203,8 +204,12 @@ class PanoMappingReport(VersionedModel):
     def resolved(self) -> list[MappingRecord]:
         return [m for m in self.mappings if m.is_resolved]
 
+    def unresolved(self) -> list[MappingRecord]:
+        """Records that name no scan and are not simply evidence-free."""
+        return [m for m in self.mappings if m.status in ("ambiguous", "orphan", "conflict")]
+
     def has_any_issue(self) -> bool:
-        return bool(self.issues) or bool(self.unresolved_references)
+        return bool(self.issues) or bool(self.unresolved_references) or bool(self.unresolved())
 
 
 def image_set_digest(images: list[ImageAsset]) -> str | None:
@@ -369,6 +374,52 @@ def read_vendor_manifest(path: str | Path) -> list[ExplicitEntry]:
     return [e.model_copy(update={"origin": f"{vendor}:{e.origin}"}) for e in entries]
 
 
+def _hash_input(path: Path, what: str) -> str:
+    """Hash an input, or refuse. A result we cannot account for is not a result."""
+    try:
+        return sha256_file(path)
+    except OSError as e:
+        raise ContractError(
+            f"could not hash the {what} {path}: {e}. Every input that changes the mapping has "
+            "to be nameable in the record, so the run stops rather than reporting a result it "
+            "cannot account for."
+        ) from e
+
+
+def check_mapping_inputs(
+    mapping: str | Path | None = None,
+    vendor_manifest: str | Path | None = None,
+    images_dir: str | Path | None = None,
+) -> None:
+    """Refuse unusable mapping inputs, reading nothing expensive.
+
+    Split out so a caller can pay for a typo in a ``--mapping`` path with a stat rather than
+    with a full pass over a 50 GB E57. Mapping files are small, so parsing them twice — once
+    here and once for real — costs nothing next to what it saves.
+    """
+    if (
+        mapping is not None
+        and vendor_manifest is not None
+        and Path(mapping).resolve() == Path(vendor_manifest).resolve()
+    ):
+        raise ContractError(
+            f"{Path(mapping).resolve()} was given as both --mapping and --vendor-manifest. "
+            "The two differ only in what they claim about who wrote the file, so one file "
+            "cannot be both; passing it twice would make it agree with itself and report the "
+            "result as confirmed."
+        )
+    if vendor_manifest is not None:
+        read_vendor_manifest(vendor_manifest)
+    if mapping is not None:
+        read_mapping_file(mapping)
+    if images_dir is not None:
+        d = Path(images_dir)
+        if not d.exists():
+            raise E57FileNotFoundError(d)
+        if not d.is_dir():
+            raise E57NotAFileError(d)
+
+
 # ---------------------------------------------------------------- the mapping itself
 
 
@@ -526,6 +577,14 @@ def map_images(
                 "for a multi-image station, but check it is what you meant"
             )
 
+    # A record that could not be resolved is a problem with the survey, not a detail of one
+    # image: without this a report where every image is in conflict has issues == [] and
+    # has_any_issue() answers False, which is exactly the clean bill of health it must not
+    # give. `unmapped` is a note instead — no evidence is a legitimate answer, not a defect.
+    for rec in records:
+        if rec.status in ("ambiguous", "orphan", "conflict"):
+            issues.append(f"{rec.image_id}: {rec.status} — {rec.reason}")
+
     counts: dict[str, int] = defaultdict(int)
     for rec in records:
         counts[rec.status] += 1
@@ -576,13 +635,16 @@ def _record_for(
             hints=hints,
         )
 
-    # Several rows may name the same image. If they disagree, that is a conflict in the
-    # mapping file itself and neither row wins.
-    targets = {tuple(sorted(scans)) for _entry, scans, _hint in rows}
+    # ---- the mapping file's own account, before it meets the file's
     entry, scans, _first_hint = rows[0]
     # Every row's hint, not just the first: a near-miss on row 7 is the one the user needs.
     hints += [h for _e, _s, h in rows if h]
-    if len(targets) > 1:
+    resolved = {tuple(sorted(s)) for _e, s, _h in rows}
+    declared = {(e.target.kind, e.target.value) for e, _s, _h in rows}
+    # Two rows that resolve to different scans contradict each other; so do two rows naming
+    # different things that both resolve to nothing, which would otherwise collapse into one
+    # empty tuple and read as a single tidy orphan.
+    if len(resolved) > 1 or (len(declared) > 1 and not next(iter(resolved))):
         return MappingRecord(
             image_id=image.image_id,
             status="conflict",
@@ -594,14 +656,58 @@ def _record_for(
             hints=hints,
         )
 
+    # ---- reconcile the two accounts
+    #
+    # Overlap means the mapping file agrees with the E57, or narrows an association the E57
+    # left ambiguous — both legitimate. No overlap at all, when either side named something,
+    # is a disagreement, and a disagreement is never resolved in favour of one side.
+    #
+    # That includes an association whose target is missing from this file. "The E57 says
+    # GUID_C" and "the user says scan_000" are two statements about the same image whether or
+    # not GUID_C is here; a missing target makes the file's statement unresolvable, not
+    # absent, and letting the mapping file win exactly where we understand that statement
+    # least is the silent override this module exists to prevent. An explicit override policy
+    # would be a declared flag, not a side effect of the target being missing.
+    declared_association = emb_value is not None
+    overlap = set(scans) & set(emb_scans)
+    if declared_association and (scans or emb_scans) and not overlap:
+        declares = (
+            f"associates it with {emb_scans}"
+            if emb_scans
+            else f"associates it with scan GUID {emb_value}, which is not in this file"
+        )
+        names = (
+            f"maps this image to {scans[0] if len(scans) == 1 else sorted(scans)}"
+            if scans
+            else f"maps this image to {entry.target}, which this survey does not contain"
+        )
+        return MappingRecord(
+            image_id=image.image_id,
+            status="conflict",
+            evidence_type=entry.evidence_type,
+            evidence_value=f"{entry.origin} -> {entry.target}; "
+            f"E57 associatedData3DGuid {emb_value} -> {emb_scans or 'no scan in this file'}",
+            reason=f"{entry.origin} {names}, but the E57 itself {declares}. A mapping file "
+            "does not silently overwrite the file's own evidence; resolve the disagreement "
+            "and re-run",
+            candidate_scan_ids=sorted(set(scans) | set(emb_scans)),
+            hints=hints,
+        )
+
     if not scans:
+        dead_end = (
+            f" The E57's own association names scan GUID {emb_value}, which is not in this "
+            "file either, so neither statement resolves."
+            if declared_association
+            else ""
+        )
         return MappingRecord(
             image_id=image.image_id,
             status="orphan",
             evidence_type=entry.evidence_type,
             evidence_value=str(entry.target),
             reason=f"{entry.origin} maps this image to {entry.target}, which this survey does "
-            "not contain",
+            f"not contain.{dead_end}",
             hints=hints,
         )
     if len(scans) > 1:
@@ -617,36 +723,22 @@ def _record_for(
         )
 
     scan_id = scans[0]
-    # The file's own association is machine evidence. A mapping file that contradicts it is a
-    # conflict, never an override: whichever is wrong, we do not know which (§13).
-    #
-    # ``orphan`` counts as a contradiction too. "The E57 says GUID_C" and "the user says
-    # scan_000" are different statements about the same image whether or not GUID_C happens to
-    # be in this file — a missing target makes the file's statement unresolvable, not absent.
-    # Treating it as absent would let a mapping file override the file's own evidence exactly
-    # when we understand that evidence least. An explicit override policy could exist one day;
-    # it would be a declared flag, not a side effect of the target being missing.
-    if emb_status in ("confirmed", "ambiguous", "orphan") and scan_id not in emb_scans:
-        declares = (
-            f"associates it with {emb_scans}"
-            if emb_scans
-            else f"associates it with scan GUID {emb_value}, which is not in this file"
-        )
-        return MappingRecord(
-            image_id=image.image_id,
-            status="conflict",
-            evidence_type=entry.evidence_type,
-            evidence_value=f"{entry.origin} -> {entry.target}; "
-            f"E57 associatedData3DGuid {emb_value} -> {emb_scans or 'no scan in this file'}",
-            reason=f"{entry.origin} maps this image to {scan_id}, but the E57 itself {declares}. "
-            "A mapping file does not silently overwrite the file's own evidence; resolve the "
-            "disagreement and re-run",
-            candidate_scan_ids=sorted({scan_id, *emb_scans}),
-            hints=hints,
-        )
-
     confirmed = entry.evidence_type == "vendor_manifest"
     agrees = emb_status == "confirmed" and scan_id in emb_scans
+    narrowed = emb_status == "ambiguous" and scan_id in emb_scans
+    if agrees:
+        reason = f"{entry.origin} and the E57's own associatedData3DGuid agree on {scan_id}"
+    elif narrowed:
+        reason = (
+            f"the E57 associates this image with {sorted(emb_scans)} without saying which, "
+            f"and {entry.origin} names {scan_id}, one of them"
+        )
+    else:
+        reason = f"{entry.origin} maps this image to {entry.target}" + (
+            " (a machine-generated vendor index)"
+            if confirmed
+            else " (user-provided; not machine-verifiable)"
+        )
     return MappingRecord(
         image_id=image.image_id,
         scan_id=scan_id,
@@ -654,16 +746,10 @@ def _record_for(
         status="confirmed" if (confirmed or agrees) else "manual",
         evidence_type="e57_associated_guid" if agrees else entry.evidence_type,
         evidence_value=emb_value if agrees else str(entry.target),
-        reason=(
-            f"{entry.origin} and the E57's own associatedData3DGuid agree on {scan_id}"
-            if agrees
-            else f"{entry.origin} maps this image to {entry.target}"
-            + (
-                " (a machine-generated vendor index)"
-                if confirmed
-                else " (user-provided; not machine-verifiable)"
-            )
-        ),
+        reason=reason,
+        # A narrowed association keeps the candidates it was narrowed from: the record has to
+        # show that the E57 did not, on its own, identify this scan.
+        candidate_scan_ids=sorted(emb_scans) if narrowed else [],
         hints=hints,
     )
 
@@ -698,22 +784,12 @@ def build_mapping_report(
     hashing = compute_hash or source_sha256 is not None
     skipped_reason = None if hashing else "requested with --no-hash"
 
+    check_mapping_inputs(mapping, vendor_manifest, images_dir)
+
     if images_dir is not None:
         images = discover_external_images(images_dir, compute_hash=hashing)
     else:
         images = discover_embedded_images(p)
-
-    if (
-        mapping is not None
-        and vendor_manifest is not None
-        and Path(mapping).resolve() == Path(vendor_manifest).resolve()
-    ):
-        raise ContractError(
-            f"{Path(mapping).resolve()} was given as both --mapping and --vendor-manifest. "
-            "The two differ only in what they claim about who wrote the file, so one file "
-            "cannot be both; passing it twice would make it agree with itself and report the "
-            "result as confirmed."
-        )
 
     # Vendor manifests first, so a report naming both files reads in evidence-tier order.
     entries: list[ExplicitEntry] = []
@@ -728,7 +804,7 @@ def build_mapping_report(
             MappingInput(
                 role=role,  # type: ignore[arg-type]
                 path=str(f.resolve()),
-                sha256=sha256_file(f) if hashing else None,
+                sha256=_hash_input(f, f"{role.replace('_', ' ')} file") if hashing else None,
                 hash_skipped_reason=skipped_reason,
                 size_bytes=f.stat().st_size,
                 row_count=len(rows),
