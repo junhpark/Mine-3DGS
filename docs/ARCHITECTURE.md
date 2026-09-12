@@ -272,8 +272,10 @@ Phase 0B 라면 E57 뿐 아니라 매핑 파일, vendor manifest, 외부 이미�
 매핑 CSV 로 돌리면 다른 결과이므로, E57 만 적힌 기록은 두 결과를 구분하지도 재현하지도
 못한다. 한 산출물 트리 안의 여러 artifact 는 **한 번 계산한 같은 digest** 를 공유한다:
 `scan_000`·`image_000` 은 특정 파일 안의 index 라서, 어느 바이트를 읽었는지 말할 수 없는
-artifact 는 자기 ID 가 무엇을 가리키는지도 말할 수 없다. hash 를 생략했다면 그 이유를 적는다 —
-빈 값과 "생략함" 은 다른 사실이다.
+artifact 는 자기 ID 가 무엇을 가리키는지도 말할 수 없다. hash 를 생략했다면 **artifact 가 그
+이유를 적는다** (`hash_skipped_reason`) — 값이 비어 있다는 것과 "왜 비었는지" 는 다른 사실이고,
+`SourceAsset` 자체에는 이유를 적을 자리가 없으므로 그 진술은 artifact 수준과 입력별 레코드
+(`MappingInput`·`ImageAsset`·`ImageOutput`) 에 남는다.
 
 ## 10. 청킹 · 중심선
 

@@ -536,6 +536,61 @@ def test_a_thousandth_scan_does_not_lock_its_own_directory(fake_e57, tmp_path):
     assert (out / "extraction_manifest.json").exists()
 
 
+def test_a_finished_but_unpublished_run_is_not_reclaimed(fake_e57, tmp_path):
+    """A publish failure tells the user where the finished run is; the next run must not eat it."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    stranded = tmp_path / ".out.minegs-partial"
+    (stranded / "scans").mkdir(parents=True)
+    (stranded / "scans" / "scan_000.ply").write_bytes(b"a whole run")
+    (stranded / "extraction_manifest.json").write_text("{}")
+    with pytest.raises(ContractError, match="complete run"):
+        extract(path, tmp_path / "out", compute_hash=False)
+    assert (stranded / "scans" / "scan_000.ply").exists()
+
+
+def test_publish_rollback_restores_the_previous_extraction(fake_e57, tmp_path, monkeypatch):
+    """If the final rename fails, the tree that was moved aside comes back."""
+
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    extract(path, out, compute_hash=False)
+    before = {p.name: p.read_bytes() for p in (out / "scans").iterdir()}
+
+    real_rename = Path.rename
+
+    def fail_on_publish(self, target):
+        # only the temp -> target move; the rollback that follows must be allowed to work
+        if self.name.endswith(".minegs-partial"):
+            raise OSError("no space left on device")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_on_publish)
+    with pytest.raises(ContractError) as err:
+        extract(path, out, overwrite=True, compute_hash=False)
+    monkeypatch.undo()
+
+    assert "back in place" in str(err.value)
+    assert "minegs-partial" in str(err.value), "the finished run must be findable"
+    assert {p.name: p.read_bytes() for p in (out / "scans").iterdir()} == before
+    assert not (tmp_path / ".out.minegs-previous").exists()
+
+
+def test_a_staging_setup_failure_stays_on_the_exit_code_contract(fake_e57, tmp_path, monkeypatch):
+    from minegs.core.errors import MinegsError
+
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    real_mkdir = Path.mkdir
+
+    def refuse(self, *a, **k):
+        if self.name == "scans":
+            raise PermissionError("read-only file system")
+        return real_mkdir(self, *a, **k)
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+    with pytest.raises(MinegsError, match="cannot create the staging directory"):
+        extract(path, tmp_path / "out", compute_hash=False)
+
+
 def test_a_symlinked_staging_path_is_refused_not_followed(fake_e57, tmp_path):
     """rmtree refuses a link anyway, with a bare OSError; following it would empty a directory
     somewhere else entirely."""

@@ -890,6 +890,70 @@ def test_a_malformed_mapping_file_fails_closed(tmp_path):
         read_vendor_manifest(vendor)
 
 
+def test_a_csv_error_is_not_a_value_error_and_still_fails_closed(tmp_path):
+    """csv.Error does not derive from ValueError, so it needs naming explicitly."""
+    import csv
+
+    p = tmp_path / "m.csv"
+    p.write_bytes(b"image_id,scan_id\n" + b"a" * (csv.field_size_limit() + 10) + b",scan_000\n")
+    with pytest.raises(ContractError, match="could not be read as CSV"):
+        read_mapping_file(p)
+
+
+def test_an_unhashable_input_stops_the_run(tmp_path, fake_e57, monkeypatch):
+    """A result we cannot account for is not a result."""
+    import minegs.ingest.e57.mapping as mapping_mod
+
+    mapping = tmp_path / "mapping.csv"
+    mapping.write_text("scan_id,image_id\nscan_000,image_000\n")
+    path, _ = fake_e57(_scans(GUID_A), root=root_with_images(image_node()))
+
+    def vanish(target, *a, **k):
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(mapping_mod, "sha256_file", vanish)
+    with pytest.raises(ContractError, match="could not hash the explicit mapping file"):
+        build_mapping_report(path, mapping=mapping, source_sha256="a" * 64)
+
+
+def test_an_unhashable_image_stops_the_run(tmp_path, fake_e57, monkeypatch):
+    import minegs.ingest.e57.images as images_mod
+
+    d = tmp_path / "images"
+    d.mkdir()
+    _write_png(d / "a.png")
+    path, _ = fake_e57(_scans(GUID_A))
+
+    def vanish(target, *a, **k):
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(images_mod, "sha256_file", vanish)
+    with pytest.raises(ContractError, match="could not hash the image"):
+        build_mapping_report(path, images_dir=d, compute_hash=False, source_sha256="a" * 64)
+
+
+def test_external_ids_follow_the_directory_entry_not_the_link_target(tmp_path, fake_e57):
+    """A symlink's ids and order must come from what the user sees in the directory.
+
+    Resolving through the link renames the image and can reorder every id after it, so a
+    mapping file naming image_001 would silently address a different picture.
+    """
+    d = tmp_path / "images"
+    d.mkdir()
+    elsewhere = tmp_path / "originals"
+    elsewhere.mkdir()
+    _write_png(elsewhere / "zzz_last.png", (16, 8))
+    _write_png(d / "b.png")
+    (d / "a.png").symlink_to(elsewhere / "zzz_last.png")
+
+    assets = discover_external_images(d)
+    assert [a.name for a in assets] == ["a.png", "b.png"]
+    assert [a.image_id for a in assets] == ["image_000", "image_001"]
+    assert assets[0].path == str(d.resolve() / "a.png"), "the entry, not the link target"
+    assert "zzz_last" not in assets[0].path
+    assert (assets[0].width, assets[0].height) == (16, 8), "the bytes still come from the target"
+
+
 def test_a_hardlink_cannot_smuggle_one_file_into_both_tiers(tmp_path, fake_e57):
     body = json.dumps(
         {

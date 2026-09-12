@@ -580,6 +580,14 @@ def _discard(path: Path, what: str) -> None:
         return
     if not path.is_dir():
         raise ContractError(f"{path} is {what}, but it is not a directory. Remove it and re-run.")
+    if (path / "extraction_manifest.json").is_file():
+        # A manifest means the run finished; only publishing it failed. Reclaiming the name
+        # would delete the very tree the failure told the user to go and look at.
+        raise ContractError(
+            f"{path} is {what}, but it holds a complete run (it has an extraction_manifest"
+            ".json) — a publish that failed leaves one here. Move it somewhere safe, or "
+            "delete it once you are done with it, then re-run."
+        )
     foreign = foreign_entries(path)
     if foreign:
         raise ContractError(
@@ -697,7 +705,16 @@ def _publish(tmp: Path, work_dir: Path, overwrite: bool) -> None:
     try:
         tmp.rename(work_dir)
     except OSError as e:
-        previous.rename(work_dir)
+        try:
+            previous.rename(work_dir)
+        except OSError as restore:
+            # Both moves failed. Nothing is lost — the previous tree is intact under its
+            # backup name — but it is somewhere the user would not think to look, so say so.
+            # The next run restores it before doing anything else.
+            raise ContractError(
+                f"{e}, and restoring the previous contents also failed ({restore}). They are "
+                f"intact at {previous} and the next run will put them back."
+            ) from e
         raise ContractError(f"{e}. The previous contents are back in place.") from e
     # The run is published; failing it now over a leftover backup would be a lie about what
     # happened. The next run's target check finds and removes it.

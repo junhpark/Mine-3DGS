@@ -276,10 +276,12 @@ def discover_external_images(
     if not d.is_dir():
         raise E57NotAFileError(d)
 
+    # Sorted and named by the DIRECTORY ENTRY, not by what a symlink points at: the entry is
+    # what the user sees and what a mapping file names, and resolving through a link would
+    # silently reorder the ids and rename the images.
+    root = d.resolve()
     files = sorted(
-        # Resolved: a provenance record whose paths only mean something from the directory the
-        # command happened to be run in is not a record of what was read.
-        (p.resolve() for p in d.iterdir() if p.is_file() and p.suffix.lower() in suffixes),
+        (p for p in d.iterdir() if p.is_file() and p.suffix.lower() in suffixes),
         key=lambda p: p.name,
     )
     assets: list[ImageAsset] = []
@@ -306,7 +308,9 @@ def discover_external_images(
                 representation="unknown",
                 width=width,
                 height=height,
-                path=str(p),
+                # The entry's own path under the resolved directory: absolute, so provenance
+                # means something from anywhere, without following a link somewhere else.
+                path=str(root / p.name),
                 sha256=_hash_image(p) if compute_hash else None,
                 hash_skipped_reason=None if compute_hash else "requested with --no-hash",
                 issues=issues,

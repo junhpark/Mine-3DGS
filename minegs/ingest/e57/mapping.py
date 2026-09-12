@@ -249,7 +249,9 @@ def _load_json(path: Path) -> Any:
 def _rows_from_csv(path: Path) -> list[dict[str, str]]:
     try:
         return _csv_rows(path)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, csv.Error) as e:
+        # csv.Error is not a ValueError — a field over the module's size limit raises it, and
+        # it would otherwise reach the CLI as a traceback instead of a sentence.
         raise ContractError(f"{path}: could not be read as CSV ({e})") from e
 
 
