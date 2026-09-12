@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from minegs.core.errors import ContractError
 from minegs.core.frames import Sim3
@@ -30,6 +30,8 @@ class BackendCapabilities:
     mcmc_strategy: bool = False
     pose_refinement: bool = False
     depth_render: bool = False  # can export depth maps (needed for GS -> surface, §1.7)
+    # Can *continue training* from a checkpoint. Loading weights for evaluation is not resume:
+    # a run that starts its schedule at iteration 0 is a different experiment (§0D.1).
     resume: bool = False
 
     def has(self, name: str) -> bool:
@@ -71,10 +73,17 @@ class TrainBackend(ABC):
         dataset_dir: Path,
         out_dir: Path,
         profile: Profile,
-        resume: bool = False,
+        resume_checkpoint: PurePath | None = None,
         **kwargs: object,
     ) -> TrainCommand:
-        """``dataset_dir`` is the *staged* dataset written by ``minegs.train.staging``."""
+        """``dataset_dir`` is the *staged* dataset written by ``minegs.train.staging``.
+
+        ``resume_checkpoint`` is an already-resolved path **in the namespace this command will
+        run in** (a container path under docker, a host path under ``--native``). An adapter
+        must not look it up on the host filesystem: discovery belongs to the runner, which is
+        the only layer that knows both namespaces (§20, §21, ``minegs.train.runner.resume``).
+        Adapters that declare ``resume=False`` must refuse a non-None value rather than drop it.
+        """
 
     @abstractmethod
     def normalize_outputs(

@@ -25,6 +25,18 @@ Phase 0A/0D refuses two requests outright rather than supporting them partially:
   tracks, and TLS-initialised staging replaces ``points3D`` with ``init_points.ply`` and
   clears those tracks (``minegs.train.staging``). Depth supervision is redesigned in Phase 4.
 
+A third refusal is forced by the pinned trainer itself: **v1.5.3 cannot resume training.**
+``Config.ckpt`` is documented upstream as *"Path to the .pt files. If provide, it will skip
+training and run evaluation only."*, and ``main()`` branches on it — ``if cfg.ckpt is not
+None:`` runs ``eval``/``render_traj`` and returns, ``else:`` runs ``train()``. ``train()``
+sets ``init_step = 0`` unconditionally and never loads a checkpoint, and the saved ``.pt``
+holds only ``{"step", "splats"}`` (plus pose/appearance modules) — no optimizer moments and
+no densification-strategy state. So there is no combination of upstream flags that continues
+a run: passing ``--ckpt`` alongside training arguments produces an *evaluation* pass on the
+parent's weights, which is neither the requested experiment nor a visible failure. This
+adapter therefore declares ``resume=False`` and refuses ``--resume-from`` up front. See
+docs/ROADMAP.md §Phase 0D for the decision this leaves open.
+
 ``T_local_from_internal`` is therefore identity on every command this adapter builds, and
 ``run.json`` records it explicitly.
 """
@@ -33,7 +45,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import numpy as np
 
@@ -60,6 +72,16 @@ DEPTH_LOSS_REFUSAL = (
     "init_points.ply as points3D and clears image point3D_ids). This capability is deferred "
     "to Phase 4 (docs/ROADMAP.md); set requests.depth_loss: false to run this profile."
 )
+RESUME_REFUSAL = (
+    f"gsplat v{PINNED_GSPLAT}'s examples/simple_trainer.py cannot continue training from a "
+    "checkpoint: --ckpt is documented as 'If provide, it will skip training and run evaluation "
+    "only', main() runs eval instead of train() whenever it is set, train() starts at "
+    "init_step = 0 unconditionally, and the saved .pt carries only step and splats (no "
+    "optimizer or densification-strategy state). Passing --ckpt to a training run would "
+    "silently produce an evaluation pass on the parent's weights rather than a continuation, "
+    "so this adapter refuses resume instead of appearing to support it. Resuming needs a "
+    "resume-capable trainer entry point (open decision, docs/ROADMAP.md §Phase 0D)."
+)
 
 
 def locate_trainer(require: bool = True) -> Path | None:
@@ -77,8 +99,14 @@ def locate_trainer(require: bool = True) -> Path | None:
 
 
 # Options whose *enabled* form must never appear in an assembled command, whatever route
-# (capability request, raw backend_args, future edit) tried to put it there.
-REFUSED_FLAGS = {"depth_loss": DEPTH_LOSS_REFUSAL, "normalize_world_space": NORMALIZE_REFUSAL}
+# (capability request, raw backend_args, future edit) tried to put it there. ``ckpt`` is here
+# because a backend_args entry would otherwise be forwarded verbatim by the passthrough loop
+# and turn the run into an evaluation pass (see RESUME_REFUSAL) with no error anywhere.
+REFUSED_FLAGS = {
+    "depth_loss": DEPTH_LOSS_REFUSAL,
+    "normalize_world_space": NORMALIZE_REFUSAL,
+    "ckpt": RESUME_REFUSAL,
+}
 
 
 def _assert_no_refused_flags(argv: list[str]) -> None:
@@ -95,7 +123,7 @@ def _assert_no_refused_flags(argv: list[str]) -> None:
 
 class GsplatBackend(TrainBackend):
     name = "gsplat"
-    capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL}
+    capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL, "resume": RESUME_REFUSAL}
 
     def __init__(self, trainer: Path | None = None) -> None:
         self._trainer = trainer
@@ -121,7 +149,8 @@ class GsplatBackend(TrainBackend):
             mcmc_strategy=True,
             pose_refinement=True,
             depth_render=True,
-            resume=True,
+            # v1.5.3 has no resume path at all; see RESUME_REFUSAL and the module docstring.
+            resume=False,
         )
 
     def build_command(
@@ -129,11 +158,15 @@ class GsplatBackend(TrainBackend):
         dataset_dir: Path,
         out_dir: Path,
         profile: Profile,
-        resume: bool = False,
+        resume_checkpoint: PurePath | None = None,
         trainer: Path | None = None,
         check_trainer: bool = True,
     ) -> TrainCommand:
         """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
+        if resume_checkpoint is not None:
+            # Unreachable through the runner (resolve_resume checks capabilities first), kept so
+            # a direct caller gets the contract instead of an eval-only command.
+            raise ContractError(RESUME_REFUSAL)
         enabled = self.resolve_requests(profile)
         # tyro (gsplat's CLI parser) accepts --depth-loss and --depth_loss alike, so a hyphen
         # spelling in backend_args would otherwise slip past the refusals below and be forwarded
@@ -195,14 +228,6 @@ class GsplatBackend(TrainBackend):
                 argv += [f"--{k}", *[str(x) for x in v]]
             else:
                 argv += [f"--{k}", str(v)]
-        if resume:
-            ck = (
-                sorted((out_dir / "ckpts").glob("ckpt_*.pt"))
-                if (out_dir / "ckpts").exists()
-                else []
-            )
-            if ck:
-                argv += ["--ckpt", str(ck[-1])]
         _assert_no_refused_flags(argv)
         # identity by construction: normalisation is refused above (BACKEND_INTERNAL == LOCAL_METRIC)
         return TrainCommand(
