@@ -34,8 +34,9 @@ holds only ``{"step", "splats"}`` (plus pose/appearance modules) — no optimize
 no densification-strategy state. So there is no combination of upstream flags that continues
 a run: passing ``--ckpt`` alongside training arguments produces an *evaluation* pass on the
 parent's weights, which is neither the requested experiment nor a visible failure. This
-adapter therefore declares ``resume=False`` and refuses ``--resume-from`` up front. See
-docs/ROADMAP.md §Phase 0D for the decision this leaves open.
+adapter therefore declares ``resume=False``, and ``--resume-from`` is refused before a command
+is built. Resuming would need a trainer and checkpoint that restore the whole training state
+(Phase 0D.3, docs/ROADMAP.md); Phase 0D.2 runs its baseline uninterrupted instead.
 
 ``T_local_from_internal`` is therefore identity on every command this adapter builds, and
 ``run.json`` records it explicitly.
@@ -45,7 +46,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from pathlib import Path, PurePath
+from pathlib import Path
 
 import numpy as np
 
@@ -79,8 +80,9 @@ RESUME_REFUSAL = (
     "init_step = 0 unconditionally, and the saved .pt carries only step and splats (no "
     "optimizer or densification-strategy state). Passing --ckpt to a training run would "
     "silently produce an evaluation pass on the parent's weights rather than a continuation, "
-    "so this adapter refuses resume instead of appearing to support it. Resuming needs a "
-    "resume-capable trainer entry point (open decision, docs/ROADMAP.md §Phase 0D)."
+    "so this adapter refuses resume instead of appearing to support it. Resuming would need a "
+    "trainer and checkpoint that restore the whole training state — optimizer, schedulers, "
+    "strategy state, step, RNG (Phase 0D.3, docs/ROADMAP.md)."
 )
 
 
@@ -158,15 +160,10 @@ class GsplatBackend(TrainBackend):
         dataset_dir: Path,
         out_dir: Path,
         profile: Profile,
-        resume_checkpoint: PurePath | None = None,
         trainer: Path | None = None,
         check_trainer: bool = True,
     ) -> TrainCommand:
         """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
-        if resume_checkpoint is not None:
-            # Unreachable through the runner (resolve_resume checks capabilities first), kept so
-            # a direct caller gets the contract instead of an eval-only command.
-            raise ContractError(RESUME_REFUSAL)
         enabled = self.resolve_requests(profile)
         # tyro (gsplat's CLI parser) accepts --depth-loss and --depth_loss alike, so a hyphen
         # spelling in backend_args would otherwise slip past the refusals below and be forwarded

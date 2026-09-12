@@ -37,8 +37,10 @@ jobs:
           minegs dataset synthetic /tmp/syn --length-m 60 --n-stations 4
           minegs dataset validate /tmp/syn/dataset
           minegs eval protocol /tmp/syn/dataset
-          # Phase 0D.1 resume contract. A resume that quietly becomes fresh training produces a
-          # plausible run and a plausible PLY, so the smoke checks the refusals, not a success.
+          # Phase 0D.1 resume safety contract. A resume that quietly becomes fresh training
+          # produces a plausible run and a plausible PLY; --ckpt on a training run produces an
+          # eval-only pass that also reports success. Both are silent, so the smoke checks the
+          # refusals — there is no resume success to check for.
           minegs train run --help | tr -d '\n' | grep -q -- '--resume-from'
           if minegs train command /tmp/syn/dataset --profile light | grep -q -- '--ckpt'; then
             echo "a fresh command carries --ckpt"; exit 1

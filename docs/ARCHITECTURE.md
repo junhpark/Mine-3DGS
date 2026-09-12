@@ -244,14 +244,13 @@ RunHandle.status() / .logs() / .fetch_artifacts()
 * `LocalRunner` — `docker run --gpus all minegs:gpu@sha256:...`. CUDA 없으면 거부하고
   RunPod 저가 GPU 라우팅 제안.
 * `RunPodRunner` — 파드 생성(네트워크 볼륨) → `sync.push`(dataset 만) → 엔트리 →
-  폴링 → `sync.pull`(ply·로그) → 종료. 체크포인트는 볼륨에, `--resume-from`.
+  폴링 → `sync.pull`(ply·로그) → 종료.
 * 두 러너의 GPU 이미지 digest 는 동일. run.json 에 기록.
-* **Resume 은 러너의 책임이다** (`minegs/train/runner/resume.py`). Checkpoint 탐색·검증은
-  host 경로로만 하고, 실행 argv 에는 namespace 변환된 경로만 넣는다 (docker: parent 의
-  checkpoint 디렉토리를 `/data/resume` 에 `:ro` mount). 백엔드는 이미 결정된 경로를 받아
-  `--ckpt` 만 붙인다 — 두 계층이 동시에 경로를 해석하면 Phase 0D entry blocker 가 재발한다.
-  Resume 은 parent 를 수정하지 않고 child run 을 만들며, `run.json` 의 `resume` 블록이
-  lineage 를 기록한다. 요청한 resume 을 지킬 수 없으면 `Popen` 이전에 실패한다.
+* **Training resume 은 구현되어 있지 않다.** `--resume-from` 은 명시적 옵션으로 존재하지만
+  `Runner.prepare` 에서 항상 거부되며, 이는 trainer 실행 이전이자 run directory 생성 이전이다.
+  gsplat v1.5.3 은 학습을 이어붙일 수 없고 (`--ckpt` = evaluation only), 진짜 resume 은 완전한
+  training state 를 복원하는 checkpoint contract 를 요구한다 — Phase 0D.3, ROADMAP 참조.
+  재시작은 "조금 느린 resume" 이 아니라 다른 실험이므로 fail closed 한다.
 
 ### 8.3 프로파일
 | | light | heavy |

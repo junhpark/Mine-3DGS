@@ -4,7 +4,7 @@ image: "ghcr.io/junhpark/minegs:gpu@sha256:0000000000000000000000000000000000000
 data_root: ./data
 # API key 는 RUNPOD_API_KEY 환경변수 (파일에 쓰지 않는다)
 gpu_types: ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA RTX 4000 Ada"]
-network_volume_id: null        # 체크포인트는 볼륨에, --resume-from
+network_volume_id: null        # 체크포인트는 볼륨에 (resume 은 Phase 0D.3, 미구현)
 volume_mount: /data
 container_disk_gb: 40
 sync:

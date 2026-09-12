@@ -24,7 +24,6 @@ from minegs.core.manifest import Manifest
 from minegs.core.provenance import ProvenanceRecord, make_id, sha256_tree, stamp
 from minegs.train.backends import get_backend
 from minegs.train.profiles import Profile, load_profile
-from minegs.train.runner.resume import ResumeInfo, ResumeTarget, resolve_resume
 
 # Everything the trainer can see (§9): manifest, sparse model, init points, images, masks,
 # centerline. A changed image changes the hash. raw/ is not part of the dataset.
@@ -74,9 +73,10 @@ class RunConfig(VersionedModel):
     profile: str = "light"
     backend: str = "gsplat"
     runner: str = "local"
-    # Explicit resume target: the run directory to continue from. A boolean --resume could not
-    # say *which* run it meant (run ids are minted per submission), and a resume whose target is
-    # ambiguous is one that can silently become a fresh run (§0D.1).
+    # The run directory to continue from. Explicit because a boolean could not say *which* run
+    # it meant — run ids are minted per submission — and an ambiguous target is one that can
+    # quietly become a fresh run. No shipped backend can resume training, so setting this always
+    # fails closed today; see ``Runner.prepare`` and docs/ROADMAP.md §Phase 0D.
     resume_from: str | None = None
     chunk_id: str | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
@@ -101,8 +101,6 @@ class RunRecord(VersionedModel):
     T_tls_from_local: list[list[float]] | None = None
     frame_of_outputs: str = "LOCAL_METRIC"
     outputs: list[str] = Field(default_factory=list)
-    # None on a fresh run. Resume lineage is recorded here, never inferred from ``command``.
-    resume: ResumeInfo | None = None
     provenance: ProvenanceRecord
 
 
@@ -168,47 +166,56 @@ class Runner(ABC):
                 from minegs.core.frames import SE3
 
                 T_tls_from_local = SE3.from_matrix(chunk.T_tls_from_local)
-        dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
-        profile_dump = profile.model_dump(mode="json")
-        # Resume preflight runs *before* the run directory is created, so a refused resume
-        # leaves nothing behind to be mistaken for a started run (§28). The remaining check
-        # (the staged dataset's hash) needs staging and happens in the runner, still ahead of
-        # any subprocess.
-        target: ResumeTarget | None = None
         if run.resume_from:
-            target = resolve_resume(
-                run.resume_from,
-                backend=backend,
-                dataset_hash=dataset_hash,
-                chunk_id=run.chunk_id,
-                profile_dump=profile_dump,
-            )
+            refuse_resume(backend)
         run_dir.mkdir(parents=True, exist_ok=True)
-        parents = [manifest.dataset_id]
-        assets = []
-        if target is not None:
-            # The parent run is a lineage parent and its checkpoint is a result-changing input,
-            # so both belong in provenance and not only in the resume block (§9).
-            parents.append(target.parent_run_id)
-            assets.append(target.source_asset())
         record = RunRecord(
             run_id=run.run_id,
             dataset_id=manifest.dataset_id,
-            dataset_hash=dataset_hash,
+            dataset_hash=sha256_tree(dataset_dir, DATASET_HASH_PATTERNS),
             chunk_id=run.chunk_id,
             backend={"name": backend.name, "version": backend.version()},
-            profile=profile_dump,
+            profile=profile.model_dump(mode="json"),
             runner=self.name,
             docker_digest=self.config.image_digest(),
             T_tls_from_local=T_tls_from_local.to_list(),
-            resume=target.info() if target is not None else None,
-            provenance=stamp(run.model_dump(mode="json"), parents=parents, assets=assets),
+            provenance=stamp(run.model_dump(mode="json"), parents=[manifest.dataset_id]),
         )
         return run, manifest, profile, record
 
     @staticmethod
     def write_record(record: RunRecord, run_dir: Path) -> Path:
         return record.save(run_dir / "run.json")
+
+
+def refuse_resume(backend: Any) -> None:
+    """``--resume-from`` always fails closed today, before the run directory exists.
+
+    A restart from iteration 0 is not a slow resume, it is a different experiment recorded
+    under a run id that claims to continue another one — so the only safe answer to a resume
+    request no backend can honour is a refusal, never a fresh run.
+
+    Two refusals, in order. The first is the one users hit: no shipped backend continues
+    training, and gsplat v1.5.3 in particular turns ``--ckpt`` into an evaluation pass (see
+    ``minegs.train.backends.gsplat``), so the adapter declares ``resume=False`` and this raises
+    with that reason. The second covers a backend that *does* declare the capability: resuming
+    needs a checkpoint contract that restores the whole training state — optimizer, schedulers,
+    strategy state, step, RNG — and Mine-3DGS does not own one yet. Deliberately not a partial
+    implementation: a resume that silently drops optimizer state is a different experiment too.
+    """
+    from minegs.core.errors import NotYetImplementedError
+
+    if not backend.capabilities().has("resume"):
+        note = backend.capability_notes.get("resume", "")
+        raise ContractError(
+            f"backend {backend.name} does not support resuming training, so --resume-from "
+            f"cannot be honoured. {note}".strip()
+        )
+    raise NotYetImplementedError(
+        f"resuming a run (--resume-from) with backend {backend.name}: checkpoint discovery, "
+        "host/container path translation and parent-run compatibility are not implemented",
+        "0D.3",
+    )
 
 
 def load_record(run_dir: str | Path) -> RunRecord:

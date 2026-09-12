@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from pathlib import Path, PurePath
+from pathlib import Path
 
 from minegs.core.errors import ContractError
 from minegs.core.frames import Sim3
@@ -73,16 +73,15 @@ class TrainBackend(ABC):
         dataset_dir: Path,
         out_dir: Path,
         profile: Profile,
-        resume_checkpoint: PurePath | None = None,
         **kwargs: object,
     ) -> TrainCommand:
         """``dataset_dir`` is the *staged* dataset written by ``minegs.train.staging``.
 
-        ``resume_checkpoint`` is an already-resolved path **in the namespace this command will
-        run in** (a container path under docker, a host path under ``--native``). An adapter
-        must not look it up on the host filesystem: discovery belongs to the runner, which is
-        the only layer that knows both namespaces (§20, §21, ``minegs.train.runner.resume``).
-        Adapters that declare ``resume=False`` must refuse a non-None value rather than drop it.
+        There is no resume parameter. No shipped backend can continue training, and the shape a
+        resume argument should take is part of the checkpoint contract that does not exist yet
+        (docs/ROADMAP.md §Phase 0D) — freezing one now around gsplat's ``--ckpt`` would fix the
+        interface to a backend that cannot honour it. ``--resume-from`` is refused in
+        ``Runner.prepare`` instead, before a command is built.
         """
 
     @abstractmethod
