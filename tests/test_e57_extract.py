@@ -8,14 +8,20 @@ colour shifted onto the wrong point. Several tests below construct exactly that 
 
 from __future__ import annotations
 
+import contextlib
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 from minegs.core.errors import ContractError
 from minegs.core.pointcloud import read_ply
-from minegs.ingest.e57.exceptions import E57PoseUnusableError, E57ReadScanError
+from minegs.ingest.e57.exceptions import (
+    E57FileNotFoundError,
+    E57PoseUnusableError,
+    E57ReadScanError,
+)
 from minegs.ingest.e57.extract import (
     E57ExtractionManifest,
     apply_invalid_state,
@@ -470,6 +476,99 @@ def test_an_occupied_target_is_refused_before_the_source_is_read(fake_e57, tmp_p
         extract(path, out)
 
 
+def test_a_bad_mapping_path_is_refused_before_the_source_is_read(fake_e57, tmp_path, monkeypatch):
+    """A typo costs a stat, not a pass over a 50 GB scan."""
+    import minegs.ingest.e57.extract as extract_mod
+
+    def forbidden(*a, **k):
+        raise AssertionError("a refused run must not first hash the source")
+
+    monkeypatch.setattr(extract_mod, "sha256_file", forbidden)
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    with pytest.raises(ContractError, match="mapping file not found"):
+        extract(path, tmp_path / "out", mapping=tmp_path / "typo.csv")
+    both = tmp_path / "v.json"
+    both.write_text(
+        json.dumps(
+            {
+                "vendor": "A",
+                "generated_by": "e",
+                "mappings": [{"image_id": "image_000", "scan_id": "scan_000"}],
+            }
+        )
+    )
+    with pytest.raises(ContractError, match="both --mapping and --vendor-manifest"):
+        extract(path, tmp_path / "out", mapping=both, vendor_manifest=both)
+    with pytest.raises(E57FileNotFoundError):
+        extract(path, tmp_path / "out", images_dir=tmp_path / "nope")
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_symlinked_target_is_refused(fake_e57, tmp_path):
+    """Publish renames the target aside, which would replace the link, not what it points at."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "out"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ContractError, match="symlink"):
+        extract(path, link, compute_hash=False)
+    assert link.is_symlink() and link.resolve() == real.resolve()
+
+
+def test_a_symlink_is_never_treated_as_our_own_output(fake_e57, tmp_path):
+    """This extractor writes real files; a link wearing one of our names is someone else's."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    (out / "scans").mkdir(parents=True)
+    elsewhere = tmp_path / "precious.ply"
+    elsewhere.write_bytes(b"someone's cloud")
+    (out / "scans" / "scan_000.ply").symlink_to(elsewhere)
+    with pytest.raises(ContractError, match="did not write"):
+        extract(path, out, overwrite=True, compute_hash=False)
+    assert elsewhere.exists() and (out / "scans" / "scan_000.ply").is_symlink()
+
+
+def test_two_runs_cannot_stage_into_one_target_at_once(fake_e57, tmp_path):
+    """They would share one temporary tree and publish a mix of both."""
+    from minegs.ingest.e57.extract import staging_dir
+
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    with staging_dir(out, False) as (first, _notes):
+        assert first.exists()
+        with pytest.raises(ContractError, match="already staging into"):
+            extract(path, out, compute_hash=False)
+    assert not any(p.name.endswith(".minegs-lock") for p in tmp_path.iterdir()), "lock released"
+
+
+def test_a_file_that_appears_mid_run_is_not_swept_into_the_backup(fake_e57, tmp_path):
+    """Extraction can take hours; the target is checked again right before it is moved aside."""
+    from minegs.ingest.e57.extract import _publish
+
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    extract(path, out, compute_hash=False)
+    with staging_helper(out) as staged:
+        (out / "field_notes.md").write_text("appeared while the run was in flight")
+        with pytest.raises(ContractError, match="did not write"):
+            _publish(staged, out, True)
+    assert (out / "field_notes.md").exists()
+    assert (out / "extraction_manifest.json").exists()
+
+
+@contextlib.contextmanager
+def staging_helper(work_dir):
+    """A finished-looking temporary tree beside ``work_dir``, without running an extraction."""
+    tmp = work_dir.parent / f".{work_dir.name}.minegs-partial"
+    (tmp / "scans").mkdir(parents=True)
+    (tmp / "extraction_manifest.json").write_text("{}")
+    try:
+        yield tmp
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_a_root_file_this_extractor_did_not_write_is_never_clobbered(fake_e57, tmp_path):
     path, _ = fake_e57([_scan(data=cartesian_data(3))])
     out = tmp_path / "out"
@@ -591,18 +690,6 @@ def test_recorded_paths_point_at_the_published_tree_not_the_temporary_one(fake_e
         assert Path(recorded).is_file(), "a recorded path must exist once the run is published"
     reloaded = E57ExtractionManifest.load(out / "extraction_manifest.json")
     assert Path(reloaded.scan_outputs[0].path).is_file()
-
-
-def test_a_symlinked_target_is_refused(fake_e57, tmp_path):
-    """Publish renames the target aside, which would replace the link, not what it points at."""
-    path, _ = fake_e57([_scan(data=cartesian_data(3))])
-    real = tmp_path / "real"
-    real.mkdir()
-    link = tmp_path / "out"
-    link.symlink_to(real, target_is_directory=True)
-    with pytest.raises(ContractError, match="symlink"):
-        extract(path, link, compute_hash=False)
-    assert link.is_symlink() and link.resolve() == real.resolve()
 
 
 def test_an_external_image_output_says_why_it_has_no_hash(fake_e57, tmp_path):
