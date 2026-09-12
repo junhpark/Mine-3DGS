@@ -37,11 +37,17 @@ jobs:
           minegs dataset synthetic /tmp/syn --length-m 60 --n-stations 4
           minegs dataset validate /tmp/syn/dataset
           minegs eval protocol /tmp/syn/dataset
-          # E57 inventory against a real (tiny) E57 written here, not a committed fixture
+          # The whole Phase 0B path against a real (tiny) E57 written here, not a committed
+          # fixture: invalid points sit in the middle of the record array so a smoke run
+          # catches a colour/coordinate misalignment, which is invisible in the output itself.
           python -c "
           import numpy as np, pye57
           f = pye57.E57('/tmp/smoke.e57', mode='w')
-          f.write_scan_raw({'cartesianX': np.zeros(4), 'cartesianY': np.zeros(4), 'cartesianZ': np.zeros(4)}, name='Smoke', translation=np.array([1.0, 2.0, 3.0]))
+          f.write_scan_raw({
+              'cartesianX': np.arange(6, dtype=float), 'cartesianY': np.zeros(6), 'cartesianZ': np.zeros(6),
+              'colorRed': np.arange(6, dtype=float), 'colorGreen': np.zeros(6), 'colorBlue': np.zeros(6),
+              'cartesianInvalidState': np.array([0, 1, 0, 2, 0, 0], dtype=np.int32),
+          }, name='Smoke', translation=np.array([1.0, 2.0, 3.0]))
           f.close()"
           minegs ingest e57 inventory /tmp/smoke.e57 --json /tmp/inventory.json
           python -c "
@@ -51,6 +57,60 @@ jobs:
           assert d['station_candidates'][0]['mapping_status'] == 'inferred_from_scan'
           assert d['scans'][0]['pose']['source_frame'] == 'SOURCE'
           print('e57 inventory smoke ok')"
+          minegs ingest e57 pano-map /tmp/smoke.e57 --json /tmp/pano_mapping.json
+          python -c "
+          import json; d = json.load(open('/tmp/pano_mapping.json'))
+          assert d['images'] == [] and d['mappings'] == [], d
+          assert 'TLS_GLOBAL' not in json.dumps(d)
+          print('e57 pano-map smoke ok')"
+          # A mapping file is an input that changes the result, so it has to be in provenance.
+          printf 'scan_id,image_id\nscan_000,image_000\n' > /tmp/map.csv
+          minegs ingest e57 pano-map /tmp/smoke.e57 --mapping /tmp/map.csv --json /tmp/mapped.json
+          python -c "
+          import hashlib, json
+          d = json.load(open('/tmp/mapped.json'))
+          want = hashlib.sha256(open('/tmp/map.csv','rb').read()).hexdigest()
+          assert [i['role'] for i in d['mapping_inputs']] == ['explicit_mapping'], d
+          assert d['mapping_inputs'][0]['sha256'] == want
+          assert want in [a['sha256'] for a in d['provenance']['source_assets']]
+          print('mapping provenance smoke ok')"
+          minegs ingest e57 extract /tmp/smoke.e57 /tmp/e57_staging
+          python -c "
+          import json, pathlib
+          from minegs.core.pointcloud import read_ply
+          m = json.load(open('/tmp/e57_staging/extraction_manifest.json'))
+          s = m['scan_outputs'][0]
+          assert m['registration'] == 'registered' and m['output_frame'] == 'SOURCE', m
+          assert 'TLS_GLOBAL' not in json.dumps(m) and 'LOCAL_METRIC' not in json.dumps(m)
+          assert s['invalid_points_removed'] == 2 and s['point_count_output'] == 4, s
+          assert s['sha256'] and m['source_sha256']
+          pc = read_ply(s['path'])
+          assert pc.frame == 'SOURCE'
+          assert pc.xyz[:, 0].tolist() == [1.0, 3.0, 5.0, 6.0], pc.xyz
+          assert pc.rgb[:, 0].tolist() == [0, 2, 4, 5], 'colour must follow the surviving points'
+          root = pathlib.Path('/tmp/e57_staging')
+          assert not (root / 'manifest.json').exists(), 'staging must not look like dataset/'
+          # one digest, shared: an artifact that cannot name the bytes it read cannot say
+          # what its own scan_000 refers to
+          inv = json.load(open(root / 'inventory.json'))
+          rep = json.load(open(root / 'pano_mapping.json'))
+          assert inv['file']['sha256'] == rep['source_sha256'] == m['source_sha256'], 'digests differ'
+          assert inv['file']['hash_skipped_reason'] is None
+          print('e57 extract smoke ok')"
+          # a second run must refuse rather than mix, and must not touch what it did not write
+          echo 'field notes' > /tmp/e57_staging/notes.md
+          if minegs ingest e57 extract /tmp/smoke.e57 /tmp/e57_staging --overwrite; then
+            echo "extract overwrote a directory holding a foreign file"; exit 1
+          fi
+          test -f /tmp/e57_staging/notes.md
+          rm /tmp/e57_staging/notes.md
+          if minegs ingest e57 extract /tmp/smoke.e57 /tmp/e57_staging; then
+            echo "extract mixed two runs in one directory"; exit 1
+          fi
+          minegs ingest e57 extract /tmp/smoke.e57 /tmp/e57_staging --overwrite
+          test -z "$(find /tmp -maxdepth 1 -name '.e57_staging.minegs-*' -print -quit)" \
+            || { echo "a staging temp directory was left behind"; exit 1; }
+          echo 'e57 staging safety smoke ok'
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

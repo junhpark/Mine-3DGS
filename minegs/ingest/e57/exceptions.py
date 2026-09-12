@@ -72,3 +72,19 @@ class E57PoseUnusableError(E57Error):
             "`minegs ingest e57 inventory` rather than treating it as identity."
         )
         self.reason = reason
+
+
+class E57ReadScanError(E57Error):
+    """A scan's point payload could not be read.
+
+    Distinct from ``E57ReadError``: the file opened and its metadata parsed, so the inventory
+    would have succeeded on it. Only the payload failed.
+    """
+
+    def __init__(self, index: int, detail: str) -> None:
+        super().__init__(
+            f"scan index {index}: point data could not be read ({detail}). Inspect the file "
+            "with `minegs ingest e57 inventory` — extraction reads the payload, the inventory "
+            "does not."
+        )
+        self.index = index

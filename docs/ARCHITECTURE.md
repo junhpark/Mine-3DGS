@@ -31,7 +31,9 @@ minegs/
                  frames(SE3/Sim3), centerline, chunking, provenance
     ingest/
       common/    geometry, equirect, colmap_io               ← 두 경로가 공유
-      e57/       inventory+models+exceptions (SOURCE 프레임 계약), scan_split(pye57), tiles(PDAL), pose_to_colmap,
+      e57/       _nodes(단일 pye57 seam), inventory+models+exceptions (SOURCE 프레임 계약),
+                 images+mapping(증거 기반 station↔image), extract(추출·마스크·manifest),
+                 scan_split(deprecated), tiles(PDAL), pose_to_colmap,
                  pano/  PanoSource 어댑터: E57Embedded · ExternalJpeg · VendorExport
       video/     frames(ffmpeg), dedup_blur, masks,
                  sfm/   SfMBackend: COLMAPIncremental · COLMAPGlobal · (exp) GLUEMAP
@@ -66,8 +68,11 @@ minegs/
 ## 3. 좌표 프레임
 
 ```
-Source frame  (스캐너 로컬 / SfM 임의)
-   │
+SCANNER        개별 스캔 자신의 좌표             ← 0B.3 --raw 추출 (unregistered)
+   │  T_source_from_scan (E57 pose)
+   ▼
+SOURCE        원본 파일 자신의 좌표 (스캐너 로컬 / SfM 임의)  ← 0B 추출 산출물
+   │  Phase 0C 의 선언
    ▼
 TLS_GLOBAL     실제 계측 좌표, m        ← 평가·보고
    │  SE(3), 병진·회전만
@@ -83,6 +88,10 @@ BACKEND_INTERNAL                        ← 어댑터가 반드시 역변환해�
 * UTM 급 좌표(10⁶ m)를 float32 에 넣으면 유효 정밀도가 수십 cm 로 떨어진다.
   체적 계측에서 이 하나로 결과가 무의미해진다.
 * `T_tls_from_local` 은 manifest 필수 항목. run 이 청크 단위면 청크마다 하나.
+* `SOURCE` 와 `SCANNER` 는 Phase 0B ingest 전용이며 dataset 계약에 등장하지 않는다. E57 의
+  좌표가 `TLS_GLOBAL` 인지는 파일이 말해 주지 않으므로, 그 선언은 dataset materialization
+  (Phase 0C) 이 명시적으로 한다. Phase 0B 산출물에는 `TLS_GLOBAL`/`LOCAL_METRIC` 이라는 문자열이
+  주석으로도 등장하지 않는다 — 산출물을 grep 했을 때 나오면 그것은 진짜 주장이어야 한다.
 
 ## 4. 데이터셋 계약
 
@@ -257,6 +266,16 @@ raw ──▶ dataset ──▶ run ──▶ eval ──▶ export
 
 run_id 예: `gsplat_20260910_a91f2c`. 6개월 뒤 "이 .ply 는 어느 E57·어느 크롭
 설정·어느 commit 에서 나왔나"에 즉답할 수 있어야 한다.
+
+**입력은 하나도 빠지지 않는다.** `source_assets` 에는 결과를 바꾸는 입력이 전부 들어간다 —
+Phase 0B 라면 E57 뿐 아니라 매핑 파일, vendor manifest, 외부 이미지까지. 같은 E57 을 다른
+매핑 CSV 로 돌리면 다른 결과이므로, E57 만 적힌 기록은 두 결과를 구분하지도 재현하지도
+못한다. 한 산출물 트리 안의 여러 artifact 는 **한 번 계산한 같은 digest** 를 공유한다:
+`scan_000`·`image_000` 은 특정 파일 안의 index 라서, 어느 바이트를 읽었는지 말할 수 없는
+artifact 는 자기 ID 가 무엇을 가리키는지도 말할 수 없다. hash 를 생략했다면 **artifact 가 그
+이유를 적는다** (`hash_skipped_reason`) — 값이 비어 있다는 것과 "왜 비었는지" 는 다른 사실이고,
+`SourceAsset` 자체에는 이유를 적을 자리가 없으므로 그 진술은 artifact 수준과 입력별 레코드
+(`MappingInput`·`ImageAsset`·`ImageOutput`) 에 남는다.
 
 ## 10. 청킹 · 중심선
 

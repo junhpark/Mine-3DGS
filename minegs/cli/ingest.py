@@ -141,20 +141,239 @@ def _print_inventory(inv) -> None:
         console.print("\n[green]No problems detected.[/]")
 
 
+@e57_app.command("pano-map")
+def e57_pano_map(
+    file: Path = typer.Argument(..., help="Path to the .e57 file"),
+    json_out: Path | None = typer.Option(
+        None, "--json", help="Write the full PanoMappingReport here"
+    ),
+    mapping: Path | None = typer.Option(
+        None, "--mapping", help="Explicit station/scan <-> image mapping (CSV or JSON)"
+    ),
+    vendor_manifest: Path | None = typer.Option(
+        None, "--vendor-manifest", help="Machine-generated vendor index (JSON)"
+    ),
+    images_dir: Path | None = typer.Option(
+        None, "--images-dir", help="Map external image files in this directory instead of /images2D"
+    ),
+    no_hash: bool = typer.Option(False, "--no-hash", help="Skip the SHA-256 (recorded as skipped)"),
+) -> None:
+    """Discover images and map them to scans — from evidence only.
+
+    Reads metadata, never pixels or point data. An image is mapped when the E57 associates it
+    with exactly one scan, when a vendor index says so, or when you say so with --mapping.
+    Index equality, equal counts, file order and name similarity never produce a mapping
+    (docs/ARCHITECTURE.md §3, docs/ROADMAP.md Phase 0B.2): a panorama attributed to the wrong
+    station trains and converges just as well as a correct one.
+    """
+    from minegs.ingest.e57.mapping import build_mapping_report
+
+    def go() -> None:
+        rep = build_mapping_report(
+            file,
+            mapping=mapping,
+            vendor_manifest=vendor_manifest,
+            images_dir=images_dir,
+            compute_hash=not no_hash,
+        )
+        _print_mapping(rep)
+        if json_out:
+            rep.save(json_out)
+            console.print(f"\nwrote {json_out}")
+
+    run_guarded(go)
+
+
+_STATUS_STYLE = {
+    "confirmed": "green",
+    "manual": "cyan",
+    "unmapped": "yellow",
+    "ambiguous": "red",
+    "orphan": "red",
+    "conflict": "red",
+}
+
+
+def _print_mapping(rep) -> None:
+    """Block-per-image report. Every line says what the evidence was, or that there was none."""
+    console.print(f"[bold]Source:[/] {rep.source_file}")
+    if rep.image_root:
+        console.print(f"  images from: {rep.image_root}")
+    console.print(
+        f"[bold]Scans:[/] {rep.scan_count}   [bold]Images:[/] {len(rep.images)}   "
+        f"[dim](resolved: {len(rep.resolved())})[/]"
+    )
+
+    by_id = {im.image_id: im for im in rep.images}
+    for m in rep.mappings:
+        im = by_id[m.image_id]
+        style = _STATUS_STYLE.get(m.status, "white")
+        console.print(f"\n[bold]{m.image_id}[/]  [{style}]{m.status}[/]")
+        if im.name:
+            console.print(f"  name:           {im.name}")
+        console.print(
+            f"  representation: {im.representation}"
+            + ("  [green](panorama candidate)[/]" if im.panorama_candidate else "")
+        )
+        if im.width and im.height:
+            console.print(f"  size:           {im.width} x {im.height}")
+        console.print(f"  scan:           {m.scan_id or '[dim]not determined[/]'}")
+        console.print(f"  station:        {m.station_id or '[dim]not determined[/]'}")
+        console.print(f"  evidence:       {m.evidence_type}", highlight=False)
+        if m.evidence_value:
+            console.print(f"  evidence value: {m.evidence_value}", highlight=False)
+        console.print(f"  why:            {m.reason}")
+        if m.candidate_scan_ids:
+            console.print(f"  candidates:     {', '.join(m.candidate_scan_ids)}")
+        for hint in m.hints:
+            console.print(f"  [yellow]hint:[/] {hint} [dim](a hint is not evidence)[/]")
+
+    if rep.issues:
+        console.print("\n[bold red]Problems[/]")
+        for msg in rep.issues:
+            console.print(f"  [red]•[/] {msg}")
+    if rep.notes:
+        console.print("\n[bold]Notes[/]")
+        for msg in rep.notes:
+            console.print(f"  [yellow]•[/] {msg}")
+    console.print(
+        "\n[dim]Mapping is evidence-based: scan/image index equality, equal counts, file order "
+        "and name similarity are never used (docs/ROADMAP.md Phase 0B.2).[/]"
+    )
+
+
+@e57_app.command("extract")
+def e57_extract(
+    file: Path = typer.Argument(..., help="Path to the .e57 file"),
+    work_dir: Path = typer.Argument(..., help="Staging directory to write (NOT a dataset/)"),
+    voxel: float | None = typer.Option(None, "--voxel", help="Voxel size in metres, e.g. 0.01"),
+    scan: list[str] = typer.Option(
+        [], "--scan", help="Extract only these scan ids (repeatable), e.g. --scan scan_000"
+    ),
+    mapping: Path | None = typer.Option(None, "--mapping", help="Explicit image mapping file"),
+    vendor_manifest: Path | None = typer.Option(
+        None, "--vendor-manifest", help="Machine-generated vendor index (JSON)"
+    ),
+    images_dir: Path | None = typer.Option(
+        None, "--images-dir", help="Map external image files in this directory"
+    ),
+    no_images: bool = typer.Option(False, "--no-images", help="Extract scans only"),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Write scanner-frame clouds marked unregistered instead of SOURCE-frame ones",
+    ),
+    max_scan_points: int | None = typer.Option(
+        None, "--max-scan-points", help="Refuse scans larger than this (pye57 reads a scan whole)"
+    ),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace existing output"),
+    no_hash: bool = typer.Option(
+        False,
+        "--no-hash",
+        help="Skip hashing the inputs (E57, mapping files, external images). Output digests "
+        "are still recorded — they are the record of what this run produced.",
+    ),
+) -> None:
+    """Extract scans and supported images into a Phase 0B staging directory.
+
+    Writes inventory.json, pano_mapping.json, scans/<scan_id>.ply + .pose.json,
+    images/<image_id>.jpg and extraction_manifest.json. The result is staging, not a dataset:
+    points stay in the E57's own SOURCE frame (or, with --raw, each scan's SCANNER frame).
+    Declaring TLS_GLOBAL, choosing a LOCAL_METRIC origin and building dataset/ are Phase 0C.
+
+    By default every selected scan must declare a usable pose. --raw writes unregistered
+    scanner-frame clouds instead; a broken pose is refused either way, and neither path ever
+    substitutes identity for a missing one.
+    """
+    from minegs.ingest.e57.extract import extract
+
+    def go() -> None:
+        manifest = extract(
+            file,
+            work_dir,
+            scan_ids=list(scan) or None,
+            voxel_m=voxel,
+            registered=not raw,
+            with_images=not no_images,
+            mapping=mapping,
+            vendor_manifest=vendor_manifest,
+            images_dir=images_dir,
+            compute_hash=not no_hash,
+            overwrite=overwrite,
+            max_scan_points=max_scan_points,
+        )
+        _print_extraction(manifest)
+
+    run_guarded(go)
+
+
+def _print_extraction(m) -> None:
+    console.print(f"[bold]Extracted:[/] {m.source_e57}")
+    console.print(f"  into:   {m.work_dir}")
+    console.print(
+        f"  frame:  [bold]{m.output_frame}[/] ({m.registration}) "
+        "[dim]— not TLS_GLOBAL, not a dataset[/]"
+    )
+    for s in m.scan_outputs:
+        console.print(f"\n[bold]{s.scan_id}[/]  {Path(s.path).name}")
+        console.print(
+            f"  points:      {s.point_count_output:,}"
+            + (
+                f"  [dim](declared {s.point_count_input:,}"
+                if s.point_count_input is not None
+                else "  [dim]("
+            )
+            + f", {s.invalid_points_removed:,} invalid removed)[/]"
+        )
+        console.print(f"  pose:        {s.pose_status}")
+        console.print(f"  attributes:  {', '.join(s.attributes) or '[dim]none[/]'}")
+        if s.color_conversion:
+            console.print(f"  colour:      {s.color_conversion}")
+        if s.voxel_m:
+            console.print(f"  voxel:       {s.voxel_m} m")
+        for msg in s.issues:
+            console.print(f"  [red]problem:[/] {msg}")
+    for im in m.image_outputs:
+        console.print(
+            f"\n[bold]{im.image_id}[/]  {Path(im.path).name}  {im.representation}  "
+            f"mapping: {im.mapping_status}"
+            + ("" if im.extracted else "  [dim](referenced, not copied)[/]")
+        )
+    for sk in m.skipped_images:
+        console.print(f"\n[yellow]{sk.image_id} skipped[/]  {sk.reason}")
+    if m.issues:
+        console.print("\n[bold red]Problems[/]")
+        for msg in m.issues:
+            console.print(f"  [red]•[/] {msg}")
+    if m.notes:
+        console.print("\n[bold]Notes[/]")
+        for msg in m.notes:
+            console.print(f"  [yellow]•[/] {msg}")
+
+
 @e57_app.command("split")
 def e57_split(
     file: Path = typer.Argument(...),
     out_dir: Path = typer.Argument(...),
     voxel_m: float = typer.Option(0.01),
 ) -> None:
-    """Write one scanner-frame PLY + pose JSON per station."""
+    """Deprecated: flat scanner-frame PLY + pose JSON per scan. Use `extract` instead.
+
+    Kept for the Phase 0A dataset builder. `extract` writes the same points plus the mapping
+    report, the image outputs and an extraction manifest, can place points in the SOURCE
+    frame, and publishes its output all-or-nothing. This command writes scan by scan with no
+    rollback, so an interrupted run leaves whatever it had written.
+    """
     from minegs.ingest.e57.scan_split import split_scans
 
-    run_guarded(
-        lambda: console.print(
-            f"wrote {len(split_scans(file, out_dir, voxel_m))} stations to {out_dir}"
+    def go() -> None:
+        console.print(
+            "[yellow]`split` is deprecated; use `minegs ingest e57 extract` "
+            "(docs/ROADMAP.md Phase 0B.3).[/]"
         )
-    )
+        console.print(f"wrote {len(split_scans(file, out_dir, voxel_m))} stations to {out_dir}")
+
+    run_guarded(go)
 
 
 @e57_app.command("tiles")

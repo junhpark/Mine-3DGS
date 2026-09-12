@@ -27,7 +27,6 @@ from typing import Any
 
 import numpy as np
 
-from minegs.core.errors import MissingDependencyError
 from minegs.core.provenance import (
     ProvenanceRecord,
     SourceAsset,
@@ -35,11 +34,9 @@ from minegs.core.provenance import (
     sha256_file,
     tool_versions,
 )
+from minegs.ingest.e57 import _nodes
 from minegs.ingest.e57.exceptions import (
-    E57FileNotFoundError,
     E57NoScansError,
-    E57NotAFileError,
-    E57ReadError,
     E57UnsupportedStructureError,
 )
 from minegs.ingest.e57.models import (
@@ -68,41 +65,11 @@ _VENDOR_STRING_FIELDS = ("description", "sensorVendor", "sensorModel", "sensorSe
 _VENDOR_SCALAR_FIELDS = ("temperature", "relativeHumidity", "atmosphericPressure")
 
 
-def _pye57() -> Any:
-    try:
-        import pye57
-    except ImportError as e:
-        raise MissingDependencyError("pye57", "e57", "reading E57 files") from e
-    return pye57
-
-
-# ---------------------------------------------------------------- guarded node access
-
-
-def _fields(node: Any) -> list[str]:
-    try:
-        return [node.get(i).elementName() for i in range(node.childCount())]
-    except Exception:
-        return []
-
-
-def _value(node: Any, *path: str) -> Any:
-    """``node[a][b].value()`` or ``None`` if any step is missing or unreadable."""
-    cur = node
-    try:
-        for key in path:
-            cur = cur[key]
-        return cur.value()
-    except Exception:
-        return None
-
-
-def _str_value(node: Any, *path: str) -> str | None:
-    v = _value(node, *path)
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s or None
+# Guarded node access lives in one module so every E57 reader shares the same guards; see
+# ``_nodes`` for why. These aliases keep this file readable.
+_fields = _nodes.fields
+_value = _nodes.value
+_str_value = _nodes.str_value
 
 
 # ---------------------------------------------------------------- scan-level readers
@@ -335,50 +302,26 @@ def _image_summary(root: Any) -> ImageSummary:
 
 
 def list_images2d(path: str | Path) -> list[dict[str, Any]]:
-    """Enumerate ``/images2D`` entries with their raw metadata.
+    """Enumerate ``/images2D`` entries as plain dicts.
 
-    Detection detail for consumers that already know what to do with it (the PanoSource
-    adapters). The Phase 0B.1 inventory contract intentionally carries only a summary; the
-    station↔panorama mapping is Phase 0B.2 and is not inferred here.
+    Kept as the legacy shape the Phase 0A ``PanoSource`` adapters read. New code should use
+    :func:`minegs.ingest.e57.images.discover_embedded_images`, which returns the Phase 0B.2
+    ``ImageAsset`` contract; this wrapper exists so both cannot drift apart.
     """
-    pye57 = _pye57()
-    out: list[dict[str, Any]] = []
-    e57 = pye57.E57(str(path))
-    try:
-        root = e57.root
-        if not root.isDefined("images2D"):
-            return out
-        images = root["images2D"]
-        for i in range(images.childCount()):
-            node = images.get(i)
-            entry: dict[str, Any] = {
-                "index": i,
-                "guid": _str_value(node, "guid"),
-                "name": _str_value(node, "name"),
-                "associated_scan_guid": _str_value(node, "associatedData3DGuid"),
-                "representation": None,
-                "width": None,
-                "height": None,
-            }
-            for key in (
-                "sphericalRepresentation",
-                "pinholeRepresentation",
-                "cylindricalRepresentation",
-                "visualReferenceRepresentation",
-            ):
-                try:
-                    defined = node.isDefined(key)
-                except Exception:
-                    defined = False
-                if defined:
-                    entry["representation"] = key.replace("Representation", "")
-                    entry["width"] = _value(node, key, "imageWidth")
-                    entry["height"] = _value(node, key, "imageHeight")
-                    break
-            out.append(entry)
-    finally:
-        e57.close()
-    return out
+    from minegs.ingest.e57.images import discover_embedded_images
+
+    return [
+        {
+            "index": a.source_index,
+            "guid": a.guid,
+            "name": a.name,
+            "associated_scan_guid": a.associated_scan_guid,
+            "representation": None if a.representation == "unknown" else a.representation,
+            "width": a.width,
+            "height": a.height,
+        }
+        for a in discover_embedded_images(path)
+    ]
 
 
 # ---------------------------------------------------------------- public entry point
@@ -394,20 +337,10 @@ def inventory(path: str | Path, compute_hash: bool = True) -> E57Inventory:
     ``compute_hash=False`` to skip it; the report records *why* the hash is absent so it can
     never be mistaken for a hashed one.
     """
-    pye57 = _pye57()
     p = Path(path)
-    if not p.exists():
-        raise E57FileNotFoundError(p)
-    if not p.is_file():
-        raise E57NotAFileError(p)
+    size = p.stat().st_size if p.is_file() else 0
 
-    size = p.stat().st_size
-    try:
-        e57 = pye57.E57(str(p))
-    except Exception as e:
-        raise E57ReadError(p, str(e)) from e
-
-    try:
+    with _nodes.open_e57(p) as e57:
         root = e57.root
         try:
             scan_count = int(e57.scan_count)
@@ -437,8 +370,6 @@ def inventory(path: str | Path, compute_hash: bool = True) -> E57Inventory:
             scans.append(_scan_inventory(header, i))
 
         images = _image_summary(root)
-    finally:
-        e57.close()
 
     file_issues, file_notes = _file_findings(scans, images)
     stations = [
@@ -472,6 +403,28 @@ def inventory(path: str | Path, compute_hash: bool = True) -> E57Inventory:
             tool_versions=tool_versions(),
         ),
     )
+
+
+def with_source_hash(inv: E57Inventory, sha256: str | None) -> E57Inventory:
+    """The same inventory, stamped with a digest the caller already computed.
+
+    Extraction writes three artifacts describing one read of one file. Letting each compute
+    its own SHA-256 would stream a 50 GB scan three times; letting only one of them compute it
+    leaves a staging tree whose inventory cannot say which bytes it describes — and
+    ``scan_000`` means nothing without the digest of the file it is the first scan of. So the
+    digest is computed once and stamped onto every artifact that reports it.
+
+    ``None`` (hashing was skipped) returns the inventory unchanged, keeping its skip reason.
+    """
+    if sha256 is None:
+        return inv
+    file_info = inv.file.model_copy(update={"sha256": sha256, "hash_skipped_reason": None})
+    assets = [
+        a.model_copy(update={"sha256": sha256}) if a.path == inv.file.path else a
+        for a in inv.provenance.source_assets
+    ]
+    provenance = inv.provenance.model_copy(update={"source_assets": assets})
+    return inv.model_copy(update={"file": file_info, "provenance": provenance})
 
 
 def _file_findings(
