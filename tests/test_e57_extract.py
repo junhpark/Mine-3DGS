@@ -504,6 +504,67 @@ def test_a_bad_mapping_path_is_refused_before_the_source_is_read(fake_e57, tmp_p
     assert not (tmp_path / "out").exists()
 
 
+def test_every_id_this_extractor_can_write_is_recognised_as_its_own():
+    """The ownership check and the id generator must agree, or a big survey locks itself out.
+
+    ``{:03d}`` pads to *at least* three digits, so scan 1000 is ``scan_1000.ply``. A check
+    matching exactly three digits calls that file foreign, and then refuses to replace the
+    directory containing it — for good, on every re-run of any survey that large.
+    """
+    from minegs.ingest.e57.extract import _OUTPUT_DIRS
+    from minegs.ingest.e57.images import image_id_for
+    from minegs.ingest.e57.models import scan_id_for
+
+    for i in (0, 1, 999, 1000, 12345):
+        for name in (f"{scan_id_for(i)}.ply", f"{scan_id_for(i)}.pose.json"):
+            assert _OUTPUT_DIRS["scans"].match(name), name
+        for name in (f"{image_id_for(i)}.jpg", f"{image_id_for(i)}.png"):
+            assert _OUTPUT_DIRS["images"].match(name), name
+    for name in ("scan_00.ply", "scan_000.txt", "scans.ply", "scan_abc.ply", "notes.md"):
+        assert not _OUTPUT_DIRS["scans"].match(name), name
+
+
+def test_a_thousandth_scan_does_not_lock_its_own_directory(fake_e57, tmp_path):
+    """The same defect end to end, without writing a thousand scans."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    out = tmp_path / "out"
+    extract(path, out, compute_hash=False)
+    (out / "scans" / "scan_1000.ply").write_bytes(b"from a bigger survey")
+    (out / "images").mkdir()
+    (out / "images" / "image_1000.jpg").write_bytes(b"likewise")
+    extract(path, out, overwrite=True, compute_hash=False)
+    assert (out / "extraction_manifest.json").exists()
+
+
+def test_a_symlinked_staging_path_is_refused_not_followed(fake_e57, tmp_path):
+    """rmtree refuses a link anyway, with a bare OSError; following it would empty a directory
+    somewhere else entirely."""
+    path, _ = fake_e57([_scan(data=cartesian_data(3))])
+    elsewhere = tmp_path / "someone_elses"
+    elsewhere.mkdir()
+    (elsewhere / "notes.md").write_text("keep me")
+    (tmp_path / ".out.minegs-partial").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(ContractError, match="symlink"):
+        extract(path, tmp_path / "out", compute_hash=False)
+    assert (elsewhere / "notes.md").exists()
+
+
+def test_a_run_only_releases_its_own_lock(tmp_path):
+    """A killed run's lock cleared by hand, then a new run: releasing blindly hands it away."""
+    from minegs.ingest.e57.extract import _target_lock
+
+    out = tmp_path / "out"
+    lock = tmp_path / ".out.minegs-lock"
+    with _target_lock(out):
+        assert lock.exists()
+        lock.write_text("pid 999999\n")  # as if cleared and retaken by another run
+    assert lock.exists(), "a lock we no longer own must not be removed"
+    lock.unlink()
+    with _target_lock(out):
+        pass
+    assert not lock.exists()
+
+
 def test_a_symlinked_target_is_refused(fake_e57, tmp_path):
     """Publish renames the target aside, which would replace the link, not what it points at."""
     path, _ = fake_e57([_scan(data=cartesian_data(3))])

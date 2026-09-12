@@ -442,8 +442,11 @@ def plan_scans(
 
 #: What this extractor writes at the root of a staging directory.
 _ROOT_OUTPUTS = ("inventory.json", "pano_mapping.json", "extraction_manifest.json")
-_OUTPUT_DIRS = {"scans": re.compile(r"^scan_\d{3}\.(ply|pose\.json)$")}
-_OUTPUT_DIRS["images"] = re.compile(r"^image_\d{3}\.(jpg|png)$")
+#: ``{:03d}`` pads to *at least* three digits, so a survey with a thousand scans writes
+#: ``scan_1000.ply``. Matching exactly three would make this extractor call its own output
+#: foreign on every re-run of a large survey, and refuse to replace it for good.
+_OUTPUT_DIRS = {"scans": re.compile(r"^scan_\d{3,}\.(ply|pose\.json)$")}
+_OUTPUT_DIRS["images"] = re.compile(r"^image_\d{3,}\.(jpg|png)$")
 
 
 def foreign_entries(work_dir: Path) -> list[str]:
@@ -566,6 +569,13 @@ def _check_target(work_dir: Path, overwrite: bool) -> None:
 
 def _discard(path: Path, what: str) -> None:
     """Remove a directory this extractor owns, refusing if anything else is inside it."""
+    if path.is_symlink():
+        # rmtree refuses a symlink anyway, with a bare OSError; and following it would empty
+        # a directory somewhere else entirely. This extractor does not create links.
+        raise ContractError(
+            f"{path} is {what}, but it is a symlink, which this extractor never creates. "
+            "Inspect it and remove it yourself."
+        )
     if not path.exists():
         return
     if not path.is_dir():
@@ -603,12 +613,21 @@ def _target_lock(work_dir: Path) -> Iterator[Path]:
         ) from e
     except OSError as e:
         raise ContractError(f"could not create the extraction lock {lock}: {e}") from e
+    payload = f"pid {os.getpid()}\n"
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(f"pid {os.getpid()}\n")
+            f.write(payload)
         yield lock
     finally:
-        lock.unlink(missing_ok=True)
+        # Only ever remove the lock we wrote. If a killed run's lock was cleared by hand and
+        # another has started since, unlinking blindly would hand it away mid-run. A failure
+        # to release is left alone rather than raised: it must not replace the real error, and
+        # the refusal a stale lock produces says how to clear it.
+        try:
+            if lock.read_text() == payload:
+                lock.unlink()
+        except OSError:
+            pass
 
 
 @contextmanager
