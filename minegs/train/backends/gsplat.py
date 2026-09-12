@@ -111,16 +111,34 @@ REFUSED_FLAGS = {
 }
 
 
+def canonical_option(raw: object) -> str:
+    """One spelling per option, for a ``backend_args`` key and an assembled token alike.
+
+    A refusal that matches one spelling of a flag is not a refusal. tyro (gsplat's CLI parser)
+    accepts ``--depth-loss`` and ``--depth_loss`` alike, so hyphens fold to underscores; and a
+    key written with its dashes already attached — ``backend_args: {"--ckpt": ...}`` — used to be
+    emitted as ``--__ckpt`` and sail past a guard keyed on ``ckpt``, so leading dashes come off
+    too. Surrounding whitespace is stripped for the same reason: ``{"ckpt ": ...}`` rendered as
+    ``--ckpt <path>`` in the printed command while matching nothing. Leading underscores go the
+    same way, so the guard still recognises a token like ``--__ckpt`` however it was produced; no
+    gsplat option name begins with one.
+    """
+    return str(raw).strip(" \t\r\n-_").replace("-", "_")
+
+
 def _assert_no_refused_flags(argv: list[str]) -> None:
     """Last line of defence: scan the assembled argv, not just the inputs that built it."""
     for token in argv:
-        if not token.startswith("--"):
+        if not token.startswith("-"):
             continue
-        name = token[2:].split("=", 1)[0].replace("-", "_")
+        name = canonical_option(token.split("=", 1)[0])
         if name.startswith("no_"):  # --no-<opt> disables it; that is the safe direction
             continue
-        if name in REFUSED_FLAGS:
-            raise ContractError(REFUSED_FLAGS[name])
+        # Case-folded because REFUSED_FLAGS is lower-case and no gsplat option is not: matching
+        # only the exact case would let ``--CKPT`` through a guard whose whole job is to be the
+        # spelling-independent one.
+        if name.casefold() in REFUSED_FLAGS:
+            raise ContractError(REFUSED_FLAGS[name.casefold()])
 
 
 class GsplatBackend(TrainBackend):
@@ -165,12 +183,19 @@ class GsplatBackend(TrainBackend):
     ) -> TrainCommand:
         """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
         enabled = self.resolve_requests(profile)
-        # tyro (gsplat's CLI parser) accepts --depth-loss and --depth_loss alike, so a hyphen
-        # spelling in backend_args would otherwise slip past the refusals below and be forwarded
-        # verbatim by the passthrough loop. Canonicalise to underscores first: one key, one guard.
+        # Canonicalise every backend_args key first, so the refusals below and the argv scan at
+        # the end are comparing the same thing the user wrote (see ``canonical_option``): one
+        # key, one guard. Without this a refused option smuggled in under a second spelling is
+        # forwarded verbatim by the passthrough loop.
         args: dict[str, object] = {}
         for raw_key, value in profile.backend_args.items():
-            key = str(raw_key).replace("-", "_")
+            key = canonical_option(raw_key)
+            if not key or any(c.isspace() for c in key):
+                raise ContractError(
+                    f"backend_args key {raw_key!r} is not an option name. A key with inner "
+                    "whitespace cannot be passed as a flag, and a command printed with one reads "
+                    "as two arguments."
+                )
             if key in args:
                 raise ContractError(
                     f"backend_args has two spellings of the same option ({raw_key!r} collides with "

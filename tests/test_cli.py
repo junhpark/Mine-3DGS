@@ -315,11 +315,15 @@ def test_cli_resume_target_is_explicit_and_fails_closed(tmp_path):
             str(tmp_path / "runs" / "does-not-exist"),
         ],
     )
-    # Exit 2, a contract error, and a message that says what to do about it. With the default
-    # backend the refusal comes from gsplat rather than from the missing directory: v1.5.3
-    # cannot continue training at all, so resume is refused before any target is looked up
-    # (docs/ROADMAP.md §Phase 0D). The parent-not-found path is covered against a
-    # resume-capable backend in tests/test_train_resume.py.
+    # Exit 2, a contract error, and a message that says what to do about it. The refusal comes
+    # from the backend declaring it cannot resume, not from the missing directory: gsplat v1.5.3
+    # cannot continue training at all, so nothing looks the target up (docs/ROADMAP.md §Phase 0D).
+    # Whitespace-normalised because rich wraps to the terminal width, and an assertion that
+    # depends on COLUMNS tests the environment rather than the contract.
+    out = " ".join(r.output.split())
     assert r.exit_code == 2
-    assert "does not support resuming training" in r.output
-    assert "evaluation only" in r.output and "Phase 0D" in r.output
+    assert "does not support resuming training" in out
+    assert "evaluation only" in out and "Phase 0D" in out
+    # ...and the refusal happens before anything is written: this invocation used the default
+    # run directory (<dataset>/../runs/<run_id>), the path every real user takes.
+    assert not (root / "runs").exists()

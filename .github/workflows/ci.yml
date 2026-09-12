@@ -53,6 +53,17 @@ jobs:
             --resume-from /tmp/no-such-run 2>&1 | tr -d '\n' | tr -s ' ' \
             | grep -q 'does not support resuming training'
           test ! -d /tmp/syn/runs || { echo "a refused resume created a run directory"; exit 1; }
+          # A refusal that matches one spelling of a flag is not a refusal: a profile writing the
+          # key with its dashes attached used to render as --__ckpt and sail past the guard.
+          for key in 'ckpt' '--ckpt' '-ckpt' 'CKPT' 'ckpt '; do
+            printf 'schema_version: "1.0"\nname: evil\nbackend: gsplat\nmax_steps: 10\n' > /tmp/evil.yaml
+            printf 'backend_args:\n  "%s": /tmp/runs/p/ckpt/ckpt_6999.pt\n' "$key" >> /tmp/evil.yaml
+            if minegs train command /tmp/syn/dataset --profile /tmp/evil.yaml > /tmp/evil.out 2>&1; then
+              echo "backend_args key '$key' was not refused:"; cat /tmp/evil.out; exit 1
+            fi
+            grep -q 'evaluation only' /tmp/evil.out || {
+              echo "key '$key' was refused for the wrong reason:"; cat /tmp/evil.out; exit 1; }
+          done
           echo 'resume contract smoke ok'
           # The whole Phase 0B path against a real (tiny) E57 written here, not a committed
           # fixture: invalid points sit in the middle of the record array so a smoke run

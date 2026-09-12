@@ -30,6 +30,7 @@ from minegs.train.backends.gsplat import (
     RESUME_REFUSAL,
     GsplatBackend,
     _assert_no_refused_flags,
+    canonical_option,
 )
 from minegs.train.profiles import load_profile
 from minegs.train.runner import RunConfig, get_runner
@@ -107,10 +108,27 @@ def test_a_backend_declaring_resume_still_has_nowhere_to_resume_from():
         refuse_resume(claims_resume)
 
 
-def test_a_checkpoint_cannot_arrive_through_backend_args(synthetic, tmp_path):
+# Every way a checkpoint could be spelled into backend_args. The canonical "ckpt" was refused
+# from the start; the rest reached the assembled command as --__ckpt / --ckpt<space> / --CKPT and
+# were forwarded verbatim, which is the eval-only path the refusal exists to close.
+CHECKPOINT_SPELLINGS = ("ckpt", "--ckpt", "-ckpt", "ckpt ", " ckpt", "CKPT", "ckpt\t", "--CKPT")
+
+
+@pytest.mark.parametrize("key", CHECKPOINT_SPELLINGS)
+def test_a_checkpoint_cannot_arrive_through_backend_args(synthetic, tmp_path, key):
     prof = load_profile("light")
-    prof.backend_args["ckpt"] = "/somewhere/ckpt_1000.pt"
+    prof.backend_args[key] = "/somewhere/ckpt_1000.pt"
     with pytest.raises(ContractError, match="evaluation only"):
+        GsplatBackend().build_command(
+            synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False
+        )
+
+
+def test_a_key_that_is_not_an_option_name_is_refused(synthetic, tmp_path):
+    """Inner whitespace cannot be a flag, and printed as one it reads as two arguments."""
+    prof = load_profile("light")
+    prof.backend_args["ck pt"] = "/somewhere/ckpt_1000.pt"
+    with pytest.raises(ContractError, match="not an option name"):
         GsplatBackend().build_command(
             synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False
         )
@@ -118,18 +136,49 @@ def test_a_checkpoint_cannot_arrive_through_backend_args(synthetic, tmp_path):
 
 def test_no_spelling_of_the_checkpoint_flag_survives_command_assembly():
     """The guard scans the assembled argv, so it does not matter which route produced the flag."""
-    for argv in (["--ckpt", "/x.pt"], ["--ckpt=/x.pt"], ["python", "t.py", "--ckpt", "/x.pt"]):
+    for argv in (
+        ["--ckpt", "/x.pt"],
+        ["--ckpt=/x.pt"],
+        ["python", "t.py", "--ckpt", "/x.pt"],
+        ["--CKPT", "/x.pt"],
+        ["-ckpt", "/x.pt"],
+        ["--__ckpt", "/x.pt"],  # what a "--ckpt" backend_args key used to render as
+        ["-- ckpt", "/x.pt"],
+    ):
         with pytest.raises(ContractError, match="evaluation only"):
             _assert_no_refused_flags(argv)
-    _assert_no_refused_flags(["python", "t.py", "--max_steps", "7000"])  # unrelated flags pass
+    # Unrelated flags, and the safe direction of a refused one, must still pass.
+    for argv in (
+        ["python", "t.py", "--max_steps", "7000"],
+        ["--strategy.absgrad"],
+        ["--no-normalize_world_space"],
+        ["--sh_degree", "3"],
+    ):
+        _assert_no_refused_flags(argv)
     assert "skip training and run evaluation only" in RESUME_REFUSAL
 
 
+def test_one_spelling_per_option(synthetic, tmp_path):
+    """Canonicalisation must fold spellings together, not let a second one shadow the first."""
+    assert canonical_option("--depth-loss") == canonical_option("depth_loss") == "depth_loss"
+    assert canonical_option("sh_degree") == "sh_degree"  # ordinary keys pass through untouched
+    prof = load_profile("light")
+    prof.backend_args["--sh-degree"] = 2  # light.yaml already sets sh_degree: 3
+    with pytest.raises(ContractError, match="two spellings of the same option"):
+        GsplatBackend().build_command(
+            synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False
+        )
+
+
 def test_fresh_gsplat_command_carries_no_checkpoint_argument(synthetic, tmp_path):
+    """A checkpoint sitting in out_dir is not discovered: the adapter never looks."""
+    out = tmp_path / "out"
+    (out / "ckpts").mkdir(parents=True)
+    (out / "ckpts" / "ckpt_6999.pt").write_bytes(b"x")
     cmd = GsplatBackend().build_command(
-        synthetic.dataset_dir, tmp_path / "out", load_profile("light"), check_trainer=False
+        synthetic.dataset_dir, out, load_profile("light"), check_trainer=False
     )
-    assert not any(a.startswith("--ckpt") for a in cmd.argv)
+    assert not any("ckpt" in a.lower() for a in cmd.argv if a.startswith("-"))
 
 
 def test_a_fresh_run_never_picks_up_a_checkpoint_lying_around(

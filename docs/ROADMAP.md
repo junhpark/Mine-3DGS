@@ -250,7 +250,9 @@ gsplat v1.5.3 training resume is unsupported and fails closed.
 * resume 요청은 fail closed — `--resume-from` 은 `Runner.prepare` 에서 거부되고, 이는
   trainer 실행 이전이자 **child run directory 생성 이전**이다.
 * raw `--ckpt` 가 학습 run 을 eval-only 로 바꿀 수 없다. `backend_args` 를 통한 경로도 포함해
-  조립된 argv 를 스캔해서 거부한다.
+  조립된 argv 를 스캔해서 거부하며, **철자에 의존하지 않는다** — key 와 argv token 을 같은
+  규칙으로 정규화하므로 `--ckpt`, `-ckpt`, `ckpt `, `CKPT` 가 모두 같은 거부에 걸린다. 한 가지
+  철자만 잡는 거부는 거부가 아니다.
 * fresh command 에는 checkpoint 인자가 없다. run directory 안에 우연히 checkpoint 가 있어도
   자동 resume 하지 않는다 — resume 은 요청되는 것이지 추론되는 것이 아니다.
 
@@ -410,7 +412,8 @@ image → point observation track 을 사용한다. 현재 staging 은 `init_poi
 infrastructure 이므로 로컬 scientific workflow 가 안정화된 뒤 구현한다.
 
 **범위**: 동일 GPU 이미지 digest, dataset-only 업로드, network volume, pod-side staging,
-resume, checkpoint, **exit-code 기반 status**, artifact 동기화 복귀, provenance, GPU 타입 기록.
+checkpoint, **exit-code 기반 status**, artifact 동기화 복귀, provenance, GPU 타입 기록.
+resume 은 Phase 6 범위가 아니다 — runner 와 무관하게 Phase 0D.3 이다 (§Phase 0D).
 
 **현재 상태**: `RunPodRunner.submit` 은 외부 호출 전에 `NotYetImplementedError` 를 던진다.
 필요한 단계는 `minegs/train/runner/runpod.py` docstring 에 있다. 특히 이전 스케치에 없던
@@ -524,7 +527,8 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | 결과를 바꾸는 입력이 provenance 에 없음 | E57·매핑 파일·vendor manifest·외부 이미지 전부 hash | 재현할 수 없는 결과는 근거가 아니다 | 해당 없음 (설계) |
 | gsplat 에 `--resume-from` | `ContractError` (upstream 근거 인용, run directory 생성 이전) | v1.5.3 은 학습을 이어붙일 수 없다 — §Phase 0D | Phase 0D.3 (보류) |
 | resume=true 를 선언하는 backend 에 `--resume-from` | `NotYetImplementedError` (Phase 0D.3) | 완전한 training state 를 복원하는 checkpoint contract 가 아직 없다 | Phase 0D.3 (보류) |
-| `backend_args` 로 들어온 `ckpt` | `ContractError` | 학습이 아니라 evaluation pass 가 조용히 실행된다 | 해당 없음 (설계) |
+| `backend_args` 로 들어온 `ckpt` (모든 철자) | `ContractError` | 학습이 아니라 evaluation pass 가 조용히 실행된다 | 해당 없음 (설계) |
+| option name 이 될 수 없는 `backend_args` key (내부 공백) | `ContractError` | flag 로 넘길 수 없고, 출력된 command 에서는 인자 두 개로 읽힌다 | 해당 없음 (설계) |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |
 | `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 4 |
