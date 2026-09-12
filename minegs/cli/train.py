@@ -66,11 +66,21 @@ def run(
     backend: str = typer.Option("gsplat"),
     config: Path | None = typer.Option(None, help="configs/runner/*.yaml"),
     native: bool = typer.Option(False, help="local: run in this python env instead of docker"),
-    resume: bool = typer.Option(False),
+    resume_from: Path | None = typer.Option(
+        None,
+        "--resume-from",
+        help="continue an existing run: path to runs/<run_id>. Starts a new child run from that "
+        "run's latest checkpoint; refuses if the checkpoint or the parent's configuration does "
+        "not match (never falls back to fresh training).",
+    ),
     chunk: str | None = typer.Option(None),
     wait: bool = typer.Option(False),
 ) -> None:
-    """Submit a training run. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8)."""
+    """Submit a training run. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8).
+
+    --resume-from names the parent run explicitly; a requested resume that cannot be honoured
+    fails instead of silently starting from iteration 0 (docs/ROADMAP.md §Phase 0D).
+    """
     from minegs.train.backends import get_backend
     from minegs.train.profiles import load_profile
     from minegs.train.runner import RunConfig, get_runner
@@ -93,7 +103,7 @@ def run(
                 profile=profile,
                 backend=backend,
                 runner=rname,
-                resume=resume,
+                resume_from=str(resume_from) if resume_from else None,
                 chunk_id=chunk,
             )
         )

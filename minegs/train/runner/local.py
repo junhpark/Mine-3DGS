@@ -19,6 +19,12 @@ from minegs.train.runner.base import (
     docker_available,
     load_record,
 )
+from minegs.train.runner.resume import (
+    check_staged_compatibility,
+    container_checkpoint,
+    docker_resume_mount,
+    guard_resume_argv,
+)
 from minegs.train.staging import stage_dataset
 
 
@@ -83,8 +89,20 @@ class LocalRunner(Runner):
             "init_points": staged.init_points,
             "sha256": sha256_tree(staged.path, ("sparse/0/*.txt", "images/**/*", "masks/**/*")),
         }
+        # The last resume check, and the only one that needs staging: the trainer's actual input
+        # must be what the parent trained on (§25). Still ahead of Popen — nothing has run yet.
+        host_checkpoint = None
+        if record.resume is not None:
+            check_staged_compatibility(load_record(record.resume.parent_run_dir), record.staged)
+            host_checkpoint = Path(record.resume.checkpoint)
+        resume_mount: list[str] = []
         if self.config.native:
-            cmd = backend.build_command(staged.path, work, profile, resume=run.resume)
+            # Native execution shares the host namespace, so the validated path is the executed
+            # path; nothing is translated and nothing is mounted.
+            exec_checkpoint = host_checkpoint
+            cmd = backend.build_command(
+                staged.path, work, profile, resume_checkpoint=exec_checkpoint
+            )
             argv = cmd.argv
         else:
             if not docker_available():
@@ -95,11 +113,20 @@ class LocalRunner(Runner):
                 raise ContractError(
                     "runner image must be pinned by digest (image@sha256:...) for reproducibility (§8.2)"
                 )
+            # The Phase 0D entry blocker: the checkpoint was *found* on the host but the trainer
+            # runs in the container, so the two namespaces must be handled separately (§17). The
+            # parent's checkpoint directory — nothing more of the parent run, and read-only — is
+            # mounted at /data/resume, and that is the path the trainer receives.
+            exec_checkpoint = (
+                container_checkpoint(host_checkpoint) if host_checkpoint is not None else None
+            )
+            if host_checkpoint is not None:
+                resume_mount = docker_resume_mount(host_checkpoint)
             cmd = backend.build_command(
                 Path("/data/run/staged"),
                 Path("/data/run/backend_out"),
                 profile,
-                resume=run.resume,
+                resume_checkpoint=exec_checkpoint,
                 check_trainer=False,  # the trainer lives inside the image
             )
             argv = [
@@ -114,11 +141,18 @@ class LocalRunner(Runner):
                 f"{dataset_dir}:/data/dataset:ro",
                 "-v",
                 f"{run_dir.resolve()}:/data/run",
+                *resume_mount,
                 "--entrypoint",
                 cmd.argv[0],
                 self.config.image,
                 *cmd.argv[1:],
             ]
+        # §16: whatever route built the command, a requested resume must be carried by the argv
+        # that is about to be executed. Without this, a backend that quietly dropped the flag
+        # would start a fresh run under a run id whose run.json claims a parent.
+        guard_resume_argv(argv, exec_checkpoint)
+        if record.resume is not None:
+            record.resume.checkpoint_exec_path = str(exec_checkpoint)
         record.command = argv
         record.T_local_from_internal = cmd.T_local_from_internal.to_list()
         record.status = RunStatus.RUNNING

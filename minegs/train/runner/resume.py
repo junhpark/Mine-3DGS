@@ -61,7 +61,10 @@ class ResumeInfo(VersionedModel):
     parent_run_id: str | None = None
     parent_run_dir: str | None = None
     checkpoint: str | None = None  # HOST path, the one that was validated
-    checkpoint_container_path: str | None = None  # execution namespace, the one in argv
+    # The path actually handed to the trainer: a container path under docker, the host path
+    # under --native. Recorded separately so Phase 0D.2 can check what the trainer was given
+    # against what was validated, instead of re-deriving the translation from the command.
+    checkpoint_exec_path: str | None = None
     checkpoint_sha256: str | None = None
     checkpoint_iteration: int | None = None
 
@@ -83,13 +86,13 @@ class ResumeTarget:
             path=str(self.checkpoint), sha256=self.sha256, size_bytes=self.size_bytes
         )
 
-    def info(self, container_path: PurePath | None = None) -> ResumeInfo:
+    def info(self, exec_path: PurePath | None = None) -> ResumeInfo:
         return ResumeInfo(
             requested=True,
             parent_run_id=self.parent_run_id,
             parent_run_dir=str(self.parent_run_dir),
             checkpoint=str(self.checkpoint),
-            checkpoint_container_path=str(container_path) if container_path else None,
+            checkpoint_exec_path=str(exec_path) if exec_path is not None else None,
             checkpoint_sha256=self.sha256,
             checkpoint_iteration=self.iteration,
         )
