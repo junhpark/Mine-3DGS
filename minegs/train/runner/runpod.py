@@ -7,7 +7,8 @@ CLI/README cannot present this path as working. What Phase 6 has to deliver, in 
    network volume* (or a pod-side ``rclone copy`` from that remote into ``/data``). The
    current sketch pushed to a remote without any step that lands it inside the pod.
 2. Create the pod from the same GPU image digest as LocalRunner, with the staged dataset
-   built pod-side (``minegs.train.staging``), checkpoints on the volume, ``--resume``.
+   built pod-side (``minegs.train.staging``), checkpoints on the volume, ``--resume-from``
+   resolved pod-side (``minegs.train.runner.resume``: host discovery, one namespace per path).
 3. Poll with the *container exit code*, not the pod lifecycle state: EXITED/TERMINATED is
    not success.
 4. Pod-side ``rclone copy`` of ``/data/runs/<run_id>/`` back to the remote, then local

@@ -253,7 +253,7 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 | 0A Foundation & Contract Freeze | **implemented + G1 통과** |
 | 0B Real E57 ingest | **0B.1–0B.3 implemented** (inventory·증거 기반 매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C Metric dataset golden gate | implemented, **not validated** (재투영 오버레이·Viser 정합 미수행) |
-| 0D Local GS baseline | implemented, **not validated** (GPU 학습 미수행). Docker `--resume` entry blocker 는 ROADMAP §Phase 0D 에 기록 |
+| 0D Local GS baseline | **0D.1 implemented + structurally tested** — `--resume-from` 계약, host↔container checkpoint 경로 분리, fail-closed. **0D.2 미수행** (GPU 학습 없음) → 0D 전체 **NOT COMPLETE**. gsplat v1.5.3 이 학습 resume 을 지원하지 않는 건은 ROADMAP §Phase 0D 의 열린 결정 |
 | 1 Metric surface & evaluation | 부분 — 양방향 지표·단면·체적 구현, surface 추출(depth/TSDF) 미구현 |
 | 2 E57 end-to-end MVP (v0.1) | 미착수 |
 | 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |

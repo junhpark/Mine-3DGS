@@ -37,6 +37,21 @@ jobs:
           minegs dataset synthetic /tmp/syn --length-m 60 --n-stations 4
           minegs dataset validate /tmp/syn/dataset
           minegs eval protocol /tmp/syn/dataset
+          # Phase 0D.1 resume contract. A resume that quietly becomes fresh training produces a
+          # plausible run and a plausible PLY, so the smoke checks the refusals, not a success.
+          minegs train run --help | tr -d '\n' | grep -q -- '--resume-from'
+          if minegs train command /tmp/syn/dataset --profile light | grep -q -- '--ckpt'; then
+            echo "a fresh command carries --ckpt"; exit 1
+          fi
+          if minegs train run /tmp/syn/dataset --profile light --native \
+               --resume-from /tmp/no-such-run; then
+            echo "--resume-from accepted a target that does not exist"; exit 1
+          fi
+          minegs train run /tmp/syn/dataset --profile light --native \
+            --resume-from /tmp/no-such-run 2>&1 | tr -d '\n' | tr -s ' ' \
+            | grep -q 'does not support resuming training'
+          test ! -d /tmp/syn/runs || { echo "a refused resume created a run directory"; exit 1; }
+          echo 'resume contract smoke ok'
           # The whole Phase 0B path against a real (tiny) E57 written here, not a committed
           # fixture: invalid points sit in the middle of the record array so a smoke run
           # catches a colour/coordinate misalignment, which is invisible in the output itself.

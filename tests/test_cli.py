@@ -276,3 +276,50 @@ def test_cli_runpod_is_not_runnable(tmp_path):
     # heavy must report ITS OWN reason (depth_loss), not whatever its default runner says first
     r = runner.invoke(app, ["train", "run", str(root / "dataset"), "--profile", "heavy"])
     assert r.exit_code == 2 and "depth_loss" in r.output and "Phase 4" in r.output
+
+
+def test_cli_resume_target_is_explicit_and_fails_closed(tmp_path):
+    """--resume-from names a run; a target that cannot be honoured is an error, not a fresh run."""
+    r = runner.invoke(app, ["train", "run", "--help"])
+    assert r.exit_code == 0 and "--resume-from" in r.output
+    # the removed boolean must not linger as a silently-accepted alias
+    assert "--resume " not in r.output and "--no-resume" not in r.output
+    root = tmp_path / "syn"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "dataset",
+                "synthetic",
+                str(root),
+                "--length-m",
+                "45",
+                "--n-stations",
+                "3",
+                "--image-size",
+                "32",
+            ],
+        ).exit_code
+        == 0
+    )
+    r = runner.invoke(
+        app,
+        [
+            "train",
+            "run",
+            str(root / "dataset"),
+            "--profile",
+            "light",
+            "--native",
+            "--resume-from",
+            str(tmp_path / "runs" / "does-not-exist"),
+        ],
+    )
+    # Exit 2, a contract error, and a message that says what to do about it. With the default
+    # backend the refusal comes from gsplat rather than from the missing directory: v1.5.3
+    # cannot continue training at all, so resume is refused before any target is looked up
+    # (docs/ROADMAP.md §Phase 0D). The parent-not-found path is covered against a
+    # resume-capable backend in tests/test_train_resume.py.
+    assert r.exit_code == 2
+    assert "does not support resuming training" in r.output
+    assert "evaluation only" in r.output and "Phase 0D" in r.output

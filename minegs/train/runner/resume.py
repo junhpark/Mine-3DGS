@@ -116,7 +116,14 @@ def docker_resume_mount(host_checkpoint: Path) -> list[str]:
     Only the checkpoint directory, so a failed child cannot write into the parent run; and
     read-only, so it cannot write into it even by accident (§18).
     """
-    return ["-v", f"{host_checkpoint.parent}:{CONTAINER_RESUME_DIR}:ro"]
+    source = host_checkpoint.parent
+    if ":" in str(source):
+        # ``docker -v`` splits on colons, so such a path would silently mount something else.
+        raise ContractError(
+            f"{source}: a checkpoint directory whose path contains ':' cannot be expressed as a "
+            "docker volume argument. Move the run directory, or use --native."
+        )
+    return ["-v", f"{source}:{CONTAINER_RESUME_DIR}:ro"]
 
 
 # ------------------------------------------------------------------ checkpoint resolution
@@ -207,7 +214,9 @@ def load_parent_record(resume_from: str | Path) -> tuple[Path, Any]:
     """``(parent_run_dir, RunRecord)`` for ``--resume-from``; both absences are hard failures."""
     from minegs.train.runner.base import load_record
 
-    parent_run_dir = Path(resume_from)
+    # Absolute from here on: a docker -v source must be absolute, and a relative parent in
+    # run.json would only be resolvable from whatever directory the run was submitted in.
+    parent_run_dir = Path(resume_from).resolve()
     if not parent_run_dir.is_dir():
         raise ContractError(
             f"--resume-from {resume_from}: no such run directory. Point it at an existing "
