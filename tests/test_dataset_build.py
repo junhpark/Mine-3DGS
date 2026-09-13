@@ -333,3 +333,130 @@ def test_overwrite_never_deletes_a_foreign_directory(staging_small, build_config
     (out / "notes.txt").unlink()
     build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
     assert Manifest.load_dataset(out).dataset_id == cfg.dataset_id
+
+
+# --- review round 3: camera-critical cross-artifact agreement, recursive overwrite ownership
+
+
+def _edit_standalone(staging_small, tmp_path, mutate):
+    """Copy a staging tree and change only pano_mapping.json."""
+    stg = _copy_staging(staging_small, tmp_path)
+    pm = stg / "pano_mapping.json"
+    rep = json.loads(pm.read_text())
+    mutate(rep)
+    pm.write_text(json.dumps(rep))
+    return stg
+
+
+def _asset(rep, image_id="image_005"):
+    return next(a for a in rep["images"] if a["image_id"] == image_id)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expect"),
+    [
+        # BLOCKER: camera-critical ImageAsset content, which 0C reads from the standalone file
+        (
+            lambda r: _asset(r)["vendor_metadata"].__setitem__("focalLength", 0.009),
+            "vendor_metadata",
+        ),
+        (
+            lambda r: _asset(r)["vendor_metadata"].__setitem__("pose_translation", [1.0, 2.0, 3.0]),
+            "vendor_metadata",
+        ),
+        (lambda r: _asset(r).__setitem__("representation", "spherical"), "representation"),
+        (lambda r: _asset(r).__setitem__("width", 999), "width"),
+        (lambda r: _asset(r).__setitem__("height", 999), "height"),
+        (lambda r: _asset(r).__setitem__("sha256", "0" * 64), "sha256"),
+        (lambda r: _asset(r).__setitem__("source_index", 99), "source_index"),
+        (lambda r: r.__setitem__("scan_count", 999), "scan_count"),
+        (lambda r: r.__setitem__("image_root_sha256", "f" * 64), "image_root_sha256"),
+    ],
+)
+def test_camera_metadata_must_agree_across_the_two_artifacts(
+    staging_small, tmp_path, mutate, expect
+):
+    """A field-by-field allowlist would go stale; the whole record is compared."""
+    from minegs.dataset.staging_input import load_staging
+
+    stg = _edit_standalone(staging_small, tmp_path, mutate)
+    with pytest.raises(ContractError, match="contradict each other") as e:
+        load_staging(stg)
+    assert expect in str(e.value)
+
+
+def test_cross_artifact_comparison_is_symmetric(staging_small, tmp_path):
+    """An extra record on either side is detected, not just a differing shared one."""
+    from minegs.dataset.staging_input import load_staging
+
+    dropped = _edit_standalone(staging_small, tmp_path / "drop", lambda r: r["images"].pop(3))
+    with pytest.raises(ContractError, match=r"missing from pano_mapping\.json"):
+        load_staging(dropped)
+
+    def add(r):
+        extra = json.loads(json.dumps(r["images"][0]))
+        extra["image_id"] = "image_999"
+        r["images"].append(extra)
+
+    added = _edit_standalone(staging_small, tmp_path / "add", add)
+    with pytest.raises(ContractError, match=r"missing from extraction_manifest\.json"):
+        load_staging(added)
+
+    def drop_mapping(r):
+        r["mappings"] = [m for m in r["mappings"] if m["image_id"] != "image_002"]
+
+    m_dropped = _edit_standalone(staging_small, tmp_path / "mdrop", drop_mapping)
+    with pytest.raises(ContractError, match=r"mapping \['image_002'\] missing from pano_mapping"):
+        load_staging(m_dropped)
+
+
+def test_an_untouched_tree_still_loads(staging_small, tmp_path):
+    """The strict comparison must not reject the extractor's own output."""
+    from minegs.dataset.staging_input import load_staging
+
+    assert load_staging(_copy_staging(staging_small, tmp_path)).source_sha256
+
+
+def test_overwrite_detects_a_nested_foreign_file(staging_small, build_config_small, tmp_path):
+    """MAJOR: --overwrite removes the whole tree, so a stray file under images/ is at risk too."""
+    from minegs.dataset.materialize import owned_relpaths
+
+    cfg = _no_holdout(build_config_small)
+    out = tmp_path / "ds"
+    res = build_dataset(staging_small.staging_dir, out, cfg)
+    # a freshly built dataset is entirely owned — nothing the builder writes reads as foreign
+    actual = {str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()}
+    assert actual - owned_relpaths(out) == set()
+
+    nested = out / "images" / "field_notes.txt"
+    nested.write_text("survey notes nobody backed up")
+    with pytest.raises(ContractError, match=r"images/field_notes\.txt"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert nested.read_text() == "survey notes nobody backed up"
+    nested.unlink()
+
+    deep = out / "sparse" / "0" / "extra" / "notes.md"
+    deep.parent.mkdir()
+    deep.write_text("x")
+    with pytest.raises(ContractError, match="did not write"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert deep.exists()
+    deep.unlink()
+    deep.parent.rmdir()
+
+    # ...and a clean generated dataset is still replaceable
+    again = build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert again.manifest.dataset_id == res.manifest.dataset_id
+    assert Manifest.load_dataset(out).all_images() == res.manifest.all_images()
+
+
+def test_overwrite_refuses_a_dataset_whose_manifest_cannot_be_read(
+    staging_small, build_config_small, tmp_path
+):
+    cfg = _no_holdout(build_config_small)
+    out = tmp_path / "ds"
+    build_dataset(staging_small.staging_dir, out, cfg)
+    (out / "manifest.json").write_text("{ not json")
+    with pytest.raises(ContractError, match="cannot be read as a dataset"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert (out / "init_points.ply").exists()

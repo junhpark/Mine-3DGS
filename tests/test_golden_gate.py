@@ -283,9 +283,12 @@ def test_golden_gate_refuses_a_reextracted_tree(dataset_small, staging_small, tm
         f.write(b"\0")
     with pytest.raises(ContractError, match="does not match the digest"):
         run_golden_gate(dataset_small.dataset_dir, tmp_path / "s3", tmp_path / "gg3")
-    # and an artifact edited after the build is caught too
+    # an internally consistent tree whose artifacts were re-written after the build: the
+    # cross-artifact check is happy, the provenance digests are not
     shutil.copytree(staging_small.staging_dir, tmp_path / "s2")
-    pm = tmp_path / "s2" / "pano_mapping.json"
-    pm.write_text(pm.read_text().replace("Skybox 0", "Skybox 9"))
+    for name in ("pano_mapping.json", "extraction_manifest.json"):
+        f = tmp_path / "s2" / name
+        f.write_text(f.read_text().replace("Skybox 0", "Skybox 9"))
+    load_staging(tmp_path / "s2")  # consistent
     with pytest.raises(ContractError, match="not the artifact this dataset was built from"):
         run_golden_gate(dataset_small.dataset_dir, tmp_path / "s2", tmp_path / "gg2")

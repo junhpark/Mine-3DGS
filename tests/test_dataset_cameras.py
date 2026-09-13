@@ -151,16 +151,24 @@ def test_invalid_image_pose_refused():
 def test_image_names_are_not_orientation_evidence(staging_small, build_config_small, tmp_path):
     src = staging_small.staging_dir
     shutil.copytree(src, tmp_path / "staging")
-    rep = json.loads((tmp_path / "staging" / "pano_mapping.json").read_text())
-    for a in rep["images"]:
-        a["name"] = "Skybox 5" if a["name"] != "Skybox 5" else "Skybox 0"  # lie about every face
-    (tmp_path / "staging" / "pano_mapping.json").write_text(json.dumps(rep))
+
+    def relabel(assets):
+        for a in assets:
+            a["name"] = "Skybox 5" if a["name"] != "Skybox 5" else "Skybox 0"
+
+    # both serialised copies, so the tree stays internally consistent and the only thing that
+    # changed is the face number in every image's name
+    pm = tmp_path / "staging" / "pano_mapping.json"
+    rep = json.loads(pm.read_text())
+    relabel(rep["images"])
+    pm.write_text(json.dumps(rep))
+    em = tmp_path / "staging" / "extraction_manifest.json"
+    man = json.loads(em.read_text())
+    relabel(man["mapping_report"]["images"])
+    em.write_text(json.dumps(man))
+
     cfg = build_config_small.model_copy(
-        update={
-            "split": build_config_small.split.model_copy(),
-            "geometry_holdout": None,
-            "centerline": None,
-        }
+        deep=True, update={"geometry_holdout": None, "centerline": None}
     )
     a = build_dataset(src, tmp_path / "a", cfg)
     b = build_dataset(tmp_path / "staging", tmp_path / "b", cfg)

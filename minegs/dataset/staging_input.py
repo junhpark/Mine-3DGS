@@ -142,34 +142,62 @@ class StagingTree:
         return self._verify(self.image_path(image_id), out.sha256, f"image {image_id}")
 
 
+def _keyed(records: list, key: str) -> dict[str, dict]:
+    return {getattr(r, key): r.model_dump(mode="json") for r in records}
+
+
+def _diff_keyed(kind: str, a: list, b: list, key: str) -> list[str]:
+    """Symmetric per-record diff: what is missing from either side, and which fields differ."""
+    A, B = _keyed(a, key), _keyed(b, key)
+    problems: list[str] = []
+    for label, missing in (
+        ("pano_mapping.json", sorted(set(B) - set(A))),
+        ("extraction_manifest.json", sorted(set(A) - set(B))),
+    ):
+        if missing:
+            problems.append(f"{kind} {missing[:6]} missing from {label}")
+    for k in sorted(set(A) & set(B)):
+        if A[k] == B[k]:
+            continue
+        fields = sorted(f for f in set(A[k]) | set(B[k]) if A[k].get(f) != B[k].get(f))
+        problems.append(f"{kind} {k} differs in {fields}")
+    return problems
+
+
 def _mapping_reports_agree(
     standalone: PanoMappingReport, carried: PanoMappingReport | None
 ) -> list[str]:
-    """Where the two copies of the mapping story disagree. Empty means they agree."""
+    """Where the two copies of the mapping story disagree. Empty means they agree.
+
+    The extractor serialises *one* ``PanoMappingReport`` into both ``pano_mapping.json`` and
+    ``extraction_manifest.json``, so the two dumps are byte-identical when nobody has edited
+    them: the verdict is a whole-model comparison, not a hand-picked field list. That matters
+    because 0C reads camera metadata — intrinsics, image pose, representation, dimensions —
+    out of the *standalone* file's ``ImageAsset`` records, and a field-by-field allowlist would
+    go stale the moment a field is added.
+
+    The localised diff below only shapes the error message; if it cannot explain a difference
+    the dumps still disagree about, the tree is refused anyway.
+    """
     if carried is None:
         return ["extraction_manifest.json carries no mapping report"]
+    a = standalone.model_dump(mode="json")
+    b = carried.model_dump(mode="json")
+    if a == b:
+        return []
     problems: list[str] = []
-    if standalone.source_sha256 != carried.source_sha256:
-        problems.append("source_sha256 differs")
-    a_ids = {i.image_id for i in standalone.images}
-    b_ids = {i.image_id for i in carried.images}
-    if a_ids != b_ids:
-        problems.append(f"image sets differ ({sorted(a_ids ^ b_ids)[:6]})")
-    b_rec = {m.image_id: m for m in carried.mappings}
-    for m in standalone.mappings:
-        c = b_rec.get(m.image_id)
-        if c is None:
-            problems.append(f"{m.image_id}: mapped in one report only")
-        elif (m.status, m.scan_id, m.station_id) != (c.status, c.scan_id, c.station_id):
-            problems.append(
-                f"{m.image_id}: {m.status}/{m.scan_id}/{m.station_id} vs "
-                f"{c.status}/{c.scan_id}/{c.station_id}"
-            )
-    a_in = {(i.role, i.sha256) for i in standalone.mapping_inputs}
-    b_in = {(i.role, i.sha256) for i in carried.mapping_inputs}
-    if a_in != b_in:
-        problems.append("mapping inputs differ")
-    return problems
+    problems += _diff_keyed("image", standalone.images, carried.images, "image_id")
+    problems += _diff_keyed("mapping", standalone.mappings, carried.mappings, "image_id")
+    problems += _diff_keyed(
+        "mapping input", standalone.mapping_inputs, carried.mapping_inputs, "path"
+    )
+    localised = {"images", "mappings", "mapping_inputs"}
+    problems += [
+        f"{f} differs" for f in sorted((set(a) | set(b)) - localised) if a.get(f) != b.get(f)
+    ]
+    # Fail closed: the dumps differ, so the tree is refused whether or not the diff above
+    # managed to name where (duplicate ids inside one report, say).
+    return problems or ["the two reports differ in a way this diff could not localise"]
 
 
 def load_staging(path: str | Path) -> StagingTree:

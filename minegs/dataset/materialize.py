@@ -72,22 +72,9 @@ CENTERLINE_FILE = "centerline.csv"
 CAMERA_EXTENT_MARGIN_M = 5.0
 #: A holdout interval may overhang the centerline ends by this much and still count as inside.
 HOLDOUT_EXTENT_TOL_M = 1e-6
-#: Top-level entries `from-e57` writes. --overwrite replaces a directory only if it holds
-#: nothing else: a mistyped destination must not cost someone their data (§30, Phase 0B rule).
-OWNED_ENTRIES = frozenset(
-    {
-        "manifest.json",
-        BUILD_CONFIG_FILE,
-        CONVENTION_FILE,
-        CENTERLINE_FILE,
-        "init_points.ply",
-        "images",
-        "sparse",
-        "masks",
-    }
-)
-#: Mapping states that may not enter a dataset (§14). An image in one of these is not dropped;
-#: the build stops.
+#: The COLMAP text files ``write_model`` can produce. ``sparse/0`` is written wholesale as one
+#: model, so all five count as ours whether or not this particular build emitted the rig pair.
+SPARSE_OUTPUTS = ("cameras.txt", "images.txt", "points3D.txt", "rigs.txt", "frames.txt")
 UNRESOLVED_STATUSES = ("unmapped", "ambiguous", "orphan", "conflict")
 
 
@@ -475,21 +462,58 @@ def _link_or_copy(src: Path, dst: Path, mode: str) -> None:
     shutil.copy2(src, dst)
 
 
+def owned_relpaths(out: Path) -> set[str]:
+    """Every file ``from-e57`` writes into a dataset, derived from the dataset itself.
+
+    Derived rather than listed, so the set cannot drift from what the builder actually
+    produces: the manifest names its images, its init cloud and its centerline, and the rest
+    is the fixed layout. A file the manifest does not account for is a file this tool did not
+    write — including one nested under ``images/``.
+    """
+    m = Manifest.load_dataset(out, strict_layout=False)
+    names = {"manifest.json", BUILD_CONFIG_FILE, m.initialization.file}
+    if m.centerline is not None:
+        names.add(m.centerline.file)
+    if (out / CONVENTION_FILE).is_file():
+        names.add(CONVENTION_FILE)
+    names |= {f"images/{n}" for n in m.all_images()}
+    names |= {f"sparse/0/{f}" for f in SPARSE_OUTPUTS}
+    return names
+
+
 def check_overwrite_target(out: Path) -> None:
-    """Only a dataset this tool wrote may be replaced, and only if it holds nothing else."""
+    """Only a dataset this tool wrote may be replaced, and only if it holds nothing else.
+
+    Recursive: ``--overwrite`` removes the whole tree, so a stray ``images/field_notes.txt``
+    is as destroyable as one at the top level, and a mistyped destination must not cost
+    someone their data.
+    """
     if not out.is_dir():
         raise ContractError(f"{out} is not a directory")
-    entries = sorted(p.name for p in out.iterdir())
-    if "manifest.json" not in entries or BUILD_CONFIG_FILE not in entries:
+    if not (out / "manifest.json").is_file() or not (out / BUILD_CONFIG_FILE).is_file():
         raise ContractError(
             f"{out} is not a dataset written by `minegs dataset from-e57` (no manifest.json + "
             f"{BUILD_CONFIG_FILE}); refusing to replace a directory this tool does not own"
         )
-    foreign = [e for e in entries if e not in OWNED_ENTRIES]
+    try:
+        owned = owned_relpaths(out)
+    except Exception as e:
+        # Broad on purpose, and it refuses rather than proceeding: a manifest.json that will
+        # not parse at all (JSONDecodeError, not ContractError) is exactly the case where we
+        # must not assume the directory is ours and delete it.
+        raise ContractError(
+            f"{out}: has a manifest.json but it cannot be read as a dataset ({e}); refusing to "
+            "replace a directory this tool does not own"
+        ) from e
+    foreign = sorted(
+        str(p.relative_to(out))
+        for p in out.rglob("*")
+        if (p.is_file() or p.is_symlink()) and str(p.relative_to(out)) not in owned
+    )
     if foreign:
         raise ContractError(
-            f"{out} holds files this tool did not write ({foreign[:6]}); move them out before "
-            "--overwrite, which would delete them"
+            f"{out} holds {len(foreign)} file(s) this tool did not write ({foreign[:6]}); move "
+            "them out before --overwrite, which would delete them"
         )
 
 
