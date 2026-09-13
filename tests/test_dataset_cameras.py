@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from minegs.core.errors import ContractError
 from minegs.core.frames import SE3, rot_x, rot_z, rotmat_to_quat
-from minegs.dataset.build_config import DatasetBuildConfig
+from minegs.dataset.build_config import CameraConfig, DatasetBuildConfig
 from minegs.dataset.cameras import (
     CameraConvention,
     axis_aligned_rotations,
@@ -175,6 +175,53 @@ def test_image_names_are_not_orientation_evidence(staging_small, build_config_sm
     assert (a.dataset_dir / "sparse" / "0" / "images.txt").read_text() == (
         b.dataset_dir / "sparse" / "0" / "images.txt"
     ).read_text()
+
+
+# 17b. ...and neither is the image's index within its station
+def test_image_index_is_not_orientation_evidence(build_config_small, tmp_path):
+    """The same scene with the cube faces emitted in a rotated order.
+
+    In the default fixture an image's emission index coincides with the face it points at, so a
+    builder that derived orientation from ``source_index`` instead of the E57 pose metadata
+    would still match the truth. Here index ``k`` carries face ``k + 1``, so only the metadata
+    still says where a camera looks — and every built pose is checked against the synthetic
+    truth, not against a second build that would share the same mistake.
+    """
+    from minegs.core.synthetic_staging import MATTERPORT_LIKE, StagingSpec, generate_staging
+
+    res = generate_staging(
+        tmp_path / "permuted",
+        StagingSpec(
+            length_m=60.0,
+            station_spacing_m=12.0,
+            points_per_m=3000,
+            image_size=64,
+            face_order=(1, 2, 3, 4, 5, 0),
+        ),
+    )
+    cfg = build_config_small.model_copy(
+        deep=True,
+        update={
+            "geometry_holdout": None,
+            "centerline": None,
+            # the convention the fixture was built with, stated outright: the calibration
+            # artifact is bound to the other tree's source digest, and this test is about
+            # orientation evidence, not about re-measuring the axes.
+            "camera": CameraConfig(
+                mode="e57_pinhole", R_e57cam_from_cam=[list(r) for r in MATTERPORT_LIKE]
+            ),
+        },
+    )
+    built = build_dataset(res.staging_dir, tmp_path / "ds", cfg)
+    model = colmap_io.read_model(built.dataset_dir / "sparse" / "0")
+    frames = json.loads((built.dataset_dir / "build_config.json").read_text())["frames"]
+    T_tls_from_source = SE3.from_matrix(frames["T_tls_from_source"])
+    T_local_from_source = SE3.from_matrix(frames["T_tls_from_local"]).inverse() @ T_tls_from_source
+    assert len(model.images) == len(res.image_poses_cam)
+    for im in model.images.values():
+        image_id = im.name.split("_", 1)[1].rsplit(".", 1)[0]
+        truth = T_local_from_source @ res.image_poses_cam[image_id]
+        assert im.world_from_cam.allclose(truth, atol=1e-6), im.name
 
 
 def _with_status(staging_root, tmp_path, image_id: str, status: str):

@@ -72,9 +72,6 @@ CENTERLINE_FILE = "centerline.csv"
 CAMERA_EXTENT_MARGIN_M = 5.0
 #: A holdout interval may overhang the centerline ends by this much and still count as inside.
 HOLDOUT_EXTENT_TOL_M = 1e-6
-#: The COLMAP text files ``write_model`` can produce. ``sparse/0`` is written wholesale as one
-#: model, so all five count as ours whether or not this particular build emitted the rig pair.
-SPARSE_OUTPUTS = ("cameras.txt", "images.txt", "points3D.txt", "rigs.txt", "frames.txt")
 UNRESOLVED_STATUSES = ("unmapped", "ambiguous", "orphan", "conflict")
 
 
@@ -463,30 +460,30 @@ def _link_or_copy(src: Path, dst: Path, mode: str) -> None:
 
 
 def owned_relpaths(out: Path) -> set[str]:
-    """Every file ``from-e57`` writes into a dataset, derived from the dataset itself.
+    """Exactly the files this tool wrote, as it recorded them in ``build_config.json``.
 
-    Derived rather than listed, so the set cannot drift from what the builder actually
-    produces: the manifest names its images, its init cloud and its centerline, and the rest
-    is the fixed layout. A file the manifest does not account for is a file this tool did not
-    write — including one nested under ``images/``.
+    Read back rather than re-derived. A rule like "images/ holds the manifest's images and
+    sparse/0 holds a COLMAP model" has to guess at the edges — whether this build emitted the
+    rig files, whether it wrote a camera convention — and every guess that errs generous is a
+    user's file inside the tree ``--overwrite`` deletes.
     """
-    m = Manifest.load_dataset(out, strict_layout=False)
-    names = {"manifest.json", BUILD_CONFIG_FILE, m.initialization.file}
-    if m.centerline is not None:
-        names.add(m.centerline.file)
-    if (out / CONVENTION_FILE).is_file():
-        names.add(CONVENTION_FILE)
-    names |= {f"images/{n}" for n in m.all_images()}
-    names |= {f"sparse/0/{f}" for f in SPARSE_OUTPUTS}
-    return names
+    cfg = json.loads((out / BUILD_CONFIG_FILE).read_text())
+    outputs = cfg.get("outputs")
+    if not isinstance(outputs, list) or not outputs or not all(isinstance(x, str) for x in outputs):
+        raise ContractError(
+            f"{out / BUILD_CONFIG_FILE} records no output file list; it was written by a minegs "
+            "that did not track what it wrote, so this tool cannot prove the directory is its "
+            "own. Remove it by hand if you meant to replace it."
+        )
+    return set(outputs)
 
 
 def check_overwrite_target(out: Path) -> None:
     """Only a dataset this tool wrote may be replaced, and only if it holds nothing else.
 
-    Recursive: ``--overwrite`` removes the whole tree, so a stray ``images/field_notes.txt``
-    is as destroyable as one at the top level, and a mistyped destination must not cost
-    someone their data.
+    Recursive, and over every kind of directory entry: ``--overwrite`` removes the whole tree,
+    so a stray ``images/field_notes.txt`` is as destroyable as one at the top level, and a
+    symlink or a socket someone bound inside the directory is unlinked just the same.
     """
     if not out.is_dir():
         raise ContractError(f"{out} is not a directory")
@@ -497,23 +494,29 @@ def check_overwrite_target(out: Path) -> None:
         )
     try:
         owned = owned_relpaths(out)
+    except ContractError:
+        raise
     except Exception as e:
-        # Broad on purpose, and it refuses rather than proceeding: a manifest.json that will
-        # not parse at all (JSONDecodeError, not ContractError) is exactly the case where we
-        # must not assume the directory is ours and delete it.
+        # Broad on purpose, and it refuses rather than proceeding: a build_config.json that
+        # will not parse at all is exactly the case where we must not assume the directory is
+        # ours and delete it.
         raise ContractError(
-            f"{out}: has a manifest.json but it cannot be read as a dataset ({e}); refusing to "
-            "replace a directory this tool does not own"
+            f"{out}: has a {BUILD_CONFIG_FILE} but it cannot be read ({e}); refusing to replace "
+            "a directory this tool does not own"
         ) from e
+    # ``is_dir()`` follows symlinks, so a link to a directory is checked as the link it is —
+    # rmtree unlinks it rather than descending, and losing it is still losing something.
     foreign = sorted(
         str(p.relative_to(out))
         for p in out.rglob("*")
-        if (p.is_file() or p.is_symlink()) and str(p.relative_to(out)) not in owned
+        if (p.is_symlink() or not p.is_dir()) and str(p.relative_to(out)) not in owned
     )
     if foreign:
         raise ContractError(
-            f"{out} holds {len(foreign)} file(s) this tool did not write ({foreign[:6]}); move "
-            "them out before --overwrite, which would delete them"
+            f"{out} holds {len(foreign)} entr(y/ies) this tool did not write ({foreign[:6]}); "
+            "move them out before --overwrite, which deletes the whole directory. Hand-added "
+            "dataset content such as masks/ counts here — it is yours, so this tool will not "
+            "delete it for you."
         )
 
 
@@ -721,6 +724,13 @@ def _build_into(
         "minegs_version": minegs.__version__,
     }
     cfg_hash = config_hash(resolved["config"])
+    # Everything written so far, plus the two files still to come. This is the record
+    # ``owned_relpaths`` reads back: ownership is what the builder says it wrote, not a guess
+    # about what a dataset ought to contain (§30).
+    resolved["outputs"] = sorted(
+        {str(p.relative_to(ds)) for p in ds.rglob("*") if p.is_file()}
+        | {"manifest.json", BUILD_CONFIG_FILE}
+    )
     (ds / BUILD_CONFIG_FILE).write_text(json.dumps(resolved, indent=2) + "\n")
 
     assets = _source_assets(

@@ -65,6 +65,11 @@ class StagingSpec:
     image_size: int = 96
     image_mode: ImageMode = "pinhole_cube"
     n_faces: int = 6
+    #: Which cube faces each station emits, in emission order. ``None`` means ``range(n_faces)``
+    #: — the natural order, in which a face's *emission index* happens to equal its face number.
+    #: Permuting it breaks that coincidence: only the pose metadata still says where a camera
+    #: looks, so a builder that read orientation off ``source_index`` produces wrong poses.
+    face_order: tuple[int, ...] | None = None
     R_e57cam_from_cam: tuple[tuple[float, float, float], ...] = MATTERPORT_LIKE
     pano_convention: PanoConvention = field(default_factory=PanoConvention)
     pixel_width_m: float = 2.0e-6  # focalLength = fx * pixel_width (a real-looking sensor)
@@ -136,6 +141,17 @@ def cube_face_rotations() -> list[np.ndarray]:
         x = np.cross(y, z)
         out.append(np.column_stack([x, y, z]))
     return out
+
+
+def _face_plan(spec: StagingSpec) -> list[tuple[int, np.ndarray]]:
+    """``(face_number, R_scanner_from_cam)`` per image of a station, in emission order."""
+    all_faces = cube_face_rotations()
+    order = tuple(range(spec.n_faces)) if spec.face_order is None else tuple(spec.face_order)
+    if len(order) != spec.n_faces or len(set(order)) != len(order):
+        raise ValueError(f"face_order {order} is not {spec.n_faces} distinct faces")
+    if not all(0 <= f < len(all_faces) for f in order):
+        raise ValueError(f"face_order {order} names a face outside 0..{len(all_faces) - 1}")
+    return [(f, all_faces[f]) for f in order]
 
 
 def render_pinhole(xyz_cam: np.ndarray, rgb: np.ndarray, K: np.ndarray, size: int) -> np.ndarray:
@@ -212,7 +228,7 @@ def generate_staging(root: str | Path, spec: StagingSpec | None = None) -> Stagi
     station_poses: dict[str, SE3] = {}
     image_poses: dict[str, SE3] = {}
     img_index = 0
-    faces = cube_face_rotations()[: spec.n_faces]
+    faces = _face_plan(spec)
     K = None
     if spec.image_mode == "pinhole_cube":
         f_px = spec.image_size / 2.0  # 90° face
@@ -275,7 +291,7 @@ def generate_staging(root: str | Path, spec: StagingSpec | None = None) -> Stagi
         # images for this station
         if spec.image_mode == "pinhole_cube":
             assert K is not None
-            for k, R_scanner_from_cam in enumerate(faces):
+            for face, R_scanner_from_cam in faces:
                 image_id = image_id_for(img_index)
                 T_source_from_cam = T_source_from_scanner @ SE3(R_scanner_from_cam, np.zeros(3))
                 # E57 stores the camera in *its* image frame: T_source_from_e57cam
@@ -309,7 +325,7 @@ def generate_staging(root: str | Path, spec: StagingSpec | None = None) -> Stagi
                     spec.image_size,
                     path,
                     meta,
-                    name=f"Skybox {k}",
+                    name=f"Skybox {face}",
                 )
                 img_index += 1
         else:

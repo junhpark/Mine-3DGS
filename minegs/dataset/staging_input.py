@@ -24,8 +24,10 @@ were actually consumed, not the bytes that once were.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from minegs.core.errors import ContractError
 from minegs.core.frames import SE3
@@ -142,14 +144,53 @@ class StagingTree:
         return self._verify(self.image_path(image_id), out.sha256, f"image {image_id}")
 
 
-def _keyed(records: list, key: str) -> dict[str, dict]:
-    return {getattr(r, key): r.model_dump(mode="json") for r in records}
+def _canonical(value: Any) -> Any:
+    """A comparable form of a dumped model, with non-finite floats kept distinguishable.
+
+    ``model_dump(mode="json")`` renders NaN, +inf and -inf all as ``null`` (pydantic's
+    ``ser_json_inf_nan="null"``), so a report claiming ``focalLength: NaN`` would compare equal
+    to one claiming ``Infinity`` or ``null``. Python-mode dumps keep the floats but make NaN
+    unequal to itself, which would refuse a tree where both copies legitimately carry one. A
+    sentinel string gives both: distinguishable, and stable under repetition.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"<non-finite:{value!r}>"
+    if isinstance(value, dict):
+        return {k: _canonical(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    return value
+
+
+def _dump(model: Any) -> Any:
+    return _canonical(model.model_dump())
+
+
+def _keyed(records: list, key: str) -> tuple[dict[str, Any], list[str]]:
+    """``{key: dump}`` plus any key that appears more than once.
+
+    A duplicate is not a detail of the diff: one report holding two records for one image is
+    already telling two stories, and ``asset()`` / ``record_for()`` would silently answer with
+    whichever came first.
+    """
+    out: dict[str, Any] = {}
+    duplicates: list[str] = []
+    for r in records:
+        k = getattr(r, key)
+        if k in out:
+            duplicates.append(k)
+        out[k] = _dump(r)
+    return out, sorted(set(duplicates))
 
 
 def _diff_keyed(kind: str, a: list, b: list, key: str) -> list[str]:
-    """Symmetric per-record diff: what is missing from either side, and which fields differ."""
-    A, B = _keyed(a, key), _keyed(b, key)
+    """Symmetric per-record diff: duplicates, records missing from either side, differing fields."""
+    A, dup_a = _keyed(a, key)
+    B, dup_b = _keyed(b, key)
     problems: list[str] = []
+    for label, dups in (("pano_mapping.json", dup_a), ("extraction_manifest.json", dup_b)):
+        if dups:
+            problems.append(f"{kind} {dups[:6]} appear more than once in {label}")
     for label, missing in (
         ("pano_mapping.json", sorted(set(B) - set(A))),
         ("extraction_manifest.json", sorted(set(A) - set(B))),
@@ -170,33 +211,33 @@ def _mapping_reports_agree(
     """Where the two copies of the mapping story disagree. Empty means they agree.
 
     The extractor serialises *one* ``PanoMappingReport`` into both ``pano_mapping.json`` and
-    ``extraction_manifest.json``, so the two dumps are byte-identical when nobody has edited
-    them: the verdict is a whole-model comparison, not a hand-picked field list. That matters
-    because 0C reads camera metadata — intrinsics, image pose, representation, dimensions —
-    out of the *standalone* file's ``ImageAsset`` records, and a field-by-field allowlist would
-    go stale the moment a field is added.
+    ``extraction_manifest.json``, so the two dumps are identical when nobody has edited them:
+    the verdict is a whole-model comparison, not a hand-picked field list. That matters because
+    0C reads camera metadata — intrinsics, image pose, representation, dimensions — out of the
+    *standalone* file's ``ImageAsset`` records, and an allowlist would go stale the moment a
+    field is added.
 
     The localised diff below only shapes the error message; if it cannot explain a difference
     the dumps still disagree about, the tree is refused anyway.
     """
     if carried is None:
         return ["extraction_manifest.json carries no mapping report"]
-    a = standalone.model_dump(mode="json")
-    b = carried.model_dump(mode="json")
-    if a == b:
-        return []
+    a, b = _dump(standalone), _dump(carried)
     problems: list[str] = []
     problems += _diff_keyed("image", standalone.images, carried.images, "image_id")
     problems += _diff_keyed("mapping", standalone.mappings, carried.mappings, "image_id")
     problems += _diff_keyed(
         "mapping input", standalone.mapping_inputs, carried.mapping_inputs, "path"
     )
+    if a == b:
+        # Equal dumps still hide a duplicate record, which both copies can share.
+        return problems
     localised = {"images", "mappings", "mapping_inputs"}
     problems += [
         f"{f} differs" for f in sorted((set(a) | set(b)) - localised) if a.get(f) != b.get(f)
     ]
     # Fail closed: the dumps differ, so the tree is refused whether or not the diff above
-    # managed to name where (duplicate ids inside one report, say).
+    # managed to name where.
     return problems or ["the two reports differ in a way this diff could not localise"]
 
 

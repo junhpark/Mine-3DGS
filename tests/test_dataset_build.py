@@ -417,6 +417,89 @@ def test_an_untouched_tree_still_loads(staging_small, tmp_path):
     assert load_staging(_copy_staging(staging_small, tmp_path)).source_sha256
 
 
+def _edit_both(staging_small, tmp_path, mutate_standalone, mutate_carried):
+    """Copy a staging tree and change each serialised copy of the mapping report separately."""
+    stg = _copy_staging(staging_small, tmp_path)
+    pm = stg / "pano_mapping.json"
+    rep = json.loads(pm.read_text())
+    mutate_standalone(rep)
+    pm.write_text(json.dumps(rep))
+    em = stg / "extraction_manifest.json"
+    man = json.loads(em.read_text())
+    mutate_carried(man["mapping_report"])
+    em.write_text(json.dumps(man))
+    return stg
+
+
+def _noop(rep) -> None:
+    return None
+
+
+#: ``model_dump(mode="json")`` renders every one of these as ``null``, which is why the
+#: comparison dumps in python mode and canonicalises non-finite floats to a sentinel instead.
+_NON_FINITE = {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf"), "null": None}
+
+
+def _set_focal(value):
+    return lambda rep: _asset(rep)["vendor_metadata"].__setitem__("focalLength", value)
+
+
+@pytest.mark.parametrize(("a", "b"), [("nan", "inf"), ("inf", "-inf"), ("nan", "null")])
+def test_non_finite_metadata_divergence_is_refused(staging_small, tmp_path, a, b):
+    """Two copies claiming different unusable focal lengths still contradict each other."""
+    from minegs.dataset.staging_input import load_staging
+
+    stg = _edit_both(
+        staging_small, tmp_path, _set_focal(_NON_FINITE[a]), _set_focal(_NON_FINITE[b])
+    )
+    with pytest.raises(ContractError, match="contradict each other") as e:
+        load_staging(stg)
+    assert "vendor_metadata" in str(e.value)
+
+
+def test_a_shared_non_finite_value_is_not_a_contradiction(staging_small, tmp_path):
+    """NaN != NaN, but two copies that both say NaN agree — the comparison must not invent one."""
+    from minegs.dataset.staging_input import load_staging
+
+    nan = _NON_FINITE["nan"]
+    stg = _edit_both(staging_small, tmp_path, _set_focal(nan), _set_focal(nan))
+    assert load_staging(stg).source_sha256
+
+
+def _duplicate(key: str, image_id: str = "image_005"):
+    def mutate(rep) -> None:
+        rec = next(r for r in rep[key] if r["image_id"] == image_id)
+        rep[key].append(json.loads(json.dumps(rec)))
+
+    return mutate
+
+
+@pytest.mark.parametrize("key", ["images", "mappings"])
+@pytest.mark.parametrize(
+    ("where", "expect"),
+    [
+        ("standalone", "more than once in pano_mapping.json"),
+        ("carried", "more than once in extraction_manifest.json"),
+        ("both", "more than once in"),
+    ],
+)
+def test_a_duplicate_record_is_refused(staging_small, tmp_path, key, where, expect):
+    """Two records for one image tell two stories; ``asset()`` would answer with whichever
+    came first. The ``both`` case is the one equal dumps would hide."""
+    from minegs.dataset.staging_input import load_staging
+
+    dup = _duplicate(key)
+    stg = _edit_both(
+        staging_small,
+        tmp_path,
+        dup if where in ("standalone", "both") else _noop,
+        dup if where in ("carried", "both") else _noop,
+    )
+    with pytest.raises(ContractError, match="contradict each other") as e:
+        load_staging(stg)
+    assert expect in str(e.value)
+
+
 def test_overwrite_detects_a_nested_foreign_file(staging_small, build_config_small, tmp_path):
     """MAJOR: --overwrite removes the whole tree, so a stray file under images/ is at risk too."""
     from minegs.dataset.materialize import owned_relpaths
@@ -450,13 +533,119 @@ def test_overwrite_detects_a_nested_foreign_file(staging_small, build_config_sma
     assert Manifest.load_dataset(out).all_images() == res.manifest.all_images()
 
 
-def test_overwrite_refuses_a_dataset_whose_manifest_cannot_be_read(
+def test_overwrite_needs_a_readable_record_of_what_was_written(
     staging_small, build_config_small, tmp_path
 ):
+    """Ownership is read back from build_config.json's outputs list, so that must be sound."""
     cfg = _no_holdout(build_config_small)
     out = tmp_path / "ds"
     build_dataset(staging_small.staging_dir, out, cfg)
-    (out / "manifest.json").write_text("{ not json")
-    with pytest.raises(ContractError, match="cannot be read as a dataset"):
+    bc = out / "build_config.json"
+    good = bc.read_text()
+
+    bc.write_text("{ not json")
+    with pytest.raises(ContractError, match="cannot be read"):
         build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
     assert (out / "init_points.ply").exists()
+
+    # a dataset from a minegs that did not record what it wrote: refuse rather than guess
+    stripped = json.loads(good)
+    del stripped["outputs"]
+    bc.write_text(json.dumps(stripped))
+    with pytest.raises(ContractError, match="records no output file list"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert (out / "init_points.ply").exists()
+
+    bc.write_text(good)
+    assert build_dataset(staging_small.staging_dir, out, cfg, overwrite=True).manifest.dataset_id
+
+
+def test_ownership_is_recorded_not_guessed(staging_small, build_config_small, tmp_path):
+    """The recorded outputs are exactly the files on disk — no allowlist to drift.
+
+    In particular sparse/0/rigs.txt and frames.txt are *not* owned: Phase 0C never writes a
+    COLMAP rig, so a file at either path is someone else's.
+    """
+    from minegs.dataset.materialize import owned_relpaths
+
+    out = tmp_path / "ds"
+    build_dataset(staging_small.staging_dir, out, _no_holdout(build_config_small))
+    actual = {str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()}
+    assert owned_relpaths(out) == actual
+    assert "sparse/0/rigs.txt" not in actual and "sparse/0/frames.txt" not in actual
+    for planted in ("sparse/0/rigs.txt", "sparse/0/frames.txt"):
+        p = out / planted
+        p.write_text("someone else's rig")
+        with pytest.raises(ContractError, match="did not write"):
+            build_dataset(
+                staging_small.staging_dir, out, _no_holdout(build_config_small), overwrite=True
+            )
+        assert p.read_text() == "someone else's rig"
+        p.unlink()
+
+
+def test_a_spherical_dataset_does_not_own_a_camera_convention_file(tmp_path):
+    """It never writes one, so a file at that path is the user's (audit: major)."""
+    from minegs.core.synthetic_staging import StagingSpec, generate_staging
+    from minegs.dataset.build_config import DatasetBuildConfig
+
+    r = generate_staging(
+        tmp_path / "s",
+        StagingSpec(
+            length_m=30,
+            station_spacing_m=15,
+            points_per_m=800,
+            image_size=24,
+            image_mode="spherical",
+        ),
+    )
+    cfg = DatasetBuildConfig.model_validate(
+        {
+            "dataset_id": "sph",
+            "source_frame": {"mode": "explicit_identity"},
+            "camera": {
+                "mode": "e57_spherical",
+                "ring_crop": {"n_yaw": 4, "width": 24, "height": 24},
+            },
+            "initialization": {"voxel_m": 0.3, "max_points": 3000, "sparse_max_points": 300},
+        }
+    )
+    out = tmp_path / "ds"
+    build_dataset(r.staging_dir, out, cfg)
+    assert not (out / "camera_convention.json").exists()
+    mine = out / "camera_convention.json"
+    mine.write_text("my own notes about this survey")
+    with pytest.raises(ContractError, match="did not write"):
+        build_dataset(r.staging_dir, out, cfg, overwrite=True)
+    assert mine.read_text() == "my own notes about this survey"
+
+
+def test_special_files_inside_the_dataset_are_not_overwritten(
+    staging_small, build_config_small, tmp_path
+):
+    """A socket or FIFO is zero bytes but a live endpoint; --overwrite unlinks it all the same."""
+    import os
+
+    cfg = _no_holdout(build_config_small)
+    out = tmp_path / "ds"
+    build_dataset(staging_small.staging_dir, out, cfg)
+
+    fifo = out / "control.pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(ContractError, match="did not write"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert fifo.is_fifo()
+    fifo.unlink()
+
+    link = out / "images" / "elsewhere.png"
+    link.symlink_to(tmp_path / "outside.png")  # dangling: not is_file(), still an entry
+    with pytest.raises(ContractError, match="did not write"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert link.is_symlink()
+    link.unlink()
+
+    dirlink = out / "shortcut"
+    dirlink.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ContractError, match="did not write"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert dirlink.is_symlink()
