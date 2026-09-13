@@ -29,6 +29,10 @@ minegs/
   minegs/
     core/        config 스키마(pydantic, schema_version + migration), manifest,
                  frames(SE3/Sim3), centerline, chunking, provenance
+    dataset/     Phase 0C materialization: build_config(strict), staging_input(0B 계약 reader),
+                 frames(SOURCE→TLS→LOCAL), cameras(E57 pinhole→COLMAP, 축 규약), calibrate,
+                 materialize(groups·split·holdout·leak-free init·transactional publish),
+                 reprojection, golden_gate(report·overlay·Viser sample)
     ingest/
       common/    geometry, equirect, colmap_io               ← 두 경로가 공유
       e57/       _nodes(단일 pye57 seam), inventory+models+exceptions (SOURCE 프레임 계약),
@@ -90,8 +94,15 @@ BACKEND_INTERNAL                        ← 어댑터가 반드시 역변환해�
 * `T_tls_from_local` 은 manifest 필수 항목. run 이 청크 단위면 청크마다 하나.
 * `SOURCE` 와 `SCANNER` 는 Phase 0B ingest 전용이며 dataset 계약에 등장하지 않는다. E57 의
   좌표가 `TLS_GLOBAL` 인지는 파일이 말해 주지 않으므로, 그 선언은 dataset materialization
-  (Phase 0C) 이 명시적으로 한다. Phase 0B 산출물에는 `TLS_GLOBAL`/`LOCAL_METRIC` 이라는 문자열이
-  주석으로도 등장하지 않는다 — 산출물을 grep 했을 때 나오면 그것은 진짜 주장이어야 한다.
+  (Phase 0C, `minegs/dataset/`) 이 명시적으로 한다 — `source_frame.mode: explicit_identity`
+  또는 `explicit_transform`. 선언 없는 identity 는 없다. Phase 0B 산출물에는
+  `TLS_GLOBAL`/`LOCAL_METRIC` 이라는 문자열이 주석으로도 등장하지 않는다 — 산출물을 grep 했을 때
+  나오면 그것은 진짜 주장이어야 한다.
+* **`TLS_GLOBAL` 의 GLOBAL 은 측지/global CRS 를 뜻하지 않는다.** 여러 scan 과 camera 를 하나의
+  metric survey 좌표계로 표현하는 *평가 기준 프레임* 이라는 뜻이다. Matterport E57 의 registered
+  survey frame 을 명시적으로 TLS_GLOBAL 로 채택할 수 있지만, 그것이 UTM/EPSG 좌표라는 주장은 아니다.
+* LOCAL_METRIC ← TLS_GLOBAL 은 baseline 에서 translation-only 다 (`R = I`, scale 1). 원점은
+  deterministic policy(station centroid, 0.1 m round) 또는 명시값이며 build config 에 기록된다.
 
 ## 4. 데이터셋 계약
 
@@ -181,9 +192,18 @@ dataset/
 ## 6. 입력 경로
 
 ### 6.1 E57 (TLS)
-inventory(pye57, 헤더만) → 규약 캘리브레이션(포인트를 파노라마에 재투영, **골든 게이트**)
-→ `PanoSource` 어댑터로 파노라마 획득 → 링 크롭 → 스캐너 포즈 → COLMAP
-→ 대형 Cartesian 스캔은 PDAL 로 타일·다운샘플 → `init_points.ply`.
+inventory(pye57, 헤더만) → 증거 기반 image↔scan 매핑 → 추출(staging, SOURCE 프레임)
+→ **Phase 0C** (`minegs/dataset/`): SOURCE→TLS_GLOBAL 선언 → LOCAL_METRIC 원점 → 카메라 →
+COLMAP → leak-free `init_points.ply` → 재투영 **골든 게이트** → Viser.
+
+두 camera path:
+
+* **pinhole** (primary — Matterport Pro3 E57 은 scan 당 6 pinhole face). intrinsics 는 E57
+  `pinholeRepresentation` 선언값만 (`fx = focalLength / pixelWidth`). E57 image frame ↔ COLMAP
+  camera 축 규약 `R_e57cam_from_cam` 은 `calibrate-camera` 가 24 개 proper rotation 을 TLS RGB
+  재투영으로 채점해 3 station 이상에서 일관되게 이길 때만 채택하거나, config 에 명시한다.
+  `T_local_from_cam = T_local_from_tls @ T_tls_from_source @ T_source_from_e57cam @ R_e57cam_from_cam`.
+* **spherical**: `PanoConvention` → ring crop → COLMAP (합성 K). cylindrical 은 거부.
 
 * E57 에 파노라마가 반드시 있다고 가정하지 않는다. 요구하는 것은
   `station_id ↔ panorama_id` 매핑 계약뿐이다.

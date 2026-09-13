@@ -180,3 +180,149 @@ def centerline_extract(
         console.print(f"centerline length={cl.length:.1f} m vertices={len(cl.vertices)} -> {out}")
 
     run_guarded(go)
+
+
+# ---------------------------------------------------------------- Phase 0C
+
+
+@app.command("synthetic-staging")
+def synthetic_staging(
+    root: Path = typer.Argument(..., help="Output root: <root>/raw, <root>/staging"),
+    length_m: float = typer.Option(90.0),
+    station_spacing_m: float = typer.Option(15.0),
+    image_size: int = typer.Option(96),
+    image_mode: str = typer.Option("pinhole_cube", help="pinhole_cube | spherical"),
+    seed: int = typer.Option(0),
+) -> None:
+    """Write a synthetic Phase 0B.3 staging tree (the Phase 0C G1 fixture)."""
+    from minegs.core.errors import ContractError
+    from minegs.core.synthetic_staging import StagingSpec, generate_staging
+
+    def go() -> None:
+        if image_mode not in ("pinhole_cube", "spherical"):
+            raise ContractError("image_mode must be pinhole_cube or spherical")
+        r = generate_staging(
+            root,
+            StagingSpec(
+                length_m=length_m,
+                station_spacing_m=station_spacing_m,
+                image_size=image_size,
+                image_mode=image_mode,  # type: ignore[arg-type]
+                seed=seed,
+            ),
+        )
+        console.print(
+            f"staging -> {r.staging_dir}  stations={len(r.station_poses)} images={len(r.image_poses_cam)}"
+        )
+
+    run_guarded(go)
+
+
+@app.command("calibrate-camera")
+def calibrate_camera(
+    staging: Path = typer.Argument(..., help="Phase 0B.3 staging tree"),
+    out: Path = typer.Option(Path("camera_convention.json"), "--out"),
+    stations: int = typer.Option(3, help="spatially separated stations to sample (>= 3)"),
+    max_points: int = typer.Option(150_000),
+    min_margin: float = typer.Option(5.0, help="required lead of the best convention (RGB units)"),
+) -> None:
+    """Golden gate step 1: measure the E57 pinhole axis convention against the TLS points."""
+    from minegs.dataset.calibrate import calibrate_camera_convention
+    from minegs.dataset.staging_input import load_staging
+
+    def go() -> None:
+        cal = calibrate_camera_convention(
+            load_staging(staging), n_stations=stations, max_points=max_points, min_margin=min_margin
+        )
+        cal.save(out)
+        label = cal.convention.label if cal.convention else "-"
+        console.print(
+            f"status=[bold]{cal.status}[/] convention={label} scoring={cal.scoring} "
+            f"best={cal.best_score:.2f} runner_up={cal.runner_up_score} margin={cal.margin}"
+        )
+        for s in cal.stations:
+            console.print(f"  {s.station_id}: best={s.best_label} margin={s.margin}")
+        for n in cal.notes:
+            console.print(f"  [yellow]{n}[/]")
+        console.print(f"wrote {out}")
+        if cal.status != "selected":
+            from minegs.core.errors import ContractError
+
+            raise ContractError(f"camera convention not selected ({cal.status}); see {out}")
+
+    run_guarded(go)
+
+
+@app.command("from-e57")
+def from_e57(
+    staging: Path = typer.Argument(..., help="Phase 0B.3 staging tree"),
+    out: Path = typer.Argument(..., help="dataset/ directory to create"),
+    config: Path = typer.Option(..., "--config", help="build config YAML/JSON (see --example)"),
+    overwrite: bool = typer.Option(False, "--overwrite"),
+) -> None:
+    """Materialise the staging tree into the dataset contract (Phase 0C)."""
+    from minegs.dataset.build_config import load_build_config
+    from minegs.dataset.materialize import build_dataset
+
+    def go() -> None:
+        cfg = load_build_config(config)
+        r = build_dataset(staging, out, cfg, overwrite=overwrite, config_path=config)
+        rep = r.report
+        console.print(
+            f"dataset [bold]{rep['dataset_id']}[/] -> {r.dataset_dir}  stations={rep['n_stations']} "
+            f"images={rep['n_images']} init_points={rep['initialization']['points_out']}"
+        )
+        console.print(
+            f"T_tls_from_local t={[round(v, 3) for v in rep['frames']['local_origin_tls']]}  "
+            f"source_mode={rep['frames']['source_mode']}"
+        )
+        if rep["camera_convention"]:
+            console.print(
+                f"camera convention: {rep['camera_convention']['label']} ({rep['camera_convention']['source']})"
+            )
+        console.print(f"protocols={rep['protocols']} claims={rep['claims']}")
+        for x in rep["refusals"]:
+            console.print(f"  [red]refused:[/] {x}")
+
+    run_guarded(go)
+
+
+@app.command("build-config-example")
+def build_config_example() -> None:
+    """Print an example Phase 0C build config."""
+    import yaml
+
+    from minegs.dataset.build_config import example_config
+
+    console.print(yaml.safe_dump(example_config(), sort_keys=False))
+
+
+@app.command("golden-gate")
+def golden_gate(
+    dataset_dir: Path = typer.Argument(...),
+    staging: Path = typer.Option(
+        ..., "--staging", help="the staging tree the dataset was built from"
+    ),
+    out: Path = typer.Option(..., "--out", help="report directory"),
+    stations: int = typer.Option(3),
+    max_points: int = typer.Option(150_000),
+) -> None:
+    """Golden gate: reprojection overlays, numerical checks, report.json, Viser TLS sample."""
+    from minegs.dataset.golden_gate import run_golden_gate
+
+    def go() -> None:
+        rep = run_golden_gate(dataset_dir, staging, out, n_stations=stations, max_points=max_points)
+        console.print(
+            f"structural_result=[bold]{rep['structural_result']}[/]  "
+            f"real_data_validation_status={rep['real_data_validation_status']}"
+        )
+        for p in rep["structural_problems"]:
+            console.print(f"  [red]{p}[/]")
+        for s in rep["stations"]:
+            console.print(
+                f"  {s['station_id']}: best_convention={s.get('best_convention')} margin={s.get('margin')}"
+            )
+        console.print(f"overlays: {len(rep['overlays'])} -> {out / 'overlays'}")
+        console.print(f"viser: {rep['viser']}")
+
+    run_guarded(go)

@@ -111,6 +111,37 @@ jobs:
           test -z "$(find /tmp -maxdepth 1 -name '.e57_staging.minegs-*' -print -quit)" \
             || { echo "a staging temp directory was left behind"; exit 1; }
           echo 'e57 staging safety smoke ok'
+          # Phase 0C G1: synthetic staging -> calibrated axis convention -> dataset -> Golden Gate.
+          # The convention is measured, not assumed; the report never claims real-data validation.
+          minegs dataset synthetic-staging /tmp/stg --length-m 45 --station-spacing-m 15 --image-size 48
+          minegs dataset calibrate-camera /tmp/stg/staging --out /tmp/stg/camera_convention.json
+          python -c "
+          import json; c = json.load(open('/tmp/stg/camera_convention.json'))
+          assert c['status'] == 'selected' and c['convention']['label'] == 'cam(+X,-Y,-Z)', c['status']
+          assert len(c['sampled_station_ids']) == 3, c['sampled_station_ids']
+          print('calibration smoke ok')"
+          printf 'schema_version: \"1.0\"\ndataset_id: ci_0c\nsource_frame: {mode: explicit_identity}\n' > /tmp/stg/build.yaml
+          printf 'camera: {mode: e57_pinhole, convention_file: /tmp/stg/camera_convention.json}\n' >> /tmp/stg/build.yaml
+          printf 'initialization: {voxel_m: 0.1, max_points: 20000, sparse_max_points: 2000}\n' >> /tmp/stg/build.yaml
+          minegs dataset from-e57 /tmp/stg/staging /tmp/stg/dataset --config /tmp/stg/build.yaml
+          minegs dataset validate /tmp/stg/dataset --strict
+          minegs eval protocol /tmp/stg/dataset
+          minegs dataset golden-gate /tmp/stg/dataset --staging /tmp/stg/staging --out /tmp/stg/gg
+          python -c "
+          import json; r = json.load(open('/tmp/stg/gg/report.json'))
+          assert r['structural_result'] == 'pass', r['structural_problems']
+          assert r['real_data_validation_status'] == 'pending_human_inspection'
+          assert r['overlays'] and r['init_points_in_holdout'] in (None, 0)
+          m = json.load(open('/tmp/stg/dataset/manifest.json'))
+          assert m['coordinate_frames']['T_tls_from_local'][0][:3] == [1.0, 0.0, 0.0], 'LOCAL_METRIC is translation-only'
+          print('phase 0c golden gate smoke ok')"
+          # a build that never declared SOURCE -> TLS_GLOBAL must not happen
+          printf 'schema_version: \"1.0\"\ndataset_id: x\ncamera: {mode: e57_pinhole, convention_file: /tmp/stg/camera_convention.json}\n' > /tmp/stg/bad.yaml
+          if minegs dataset from-e57 /tmp/stg/staging /tmp/stg/bad --config /tmp/stg/bad.yaml; then
+            echo "a dataset was built without a SOURCE frame declaration"; exit 1
+          fi
+          test ! -d /tmp/stg/bad
+          echo 'phase 0c fail-closed smoke ok'
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

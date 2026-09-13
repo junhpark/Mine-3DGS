@@ -13,13 +13,29 @@ app = typer.Typer(no_args_is_help=True)
 def view(
     dataset_dir: Path = typer.Argument(...),
     run_ply: Path | None = typer.Option(None),
-    tls: Path | None = typer.Option(None),
+    tls: Path | None = typer.Option(None, help="TLS PLY (LOCAL_METRIC or TLS_GLOBAL)"),
+    golden_gate: Path | None = typer.Option(
+        None, "--golden-gate", help="a golden-gate report dir; uses its LOCAL_METRIC TLS sample"
+    ),
     port: int = typer.Option(8080),
 ) -> None:
-    """Viser viewer: frustums, init points, splats, TLS, centerline scrubber (§12)."""
+    """Viser viewer: frustums, init points, splats, TLS, centerline scrubber (§12, §26)."""
+    from minegs.core.errors import ContractError
     from minegs.viz.viewer import launch
 
-    run_guarded(launch, dataset_dir, run_ply, tls, port)
+    def go() -> None:
+        tls_path = tls
+        if golden_gate is not None:
+            from minegs.dataset.golden_gate import TLS_SAMPLE_FILE
+
+            tls_path = golden_gate / TLS_SAMPLE_FILE
+            if not tls_path.is_file():
+                raise ContractError(
+                    f"{golden_gate}: no {TLS_SAMPLE_FILE}; run `minegs dataset golden-gate` first"
+                )
+        launch(dataset_dir, run_ply, tls_path, port)
+
+    run_guarded(go)
 
 
 @app.command()

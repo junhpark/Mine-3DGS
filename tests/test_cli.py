@@ -276,3 +276,72 @@ def test_cli_runpod_is_not_runnable(tmp_path):
     # heavy must report ITS OWN reason (depth_loss), not whatever its default runner says first
     r = runner.invoke(app, ["train", "run", str(root / "dataset"), "--profile", "heavy"])
     assert r.exit_code == 2 and "depth_loss" in r.output and "Phase 4" in r.output
+
+
+def test_cli_phase0c_pipeline(tmp_path):
+    """synthetic-staging -> calibrate-camera -> from-e57 -> validate -> info -> golden-gate."""
+    import json
+
+    root = tmp_path / "s"
+    r = runner.invoke(
+        app,
+        [
+            "dataset",
+            "synthetic-staging",
+            str(root),
+            "--length-m",
+            "45",
+            "--station-spacing-m",
+            "15",
+            "--image-size",
+            "48",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    conv = tmp_path / "camera_convention.json"
+    r = runner.invoke(
+        app, ["dataset", "calibrate-camera", str(root / "staging"), "--out", str(conv)]
+    )
+    assert r.exit_code == 0, r.output
+    assert "status=selected" in r.output.replace("\n", "") and conv.is_file()
+    cfg = tmp_path / "build.yaml"
+    cfg.write_text(
+        "schema_version: '1.0'\n"
+        "dataset_id: cli_0c\n"
+        "source_frame: {mode: explicit_identity}\n"
+        f"camera: {{mode: e57_pinhole, convention_file: {conv}}}\n"
+        "initialization: {voxel_m: 0.1, max_points: 20000, sparse_max_points: 2000}\n"
+    )
+    ds = tmp_path / "dataset"
+    r = runner.invoke(
+        app, ["dataset", "from-e57", str(root / "staging"), str(ds), "--config", str(cfg)]
+    )
+    assert r.exit_code == 0, r.output
+    assert runner.invoke(app, ["dataset", "validate", str(ds), "--strict"]).exit_code == 0
+    r = runner.invoke(app, ["dataset", "info", str(ds), "--json"])
+    assert r.exit_code == 0 and json.loads(r.output)["judgement"]["protocols"] == ["reconstruction"]
+    # a second build into the same place is refused without --overwrite
+    r = runner.invoke(
+        app, ["dataset", "from-e57", str(root / "staging"), str(ds), "--config", str(cfg)]
+    )
+    assert r.exit_code == 2 and "--overwrite" in r.output
+    gg = tmp_path / "gg"
+    r = runner.invoke(
+        app,
+        ["dataset", "golden-gate", str(ds), "--staging", str(root / "staging"), "--out", str(gg)],
+    )
+    assert r.exit_code == 0, r.output
+    rep = json.loads((gg / "report.json").read_text())
+    assert rep["structural_result"] == "pass"
+    assert rep["real_data_validation_status"] == "pending_human_inspection"
+    assert (gg / "tls_local_metric.ply").is_file()
+    # a config without a declared SOURCE frame is refused up front
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "schema_version: '1.0'\ndataset_id: x\ncamera: {mode: e57_pinhole, R_e57cam_from_cam: [[1,0,0],[0,1,0],[0,0,1]]}\n"
+    )
+    r = runner.invoke(
+        app,
+        ["dataset", "from-e57", str(root / "staging"), str(tmp_path / "d2"), "--config", str(bad)],
+    )
+    assert r.exit_code == 2 and "source_frame" in r.output.replace("\n", "")
