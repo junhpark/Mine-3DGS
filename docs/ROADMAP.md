@@ -235,31 +235,44 @@ E57 SOURCE  --explicit SE(3)-->  TLS_GLOBAL  --deterministic origin-->  LOCAL_ME
   FOV·focal·principal point 를 추측하지 않는다. 파일명(`Skybox 3`)과 index 는 orientation 근거가 아니다.
 * **축 규약은 측정한다.** `minegs dataset calibrate-camera STAGING` 이 24 개 axis-aligned proper
   rotation 을 station 자신의 scan 을 station 자신의 image 에 투영해 RGB residual 로 채점하고,
-  spatially separated 3 station(principal axis 기준 early/middle/late, index hard-code 아님) 에서
-  같은 후보가 margin 이상으로 이기면 `camera_convention.json` 에 `selected` 로 기록한다. 아니면
-  `ambiguous`/`inconsistent` 이고 builder 는 이를 거부한다. 규약은 `R_e57cam_from_cam` (E57 image
-  frame ← COLMAP camera frame) 으로 저장되며, PR #3 의 Matterport 증거 `diag(1,−1,−1)` = `cam(+X,−Y,−Z)` 는
-  default 가 아니라 명시적 설정 또는 calibration 결과로만 들어온다.
+  spatially separated **3 station 이상**(principal axis 기준 early/middle/late, index hard-code 아님)
+  에서 같은 후보가 margin 이상으로 이기면 `camera_convention.json` 에 `selected` 로 기록한다.
+  station 이 3 개 미만이면 `insufficient`, 불일치면 `inconsistent`, margin 부족이면 `ambiguous` 이고
+  builder 는 모두 거부한다. scan 에 RGB 가 없으면 calibration 자체를 거부한다 — 색 없이 threshold 를
+  넘길 수 있는 scoring 은 baseline 에 없으므로, 그 경우는 `R_e57cam_from_cam` 을 명시하는 사용자
+  책임 경로만 남는다. artifact 는 `source_sha256` 으로 staging tree 에 묶이며, 다른 survey 에서 측정한
+  artifact 는 유효해도 거부된다. 규약은 `R_e57cam_from_cam` (E57 image frame ← COLMAP camera frame)
+  으로 저장되며, PR #3 의 Matterport 증거 `diag(1,−1,−1)` = `cam(+X,−Y,−Z)` 는 default 가 아니라
+  명시적 설정 또는 calibration 결과로만 들어온다.
 * **COLMAP pose 는 방향이 이름에 있다**: `T_local_from_cam = T_local_from_tls @ T_tls_from_source @
   T_source_from_e57cam @ R_e57cam_from_cam`.
 * **Capture group** = resolved mapping 이 확정한 `image → scan → station` 하나당 `tls_station` 하나.
   `unmapped / ambiguous / orphan / conflict` 이미지가 하나라도 있으면 드롭하지 않고 build 를 거부한다.
 * **Split** 은 요청될 때만 (`test_every` 또는 명시 목록). 아무것도 없으면 reconstruction-only.
-* **Geometry holdout** 은 centerline 이 있을 때만. holdout 구간 point 는 **실제 좌표를 centerline 에
-  투영해** init 에서 제거하고, `points3D.txt` 는 **같은** leak-free 집합의 subsample 이다. 쓰고 난
+* **Geometry holdout** 은 centerline 이 있을 때만, 그리고 모든 구간이 centerline 범위 **안에 완전히**
+  들어갈 때만 (`s_start ≤ lo < hi ≤ s_end`, 1e-6 m 허용) — 끝을 넘는 구간은 survey 에 없는 chainage 에
+  대한 형상 주장을 열어 준다. holdout 구간 point 는 **실제 좌표를 centerline 에 투영해** init 에서 제거하고, `points3D.txt` 는 **같은** leak-free 집합의 subsample 이다. 쓰고 난
   PLY 를 다시 읽어 holdout 안에 point 가 없음을 확인한 뒤에야 publish 한다.
 * **Spherical path** 는 기존 `RingCropSpec`/`PanoConvention` 재사용. cylindrical 은 spherical 로
   처리하지 않고 거부한다.
-* **Provenance**: source E57 · 0B artifact 3개 · mapping input · scan/image 별 digest · camera
-  convention · centerline · config 파일이 전부 `source_assets` 에, 결과를 바꾸는 설정 전체가
-  `config_hash` 에 들어간다. 해석된 설정은 `dataset/build_config.json` 에 남는다.
+* **Provenance 는 실제로 소비한 바이트를 기술한다.** 0C 가 읽는 scan/image 는 소비 시점에 다시 해싱해
+  extractor 가 기록한 digest 와 비교하고(불일치 = 거부, 파일당 한 번만 해싱), 그 검증된 digest 가
+  `source_assets` 에 들어간다. source E57 · 0B artifact 3개 · mapping input · camera convention ·
+  centerline · config 파일도 전부 포함되며, 결과를 바꾸는 설정 전체가 `config_hash` 에 들어간다.
+  `pano_mapping.json` 과 `extraction_manifest.json` 안의 mapping report 가 서로 모순이면 합치지
+  않고 거부한다. 해석된 설정은 `dataset/build_config.json` 에 남는다.
 * **Transactional**: `.<name>.minegs-partial` 에서 build → `Manifest.load_dataset` →
-  `consistency_issues` → `judge` → §27 수치 검사 → 그 뒤에만 rename.
+  `consistency_issues` → `judge` → §27 수치 검사 → 그 뒤에만 rename. `--overwrite` 는 이 도구가 쓴
+  dataset(`manifest.json` + `build_config.json`, 그 외 파일 없음) 만 교체한다 — 오타 난 경로가 남의
+  디렉토리를 지울 수 없어야 한다 (0B 와 같은 규칙).
 
 **Golden Gate** (`minegs dataset golden-gate DATASET --staging STAGING --out DIR`): sampled station 의 scan 을
 각 image 에 재투영한 depth/TLS-RGB overlay, 24 규약 재채점과 margin, 좌표 범위, roundtrip, holdout 누수
-재검사, `report.json`, Viser 용 LOCAL_METRIC TLS sample. `structural_result` 는 수치가 말하는 것이고
-`real_data_validation_status` 는 항상 `pending_human_inspection` 이다.
+재검사, `report.json`, Viser 용 LOCAL_METRIC TLS sample. staging tree 는 같은 E57 이라는 것으로는
+부족하고 — artifact·scan·image 가 dataset provenance 에 기록된 digest 와 **정확히** 일치해야 한다
+(재추출·재매핑한 tree 는 다른 입력이다). `structural_result` 는 수치가 말하는 것이고 실패면 report 와
+overlay 를 먼저 쓴 뒤 non-zero 로 종료한다. `real_data_validation_status` 는 항상
+`pending_human_inspection` 이다.
 
 **Gate (G2) — Golden Gate** (실데이터): 실제 0B production path (`inventory → pano-map → extract`) 로 만든
 staging 에서 dataset 을 만들고, early/middle/late 3 station 이상에서 (Matterport 라면 face 여러 장) 벽면
@@ -499,6 +512,15 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | cylindrical 을 spherical 로 | `ContractError` | 검증 없는 projection 재해석 금지 | 별도 설계 |
 | `--raw` / `--no-hash` staging tree 로 dataset build | `ContractError` | 배치 불가 / provenance 불가 | 해당 없음 (설계) |
 | init PLY 에 holdout point 잔존 | publish 거부 | manifest 필드가 아니라 실제 PLY 로 증명한다 | 해당 없음 (설계) |
+| 추출 후 바뀐 scan/image 바이트 | `ContractError` (소비 시점 재해싱) | provenance 는 실제 소비한 바이트를 기술한다 | 해당 없음 (설계) |
+| 서로 모순인 `pano_mapping.json` 과 carried mapping report | `ContractError` | 다른 이야기를 하는 두 artifact 는 합치지 않는다 | 해당 없음 (설계) |
+| 다른 source 에서 측정한 calibration artifact | `ContractError` | 다른 survey 에 대한 증거다 | 해당 없음 (설계) |
+| station 3 개 미만의 calibration | `insufficient` / `--stations < 3` 거부 | 한 station 의 규약은 규약이 아니다 | 해당 없음 (설계) |
+| RGB 없는 scan 의 자동 calibration | `ContractError` | threshold 를 넘길 수 있는 색 없는 scoring 이 없다 | 명시적 규약 (사용자 책임) |
+| centerline 끝을 넘는 holdout 구간 | `ContractError` | survey 에 없는 chainage 에 대한 주장을 연다 | 해당 없음 (설계) |
+| provenance 와 다른 staging tree 로 golden-gate | `ContractError` | 같은 E57 ≠ 같은 입력 | 해당 없음 (설계) |
+| golden-gate `structural_result=fail` | report/overlay 기록 후 exit 2 | 실패한 gate 가 성공처럼 끝나면 안 된다 | 해당 없음 (설계) |
+| `--overwrite` 대상이 이 도구의 dataset 이 아니거나 외부 파일을 포함 | `ContractError` | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
 | 이미 추출 산출물이 있는 디렉토리 (`inventory.json` 하나라도) | `ContractError` (`--overwrite` 로 교체) | 두 실행이 섞이면 구분할 수 없다 | 해당 없음 (설계) |
 | 추출기 산출물 아닌 파일이 있는 디렉토리 | `ContractError` (`--overwrite` 여도) | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
 | 대상 경로가 디렉토리가 아님 | `ContractError` | staging 은 자기 디렉토리를 요구한다 | 해당 없음 (설계) |

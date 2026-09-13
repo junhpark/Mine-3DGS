@@ -73,6 +73,7 @@ def run_golden_gate(
     max_points: int = 150_000,
     min_margin: float = DEFAULT_MIN_MARGIN,
     seed: int = 0,
+    raise_on_fail: bool = True,
 ) -> dict[str, Any]:
     ds = Path(dataset_dir)
     out = Path(out_dir)
@@ -89,11 +90,21 @@ def run_golden_gate(
         raise ContractError("build_config.json and manifest.json disagree about T_tls_from_local")
     T_local_from_source = T_tls_from_local.inverse() @ T_tls_from_source
     tree = load_staging(staging_dir)
-    if tree.source_sha256 != _source_sha_of(manifest):
+    recorded = _recorded_digests(manifest)
+    if tree.source_sha256 != recorded.get("source_e57"):
         raise ContractError(
             "the staging tree's source digest is not among the dataset's source assets; this "
             "is not the tree the dataset was built from"
         )
+    # Same E57 is not enough: a re-extracted or re-mapped tree from the same file is a
+    # different input. The artifacts must be the ones the build hashed.
+    for a in tree.artifact_assets:
+        name = Path(a.path).name
+        if recorded.get(name) != a.sha256:
+            raise ContractError(
+                f"{name} in {tree.root} is not the artifact this dataset was built from "
+                f"(provenance {str(recorded.get(name))[:12]}…, tree {a.sha256[:12]}…)"
+            )
     model = colmap_io.read_model(ds / "sparse" / "0")
     by_name = model.image_by_name()
     convention: CameraConvention | None = None
@@ -125,6 +136,7 @@ def run_golden_gate(
     test_set = set(manifest.test_images())
     for g in chosen:
         scan_id = resolved["stations"][g]["scan_id"]
+        _check_recorded(recorded, tree.scan_ply(scan_id).name, tree.verify_scan(scan_id))
         cloud = read_ply(tree.scan_ply(scan_id))
         if cloud.frame != "SOURCE":
             raise ContractError(f"{scan_id}: expected a SOURCE-frame scan, got {cloud.frame}")
@@ -163,6 +175,9 @@ def run_golden_gate(
             if pinhole and local.rgb is not None:
                 # re-score every convention from the E57 pose, independent of the dataset pose
                 image_id = name.split("_", 1)[1].rsplit(".", 1)[0]
+                _check_recorded(
+                    recorded, tree.image_path(image_id).name, tree.verify_image(image_id)
+                )
                 asset = tree.asset(image_id)
                 T_source_from_e57cam = image_pose_source_from_e57cam(asset)
                 for ci, R in enumerate(candidates):
@@ -283,11 +298,29 @@ def run_golden_gate(
     }
     out.mkdir(parents=True, exist_ok=True)
     (out / REPORT_FILE).write_text(json.dumps(report, indent=2) + "\n")
+    if problems and raise_on_fail:
+        # The diagnostics are on disk first — a failing gate must leave the evidence behind.
+        raise ContractError(
+            f"golden gate structural_result=fail ({len(problems)} problem(s); see "
+            f"{out / REPORT_FILE}): " + "; ".join(problems[:4])
+        )
     return report
 
 
-def _source_sha_of(manifest: Manifest) -> str | None:
+def _recorded_digests(manifest: Manifest) -> dict[str, str]:
+    """Provenance source assets keyed by file name (the E57 under ``source_e57``)."""
+    out: dict[str, str] = {}
     for a in manifest.provenance.source_assets:
         if a.path.endswith(".e57"):
-            return a.sha256
-    return None
+            out["source_e57"] = a.sha256
+        out[Path(a.path).name] = a.sha256
+    return out
+
+
+def _check_recorded(recorded: dict[str, str], name: str, actual: str) -> None:
+    if recorded.get(name) != actual:
+        raise ContractError(
+            f"{name} is not the file this dataset was built from (provenance "
+            f"{str(recorded.get(name))[:12]}…, tree {actual[:12]}…). A re-extracted tree from "
+            "the same E57 is a different input; rebuild the dataset or point at the original tree."
+        )

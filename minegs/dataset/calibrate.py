@@ -2,15 +2,16 @@
 
 For each of the 24 axis-aligned proper rotations, the station's own scan is projected into
 the station's own images with that rotation as ``R_e57cam_from_cam``; the rotation under
-which the projected points land on pixels of their own colour wins. The scan has RGB, so
-the comparison is direct and needs no feature matching. Where a scan has no colour, edge
-agreement between the image and the projected depth image is used instead, and the artifact
-says which.
+which the projected points land on pixels of their own colour wins. The scan must have RGB:
+the comparison is direct and needs no feature matching, and the Phase 0C baseline has no
+other scoring that can clear a threshold on its own — a scan without colour is refused
+rather than scored by a weaker signal that could never pass.
 
 One station is not evidence. The winner must be the same at ≥ 3 spatially separated
 stations (early / middle / late along the survey's principal axis — chosen from the station
-positions, never from hard-coded indices), and it must win by a margin. Anything less is
-recorded as ``ambiguous`` or ``inconsistent`` and refused by the dataset builder.
+positions, never from hard-coded indices), and it must win by a margin. Fewer than three
+eligible stations, disagreement between them, or a thin margin are recorded as
+``insufficient`` / ``inconsistent`` / ``ambiguous`` and refused by the dataset builder.
 """
 
 from __future__ import annotations
@@ -35,16 +36,12 @@ from minegs.dataset.cameras import (
     image_pose_source_from_e57cam,
     pinhole_intrinsics,
 )
-from minegs.dataset.reprojection import (
-    depth_image,
-    edge_agreement,
-    project_points,
-    rgb_residual,
-)
+from minegs.dataset.reprojection import project_points, rgb_residual
 from minegs.dataset.staging_input import StagingTree
 
 DEFAULT_MIN_MARGIN = 5.0  # RGB residual units (0-255) between best and runner-up
-DEFAULT_MIN_STATIONS = 3
+#: A calibrated convention needs this many spatially separated stations to agree (§12).
+MIN_STATIONS = 3
 
 
 @dataclass
@@ -99,67 +96,66 @@ def select_spread(positions: dict[str, np.ndarray], n: int) -> list[str]:
 
 def calibrate_camera_convention(
     tree: StagingTree,
-    n_stations: int = DEFAULT_MIN_STATIONS,
+    n_stations: int = MIN_STATIONS,
     max_points: int = 150_000,
     min_margin: float = DEFAULT_MIN_MARGIN,
     seed: int = 0,
 ) -> CameraCalibration:
+    if n_stations < MIN_STATIONS:
+        raise ContractError(
+            f"calibration samples {n_stations} station(s); a calibrated convention needs at "
+            f"least {MIN_STATIONS} spatially separated stations to agree (§12). A convention "
+            "that holds at one station and breaks at the next is not a convention."
+        )
     stations = pinhole_stations(tree)
     if not stations:
         raise ContractError(
             f"{tree.root}: no resolved pinhole images. Calibration needs pinhole images mapped "
             "to their scans (see pano_mapping.json); a spherical tree does not use this step."
         )
-    if n_stations < 1:
-        raise ContractError("n_stations must be >= 1")
     chosen = select_spread({k: v.position_source for k, v in stations.items()}, n_stations)
     notes: list[str] = []
-    if len(chosen) < DEFAULT_MIN_STATIONS:
-        notes.append(
-            f"only {len(chosen)} station(s) available; the contract asks for >= "
-            f"{DEFAULT_MIN_STATIONS} spatially separated ones (§12)"
-        )
 
     candidates = axis_aligned_rotations()
     labels = [convention_label(R) for R in candidates]
     rng = np.random.default_rng(seed)
     per_station: list[StationCalibration] = []
-    agg_rgb = np.zeros(len(candidates))
-    agg_rgb_n = np.zeros(len(candidates))
-    agg_edge = np.zeros(len(candidates))
-    agg_edge_n = np.zeros(len(candidates))
-    use_rgb = True
+    agg = np.zeros(len(candidates))
+    agg_n = np.zeros(len(candidates))
     input_hashes: dict[str, str] = {}
     sampled_images: list[str] = []
 
     for sid in chosen:
         st = stations[sid]
+        # the digest is verified against the extractor's record before the bytes are used
+        input_hashes[f"scans/{st.scan_id}.ply"] = tree.verify_scan(st.scan_id)
         cloud = read_ply(tree.scan_ply(st.scan_id))
         if cloud.frame != "SOURCE":
             raise ContractError(
                 f"{st.scan_id}: scan cloud is in frame {cloud.frame!r}, expected SOURCE"
             )
+        if cloud.rgb is None:
+            raise ContractError(
+                f"{st.scan_id}: scan has no RGB. Automatic axis-convention calibration compares "
+                "point colour with pixel colour and has no other scoring that can pass on its "
+                "own; supply the convention explicitly (camera.R_e57cam_from_cam) and take "
+                "responsibility for it, or use a scan with colour."
+            )
         if len(cloud) > max_points:
             cloud = cloud.select(np.sort(rng.choice(len(cloud), max_points, replace=False)))
-        has_rgb = cloud.rgb is not None
-        use_rgb = use_rgb and has_rgb
-        input_hashes[f"scans/{st.scan_id}.ply"] = tree.scan_output(st.scan_id).sha256 or ""
-        st_rgb = np.zeros(len(candidates))
-        st_rgb_n = np.zeros(len(candidates))
-        st_edge = np.zeros(len(candidates))
-        st_edge_n = np.zeros(len(candidates))
+        st_sum = np.zeros(len(candidates))
+        st_n = np.zeros(len(candidates))
         for image_id in st.image_ids:
             asset = tree.asset(image_id)
             intr = pinhole_intrinsics(asset)
             T_source_from_e57cam = image_pose_source_from_e57cam(asset)
-            path = tree.image_path(image_id)
-            img = np.asarray(PILImage.open(path).convert("RGB"))
+            input_hashes[f"images/{tree.image_path(image_id).name}"] = tree.verify_image(image_id)
+            img = np.asarray(PILImage.open(tree.image_path(image_id)).convert("RGB"))
             if img.shape[0] != intr.height or img.shape[1] != intr.width:
                 raise ContractError(
                     f"{image_id}: file is {img.shape[1]}x{img.shape[0]} but the E57 declares "
                     f"{intr.width}x{intr.height}"
                 )
-            input_hashes[f"images/{path.name}"] = tree.image_output(image_id).sha256 or ""
             sampled_images.append(image_id)
             K = intr.K()
             for ci, R in enumerate(candidates):
@@ -167,20 +163,14 @@ def calibrate_camera_convention(
                 proj = project_points(
                     K, T_source_from_cam.inverse(), cloud.xyz, intr.width, intr.height
                 )
-                if has_rgb:
-                    res, n = rgb_residual(img, proj, cloud.rgb)
-                    if n:
-                        st_rgb[ci] += res * n
-                        st_rgb_n[ci] += n
-                if proj.n_inside:
-                    st_edge[ci] += edge_agreement(img, depth_image(proj, intr.width, intr.height))
-                    st_edge_n[ci] += 1
-        agg_rgb += st_rgb
-        agg_rgb_n += st_rgb_n
-        agg_edge += st_edge
-        agg_edge_n += st_edge_n
-        scores = _scores(labels, st_rgb, st_rgb_n, st_edge, st_edge_n)
-        best, runner, b_s, r_s = _rank(scores, "rgb_residual" if has_rgb else "edge_agreement")
+                res, n = rgb_residual(img, proj, cloud.rgb)
+                if n:
+                    st_sum[ci] += res * n
+                    st_n[ci] += n
+        agg += st_sum
+        agg_n += st_n
+        scores = _scores(labels, st_sum, st_n)
+        best, runner, b_s, r_s = _rank(scores)
         per_station.append(
             StationCalibration(
                 station_id=sid,
@@ -195,15 +185,18 @@ def calibrate_camera_convention(
             )
         )
 
-    scoring = "rgb_residual" if use_rgb else "edge_agreement"
-    if not use_rgb:
-        notes.append("a sampled scan has no RGB: ranked by edge agreement, a weaker signal")
-    overall = _scores(labels, agg_rgb, agg_rgb_n, agg_edge, agg_edge_n)
-    best, runner, b_s, r_s = _rank(overall, scoring)
+    overall = _scores(labels, agg, agg_n)
+    best, runner, b_s, r_s = _rank(overall)
     margin = None if r_s is None else abs(r_s - b_s)
     consistent = all(s.best_label == best for s in per_station)
     status: str
-    if not consistent:
+    if len(chosen) < MIN_STATIONS:
+        status = "insufficient"
+        notes.append(
+            f"only {len(chosen)} eligible station(s) ({chosen}); a calibrated convention needs "
+            f">= {MIN_STATIONS} spatially separated stations that agree (§12)"
+        )
+    elif not consistent:
         status = "inconsistent"
         notes.append(
             "stations disagree on the best convention: "
@@ -231,7 +224,7 @@ def calibrate_camera_convention(
     return CameraCalibration(
         status=status,
         convention=convention,
-        scoring=scoring,
+        scoring="rgb_residual",
         candidates=overall,
         best_score=b_s,
         runner_up_score=r_s,
@@ -248,35 +241,22 @@ def calibrate_camera_convention(
     )
 
 
-def _scores(labels, rgb, rgb_n, edge, edge_n) -> list[CandidateScore]:
-    out = []
-    for i, label in enumerate(labels):
-        out.append(
-            CandidateScore(
-                label=label,
-                rgb_residual=float(rgb[i] / rgb_n[i]) if rgb_n[i] else None,
-                edge_agreement=float(edge[i] / edge_n[i]) if edge_n[i] else None,
-                n_points=int(rgb_n[i]),
-            )
+def _scores(labels, total, n) -> list[CandidateScore]:
+    return [
+        CandidateScore(
+            label=label,
+            rgb_residual=float(total[i] / n[i]) if n[i] else None,
+            n_points=int(n[i]),
         )
-    return out
+        for i, label in enumerate(labels)
+    ]
 
 
-def _rank(scores: list[CandidateScore], scoring: str):
-    """(best label, runner-up label, best score, runner-up score). Lower residual / higher edge."""
-    if scoring == "rgb_residual":
-        vals = [
-            (s.rgb_residual if s.rgb_residual is not None else float("inf"), s.label)
-            for s in scores
-        ]
-        vals.sort()
-    else:
-        vals = [
-            (-(s.edge_agreement if s.edge_agreement is not None else -float("inf")), s.label)
-            for s in scores
-        ]
-        vals.sort()
-        vals = [(-v, lab) for v, lab in vals]
+def _rank(scores: list[CandidateScore]):
+    """(best label, runner-up label, best score, runner-up score); lower residual wins."""
+    vals = sorted(
+        (s.rgb_residual if s.rgb_residual is not None else float("inf"), s.label) for s in scores
+    )
     best_s, best = vals[0]
     runner_s, runner = vals[1] if len(vals) > 1 else (None, None)
     return best, runner, float(best_s), (None if runner_s is None else float(runner_s))

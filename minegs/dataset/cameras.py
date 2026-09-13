@@ -256,7 +256,6 @@ class CameraTable:
 class CandidateScore(_Strict):
     label: str
     rgb_residual: float | None = None
-    edge_agreement: float | None = None
     n_points: int = 0
 
 
@@ -277,9 +276,9 @@ class CameraCalibration(VersionedModel):
 
     SCHEMA_VERSION: ClassVar[str] = "1.0"
 
-    status: Literal["selected", "ambiguous", "inconsistent"]
+    status: Literal["selected", "ambiguous", "inconsistent", "insufficient"]
     convention: CameraConvention | None = None
-    scoring: Literal["rgb_residual", "edge_agreement"]
+    scoring: Literal["rgb_residual"]
     candidates: list[CandidateScore]
     best_score: float
     runner_up_score: float | None = None
@@ -295,8 +294,20 @@ class CameraCalibration(VersionedModel):
     tool_version: str
     provenance: dict[str, Any] = Field(default_factory=dict)
 
-    def require_selected(self, path: str) -> CameraConvention:
-        """The convention a build may use. Ambiguity is refused, not resolved by first match."""
+    def require_selected(self, path: str, source_sha256: str | None = None) -> CameraConvention:
+        """The convention a build may use.
+
+        Ambiguity is refused, not resolved by first match; and the artifact must have been
+        measured on the *same source bytes* the build consumes — a convention calibrated on
+        another survey is evidence about that survey.
+        """
+        if source_sha256 is not None and self.source_sha256 != source_sha256:
+            raise ContractError(
+                f"{path}: this calibration was measured on source {self.source_sha256[:12]}…, "
+                f"but the staging tree comes from {source_sha256[:12]}…. Re-run "
+                "`minegs dataset calibrate-camera` on this tree, or declare "
+                "R_e57cam_from_cam explicitly."
+            )
         if self.status != "selected" or self.convention is None:
             worst = "; ".join(self.notes) or "no note recorded"
             raise ContractError(

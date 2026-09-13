@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -234,3 +235,101 @@ def test_explicit_split_must_assign_every_group(staging_small, build_config_smal
     cfg.split.train_groups, cfg.split.test_groups = ["S000", "S001"], ["S002"]
     with pytest.raises(ContractError, match="unassigned"):
         build_dataset(staging_small.staging_dir, tmp_path / "ds", cfg)
+
+
+# --- review round 2: bytes actually consumed, holdout extent, safe overwrite
+
+
+def _copy_staging(staging_small, tmp_path, name="s"):
+    import shutil
+
+    shutil.copytree(staging_small.staging_dir, tmp_path / name)
+    return tmp_path / name
+
+
+def _no_holdout(cfg):
+    return cfg.model_copy(deep=True, update={"geometry_holdout": None, "centerline": None})
+
+
+def test_modified_scan_bytes_are_refused(staging_small, build_config_small, tmp_path):
+    """BLOCKER 1: provenance must describe the bytes consumed, so a changed scan stops the build."""
+    stg = _copy_staging(staging_small, tmp_path)
+    with open(stg / "scans" / "scan_001.ply", "r+b") as f:
+        f.seek(-8, 2)
+        f.write(b"\xff" * 8)  # corrupt the last vertex in place
+    with pytest.raises(ContractError, match=r"scan scan_001 .* does not match the digest"):
+        build_dataset(stg, tmp_path / "ds", _no_holdout(build_config_small))
+    assert not (tmp_path / "ds").exists() and not (tmp_path / ".ds.minegs-partial").exists()
+
+
+def test_modified_image_bytes_are_refused(staging_small, build_config_small, tmp_path):
+    stg = _copy_staging(staging_small, tmp_path)
+    img = stg / "images" / "image_004.png"
+    from PIL import Image as PILImage
+
+    im = PILImage.open(img).convert("RGB")
+    im.transpose(PILImage.Transpose.FLIP_LEFT_RIGHT).save(img)  # a plausible-looking edit
+    with pytest.raises(ContractError, match=r"image image_004 .* does not match the digest"):
+        build_dataset(stg, tmp_path / "ds", _no_holdout(build_config_small))
+
+
+def test_provenance_records_the_verified_digest(dataset_small, staging_small):
+    from minegs.core.provenance import sha256_file
+
+    by_name = {Path(a.path).name: a.sha256 for a in dataset_small.manifest.provenance.source_assets}
+    for name in ("scan_000.ply", "scan_003.ply"):
+        assert by_name[name] == sha256_file(staging_small.staging_dir / "scans" / name)
+    for name in ("image_000.png", "image_017.png"):
+        assert by_name[name] == sha256_file(staging_small.staging_dir / "images" / name)
+
+
+def test_contradictory_mapping_reports_are_refused(staging_small, tmp_path):
+    from minegs.dataset.staging_input import load_staging
+
+    stg = _copy_staging(staging_small, tmp_path)
+    pm = stg / "pano_mapping.json"
+    rep = json.loads(pm.read_text())
+    # image_008 belongs to scan_001; the standalone report now claims otherwise
+    rec = next(m for m in rep["mappings"] if m["image_id"] == "image_008")
+    assert rec["scan_id"] == "scan_001"
+    rec["scan_id"], rec["station_id"] = "scan_000", "S000"
+    pm.write_text(json.dumps(rep))
+    with pytest.raises(ContractError, match="contradict each other"):
+        load_staging(stg)
+
+
+@pytest.mark.parametrize("ranges, side", [([(-3.0, 4.0)], "lower"), ([(55.0, 64.0)], "upper")])
+def test_holdout_must_lie_fully_inside_the_centerline(
+    staging_small, build_config_small, tmp_path, ranges, side
+):
+    """BLOCKER 4: a range overhanging the line would claim chainage the survey does not have."""
+    cfg = build_config_small.model_copy(deep=True)
+    cfg.geometry_holdout.ranges_m = ranges
+    with pytest.raises(ContractError, match="not fully inside the centerline extent"):
+        build_dataset(staging_small.staging_dir, tmp_path / "ds", cfg)
+    # exactly on the ends is inside
+    ext = (0.0, 60.0)
+    cfg.geometry_holdout.ranges_m = (
+        [(ext[0], ext[0] + 3.0)] if side == "lower" else [(ext[1] - 3.0, ext[1])]
+    )
+    build_dataset(staging_small.staging_dir, tmp_path / "ok", cfg)
+
+
+def test_overwrite_never_deletes_a_foreign_directory(staging_small, build_config_small, tmp_path):
+    """MAJOR 4: --overwrite replaces only a dataset this tool wrote, holding nothing else."""
+    cfg = _no_holdout(build_config_small)
+    foreign = tmp_path / "photos"
+    foreign.mkdir()
+    (foreign / "holiday.jpg").write_bytes(b"precious")
+    with pytest.raises(ContractError, match="does not own"):
+        build_dataset(staging_small.staging_dir, foreign, cfg, overwrite=True)
+    assert (foreign / "holiday.jpg").read_bytes() == b"precious"
+    out = tmp_path / "ds"
+    build_dataset(staging_small.staging_dir, out, cfg)
+    (out / "notes.txt").write_text("field notes")
+    with pytest.raises(ContractError, match="did not write"):
+        build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert (out / "notes.txt").exists()
+    (out / "notes.txt").unlink()
+    build_dataset(staging_small.staging_dir, out, cfg, overwrite=True)
+    assert Manifest.load_dataset(out).dataset_id == cfg.dataset_id

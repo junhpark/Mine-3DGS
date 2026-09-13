@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image as PILImage
-from scipy.ndimage import gaussian_filter, sobel
 
 from minegs.core.frames import SE3
 from minegs.ingest.common import colmap_io
@@ -60,25 +59,6 @@ def rgb_residual(image: np.ndarray, proj: Projection, point_rgb: np.ndarray) -> 
     px = image[v, u].astype(np.float32)
     pc = point_rgb[proj.inside].astype(np.float32)
     return float(np.mean(np.abs(px - pc))), proj.n_inside
-
-
-def edge_agreement(image: np.ndarray, depth: np.ndarray, scale: int = 4) -> float:
-    """Correlation between image edges and depth-image edges at reduced resolution (−1..1)."""
-    H, W = max(1, image.shape[0] // scale), max(1, image.shape[1] // scale)
-    g = np.asarray(PILImage.fromarray(image).convert("L").resize((W, H)), dtype=np.float64)
-    d = np.asarray(
-        PILImage.fromarray(
-            np.nan_to_num(
-                depth, nan=float(np.nanmedian(depth)) if np.isfinite(depth).any() else 0.0
-            )
-        ).resize((W, H)),
-        dtype=np.float64,
-    )
-    e1 = np.hypot(sobel(gaussian_filter(g, 1), 0), sobel(gaussian_filter(g, 1), 1))
-    e2 = np.hypot(sobel(gaussian_filter(d, 1), 0), sobel(gaussian_filter(d, 1), 1))
-    e1, e2 = e1 - e1.mean(), e2 - e2.mean()
-    denom = float(np.sqrt((e1**2).sum() * (e2**2).sum()))
-    return float((e1 * e2).sum() / denom) if denom > 0 else 0.0
 
 
 def colormap(x: np.ndarray) -> np.ndarray:

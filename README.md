@@ -206,7 +206,11 @@ minegs viz view data/tunnelA/dataset --golden-gate data/tunnelA/golden_gate
   "여러 scan/camera 를 하나의 metric survey 좌표계로 표현하는 평가 기준 프레임" 이다.
 * **LOCAL_METRIC** 은 translation-only (`R=I`, scale 1), 원점은 station centroid 를 0.1 m 로 round.
 * **Pinhole intrinsics 는 E57 이 선언한 값에서만** (`fx = focalLength / pixelWidth`); 축 규약은
-  `calibrate-camera` 가 측정하거나 config 에 명시한다 (Matterport 증거: `cam(+X,-Y,-Z)` = `diag(1,-1,-1)`).
+  `calibrate-camera` 가 **RGB 있는 scan 3 station 이상**에서 측정하거나 config 에 명시한다
+  (Matterport 증거: `cam(+X,-Y,-Z)` = `diag(1,-1,-1)`). calibration artifact 는 source digest 로
+  staging tree 에 묶인다.
+* **Provenance 는 소비한 바이트를 기술한다**: 읽는 scan/image 마다 extractor 의 digest 와 대조하고
+  불일치면 거부한다. `--overwrite` 는 이 도구가 쓴 dataset 만 교체한다.
 * **Split 은 요청될 때만**, **geometry holdout 은 centerline 이 있을 때만**. holdout 구간 point 는 실제
   좌표를 centerline 에 투영해 `init_points.ply` 와 `points3D.txt` 양쪽에서 제거되고, publish 전에 PLY 를
   다시 읽어 확인한다.

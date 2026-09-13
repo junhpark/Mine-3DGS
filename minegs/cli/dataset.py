@@ -222,7 +222,9 @@ def synthetic_staging(
 def calibrate_camera(
     staging: Path = typer.Argument(..., help="Phase 0B.3 staging tree"),
     out: Path = typer.Option(Path("camera_convention.json"), "--out"),
-    stations: int = typer.Option(3, help="spatially separated stations to sample (>= 3)"),
+    stations: int = typer.Option(
+        3, help="spatially separated stations to sample (>= 3; fewer is refused)"
+    ),
     max_points: int = typer.Option(150_000),
     min_margin: float = typer.Option(5.0, help="required lead of the best convention (RGB units)"),
 ) -> None:
@@ -311,7 +313,14 @@ def golden_gate(
     from minegs.dataset.golden_gate import run_golden_gate
 
     def go() -> None:
-        rep = run_golden_gate(dataset_dir, staging, out, n_stations=stations, max_points=max_points)
+        rep = run_golden_gate(
+            dataset_dir,
+            staging,
+            out,
+            n_stations=stations,
+            max_points=max_points,
+            raise_on_fail=False,
+        )
         console.print(
             f"structural_result=[bold]{rep['structural_result']}[/]  "
             f"real_data_validation_status={rep['real_data_validation_status']}"
@@ -324,5 +333,12 @@ def golden_gate(
             )
         console.print(f"overlays: {len(rep['overlays'])} -> {out / 'overlays'}")
         console.print(f"viser: {rep['viser']}")
+        if rep["structural_result"] != "pass":
+            from minegs.core.errors import ContractError
+
+            raise ContractError(
+                f"golden gate structural_result=fail; diagnostics written to {out} "
+                f"({len(rep['structural_problems'])} problem(s))"
+            )
 
     run_guarded(go)

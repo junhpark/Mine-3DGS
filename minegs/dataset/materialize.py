@@ -70,6 +70,22 @@ CONVENTION_FILE = "camera_convention.json"
 CENTERLINE_FILE = "centerline.csv"
 #: Camera centres may sit this far outside the TLS bounding box before §27 complains.
 CAMERA_EXTENT_MARGIN_M = 5.0
+#: A holdout interval may overhang the centerline ends by this much and still count as inside.
+HOLDOUT_EXTENT_TOL_M = 1e-6
+#: Top-level entries `from-e57` writes. --overwrite replaces a directory only if it holds
+#: nothing else: a mistyped destination must not cost someone their data (§30, Phase 0B rule).
+OWNED_ENTRIES = frozenset(
+    {
+        "manifest.json",
+        BUILD_CONFIG_FILE,
+        CONVENTION_FILE,
+        CENTERLINE_FILE,
+        "init_points.ply",
+        "images",
+        "sparse",
+        "masks",
+    }
+)
 #: Mapping states that may not enter a dataset (§14). An image in one of these is not dropped;
 #: the build stops.
 UNRESOLVED_STATUSES = ("unmapped", "ambiguous", "orphan", "conflict")
@@ -140,14 +156,14 @@ def select_stations(tree: StagingTree, representation: str) -> dict[str, Station
 # ---------------------------------------------------------------------------- convention
 
 
-def load_convention(cfg: DatasetBuildConfig) -> CameraConvention:
+def load_convention(cfg: DatasetBuildConfig, source_sha256: str) -> CameraConvention:
     cam = cfg.camera
     if cam.convention_file is not None:
         p = Path(cam.convention_file)
         if not p.is_file():
             raise ContractError(f"camera.convention_file {p} not found")
         cal = CameraCalibration.load(p)
-        return cal.require_selected(str(p)).with_label()
+        return cal.require_selected(str(p), source_sha256).with_label()
     assert cam.R_e57cam_from_cam is not None
     try:
         conv = CameraConvention(
@@ -231,6 +247,7 @@ def build_init_cloud(
     read = 0
     for gid in init_groups:
         st = stations[gid]
+        tree.verify_scan(st.scan_id)
         cloud = read_ply(tree.scan_ply(st.scan_id))
         if cloud.frame != "SOURCE":
             raise ContractError(
@@ -338,6 +355,7 @@ def build_spherical_model(
         asset = tree.asset(st.image_ids[0])
         if asset.representation != "spherical":
             raise ContractError(f"{asset.image_id}: {asset.representation} is not spherical")
+        tree.verify_image(asset.image_id)
         pano = np.asarray(PILImage.open(tree.image_path(asset.image_id)).convert("RGB"))
         T_source_from_scanner = image_pose_source_from_e57cam(asset)
         T_local_from_scanner = chain.T_local_from_source @ T_source_from_scanner
@@ -457,10 +475,29 @@ def _link_or_copy(src: Path, dst: Path, mode: str) -> None:
     shutil.copy2(src, dst)
 
 
+def check_overwrite_target(out: Path) -> None:
+    """Only a dataset this tool wrote may be replaced, and only if it holds nothing else."""
+    if not out.is_dir():
+        raise ContractError(f"{out} is not a directory")
+    entries = sorted(p.name for p in out.iterdir())
+    if "manifest.json" not in entries or BUILD_CONFIG_FILE not in entries:
+        raise ContractError(
+            f"{out} is not a dataset written by `minegs dataset from-e57` (no manifest.json + "
+            f"{BUILD_CONFIG_FILE}); refusing to replace a directory this tool does not own"
+        )
+    foreign = [e for e in entries if e not in OWNED_ENTRIES]
+    if foreign:
+        raise ContractError(
+            f"{out} holds files this tool did not write ({foreign[:6]}); move them out before "
+            "--overwrite, which would delete them"
+        )
+
+
 def _publish(tmp: Path, out: Path, overwrite: bool) -> None:
     if out.exists():
         if not overwrite:
             raise ContractError(f"{out} exists; pass --overwrite to replace it")
+        check_overwrite_target(out)
         previous = out.parent / f".{out.name}.minegs-previous"
         if previous.exists():
             raise ContractError(f"{previous} exists from an interrupted run; inspect and remove it")
@@ -488,8 +525,8 @@ def build_dataset(
     out = Path(out)
     if out.exists() and not overwrite:
         raise ContractError(f"{out} exists; pass --overwrite to replace it")
-    if out.exists() and not out.is_dir():
-        raise ContractError(f"{out} is not a directory")
+    if out.exists():
+        check_overwrite_target(out)  # before any work, and again at publication
     tmp = _partial_dir(out)
     if tmp.exists():
         raise ContractError(f"{tmp}: a partial build is already there; remove it before building")
@@ -521,7 +558,7 @@ def _build_into(
                 "implemented and is not treated as spherical (§13)"
             )
     stations = select_stations(tree, representation)
-    convention = load_convention(cfg) if representation == "pinhole" else None
+    convention = load_convention(cfg, tree.source_sha256) if representation == "pinhole" else None
 
     # ---- frames
     positions_source = np.array([st.position_source for st in stations.values()])
@@ -535,6 +572,7 @@ def _build_into(
     tls_hi = np.full(3, -np.inf)
     sample_parts = []
     for st in stations.values():
+        tree.verify_scan(st.scan_id)  # bytes actually consumed == bytes the extractor recorded
         cloud = read_ply(tree.scan_ply(st.scan_id))
         if cloud.frame != "SOURCE":
             raise ContractError(
@@ -560,9 +598,18 @@ def _build_into(
     if holdout:
         assert centerline_tls is not None
         ext = (centerline_tls.s_start, centerline_tls.s_end)
-        outside = [r for r in holdout if r[1] < ext[0] or r[0] > ext[1]]
+        # Every interval must lie *entirely* within the line: a range that pokes past the end
+        # would grant geometry/volume claims for chainage the survey does not represent.
+        outside = [
+            r
+            for r in holdout
+            if r[0] < ext[0] - HOLDOUT_EXTENT_TOL_M or r[1] > ext[1] + HOLDOUT_EXTENT_TOL_M
+        ]
         if outside:
-            raise ContractError(f"holdout ranges {outside} lie outside the centerline extent {ext}")
+            raise ContractError(
+                f"holdout ranges {outside} are not fully inside the centerline extent "
+                f"[{ext[0]:.3f}, {ext[1]:.3f}] m (tolerance {HOLDOUT_EXTENT_TOL_M} m)"
+            )
 
     # ---- split
     order = sorted(stations, key=(lambda g: (chainage[g], g)) if chainage else (lambda g: g))
@@ -580,6 +627,7 @@ def _build_into(
         model, members = build_pinhole_model(tree, stations, chain, convention, ext)
         for sid, st in stations.items():
             for image_id, name in zip(st.image_ids, members[sid], strict=True):
+                tree.verify_image(image_id)
                 _link_or_copy(tree.image_path(image_id), ds / "images" / name, cfg.images.mode)
     else:
         model, members = build_spherical_model(tree, stations, chain, cfg, ds / "images")
@@ -761,15 +809,14 @@ def _source_assets(
     for gid in sorted(set(stations)):
         st = stations[gid]
         so = tree.scan_output(st.scan_id)
-        assert so.sha256 is not None
-        assets.append(SourceAsset(path=so.path, sha256=so.sha256))
+        assets.append(SourceAsset(path=so.path, sha256=tree.verify_scan(st.scan_id)))
         for image_id in st.image_ids:
             io = tree.image_output(image_id)
-            if io.sha256 is None:
-                raise ContractError(
-                    f"image {image_id} has no digest ({io.hash_skipped_reason}); provenance cannot name it"
+            assets.append(
+                SourceAsset(
+                    path=io.path, sha256=tree.verify_image(image_id), size_bytes=io.bytes_written
                 )
-            assets.append(SourceAsset(path=io.path, sha256=io.sha256, size_bytes=io.bytes_written))
+            )
     if conv_path is not None:
         assets.append(
             SourceAsset(

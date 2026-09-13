@@ -345,3 +345,63 @@ def test_cli_phase0c_pipeline(tmp_path):
         ["dataset", "from-e57", str(root / "staging"), str(tmp_path / "d2"), "--config", str(bad)],
     )
     assert r.exit_code == 2 and "source_frame" in r.output.replace("\n", "")
+
+
+def test_cli_golden_gate_fails_loudly_on_a_wrong_convention(tmp_path):
+    """MAJOR 1: a failing gate exits non-zero, after writing its diagnostics."""
+    import json
+
+    root = tmp_path / "s"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "dataset",
+                "synthetic-staging",
+                str(root),
+                "--length-m",
+                "45",
+                "--station-spacing-m",
+                "15",
+                "--image-size",
+                "40",
+            ],
+        ).exit_code
+        == 0
+    )
+    cfg = tmp_path / "wrong.yaml"
+    cfg.write_text(
+        "schema_version: '1.0'\ndataset_id: wrong\nsource_frame: {mode: explicit_identity}\n"
+        "camera: {mode: e57_pinhole, R_e57cam_from_cam: [[1,0,0],[0,1,0],[0,0,1]]}\n"
+        "initialization: {voxel_m: 0.1, max_points: 20000, sparse_max_points: 1000}\n"
+    )
+    ds = tmp_path / "dataset"
+    r = runner.invoke(
+        app, ["dataset", "from-e57", str(root / "staging"), str(ds), "--config", str(cfg)]
+    )
+    assert r.exit_code == 0, r.output
+    gg = tmp_path / "gg"
+    r = runner.invoke(
+        app,
+        ["dataset", "golden-gate", str(ds), "--staging", str(root / "staging"), "--out", str(gg)],
+    )
+    assert r.exit_code == 2, r.output
+    out = " ".join(r.output.split())
+    assert "structural_result=fail" in out and "diagnostics written" in out
+    rep = json.loads((gg / "report.json").read_text())
+    assert rep["structural_result"] == "fail" and rep["overlays"]
+    assert all((gg / p).is_file() for p in rep["overlays"])
+    # and a calibration request with too few stations is refused at the CLI
+    r = runner.invoke(
+        app,
+        [
+            "dataset",
+            "calibrate-camera",
+            str(root / "staging"),
+            "--out",
+            str(tmp_path / "c.json"),
+            "--stations",
+            "2",
+        ],
+    )
+    assert r.exit_code == 2 and "at least 3" in " ".join(r.output.split())

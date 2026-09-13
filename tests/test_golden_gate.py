@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -152,9 +153,18 @@ def test_golden_gate_catches_a_wrong_explicit_convention(
     cfg.camera.convention_file = None
     cfg.camera.R_e57cam_from_cam = np.eye(3).tolist()  # declared, wrong
     res = build_dataset(staging_small.staging_dir, tmp_path / "ds", cfg)
-    report = run_golden_gate(res.dataset_dir, staging_small.staging_dir, tmp_path / "gg")
-    assert report["structural_result"] == "fail"
+    from minegs.core.errors import ContractError
+
+    # the gate fails loudly — but only after the diagnostics are on disk
+    with pytest.raises(ContractError, match="structural_result=fail"):
+        run_golden_gate(res.dataset_dir, staging_small.staging_dir, tmp_path / "gg")
+    report = json.loads((tmp_path / "gg" / REPORT_FILE).read_text())
+    assert report["structural_result"] == "fail" and report["overlays"]
     assert any("evidence picks cam(+X,-Y,-Z)" in p for p in report["structural_problems"])
+    same = run_golden_gate(
+        res.dataset_dir, staging_small.staging_dir, tmp_path / "gg2", raise_on_fail=False
+    )
+    assert same["structural_result"] == "fail"
 
 
 def test_select_spread_uses_position_not_index():
@@ -166,3 +176,116 @@ def test_select_spread_uses_position_not_index():
     }
     assert select_spread(pos, 3) == ["S000", "S002", "S001"]  # first, middle, last by position
     assert select_spread(pos, 2) == ["S000", "S001"]
+
+
+# --- review round 2: source-bound calibration, >= 3 stations, RGB required, exact inputs
+
+
+def _staging(tmp_path, name, **spec):
+    from minegs.core.synthetic_staging import StagingSpec, generate_staging
+
+    base = {"points_per_m": 2000, "image_size": 40}
+    base.update(spec)
+    return generate_staging(tmp_path / name, StagingSpec(**base))
+
+
+def test_calibration_from_another_source_is_refused(staging_small, build_config_small, tmp_path):
+    """BLOCKER 2: a valid artifact measured on a different survey is evidence about that survey."""
+    from minegs.core.errors import ContractError
+    from minegs.dataset.materialize import build_dataset
+
+    other = _staging(tmp_path, "other", length_m=45, station_spacing_m=15, seed=7)
+    cal = calibrate_camera_convention(load_staging(other.staging_dir))
+    assert (
+        cal.status == "selected"
+        and cal.source_sha256 != load_staging(staging_small.staging_dir).source_sha256
+    )
+    foreign = tmp_path / "foreign_convention.json"
+    cal.save(foreign)
+    cfg = build_config_small.model_copy(
+        deep=True, update={"geometry_holdout": None, "centerline": None}
+    )
+    cfg.camera.convention_file = str(foreign)
+    with pytest.raises(ContractError, match="measured on source"):
+        build_dataset(staging_small.staging_dir, tmp_path / "ds", cfg)
+    assert not (tmp_path / "ds").exists()
+
+
+@pytest.mark.parametrize("length_m, n_expected", [(20.0, 1), (30.0, 2)])
+def test_fewer_than_three_stations_cannot_select(tmp_path, length_m, n_expected):
+    """BLOCKER 3: one or two stations never yield a calibrated convention."""
+    from minegs.core.errors import ContractError
+
+    r = _staging(tmp_path, "few", length_m=length_m, station_spacing_m=15)
+    assert len(r.station_poses) == n_expected
+    cal = calibrate_camera_convention(load_staging(r.staging_dir))
+    assert cal.status == "insufficient" and cal.convention is None
+    assert len(cal.sampled_station_ids) == n_expected
+    p = tmp_path / "cal.json"
+    cal.save(p)
+    with pytest.raises(ContractError, match="insufficient"):
+        CameraCalibration.load(p).require_selected(str(p))
+
+
+def test_requesting_fewer_than_three_stations_is_refused(staging_small):
+    from minegs.core.errors import ContractError
+
+    tree = load_staging(staging_small.staging_dir)
+    for n in (1, 2):
+        with pytest.raises(ContractError, match="at least 3"):
+            calibrate_camera_convention(tree, n_stations=n)
+
+
+def test_scan_without_rgb_is_refused_for_calibration(staging_small, tmp_path):
+    """MAJOR 3: there is no colour-free scoring that can clear the threshold, so refuse."""
+    import shutil
+
+    from minegs.core.errors import ContractError
+    from minegs.core.pointcloud import PointCloud, read_ply, write_ply
+    from minegs.core.provenance import sha256_file
+
+    shutil.copytree(staging_small.staging_dir, tmp_path / "s")
+    em_path = tmp_path / "s" / "extraction_manifest.json"
+    em = json.loads(em_path.read_text())
+    for so in em["scan_outputs"]:
+        ply = tmp_path / "s" / "scans" / Path(so["path"]).name
+        pc = read_ply(ply)
+        write_ply(PointCloud(pc.xyz, None, frame="SOURCE"), ply, xyz_dtype="f8")
+        so["sha256"], so["attributes"] = sha256_file(ply), []
+    em_path.write_text(json.dumps(em))
+    with pytest.raises(ContractError, match="no RGB"):
+        calibrate_camera_convention(load_staging(tmp_path / "s"))
+
+
+def test_golden_gate_refuses_a_reextracted_tree(dataset_small, staging_small, tmp_path):
+    """MAJOR 2: same E57, different bytes — a consistent but different tree is not the input."""
+    import shutil
+
+    from minegs.core.errors import ContractError
+    from minegs.core.provenance import sha256_file
+
+    shutil.copytree(staging_small.staging_dir, tmp_path / "s")
+    scan = next((tmp_path / "s" / "scans").glob("scan_000.ply"))
+    with open(scan, "ab") as f:
+        f.write(b"\0")  # a trailing byte a PLY reader ignores, a digest does not
+    em_path = tmp_path / "s" / "extraction_manifest.json"
+    em = json.loads(em_path.read_text())
+    for so in em["scan_outputs"]:
+        if so["scan_id"] == "scan_000":
+            so["sha256"] = sha256_file(scan)
+    em_path.write_text(json.dumps(em))
+    load_staging(tmp_path / "s")  # internally consistent, and still not the build's input
+    with pytest.raises(ContractError, match=r"not the (file|artifact) this dataset was built from"):
+        run_golden_gate(dataset_small.dataset_dir, tmp_path / "s", tmp_path / "gg")
+    # scan bytes changed with the artifacts left intact: caught at consumption
+    shutil.copytree(staging_small.staging_dir, tmp_path / "s3")
+    with open(tmp_path / "s3" / "scans" / "scan_000.ply", "ab") as f:
+        f.write(b"\0")
+    with pytest.raises(ContractError, match="does not match the digest"):
+        run_golden_gate(dataset_small.dataset_dir, tmp_path / "s3", tmp_path / "gg3")
+    # and an artifact edited after the build is caught too
+    shutil.copytree(staging_small.staging_dir, tmp_path / "s2")
+    pm = tmp_path / "s2" / "pano_mapping.json"
+    pm.write_text(pm.read_text().replace("Skybox 0", "Skybox 9"))
+    with pytest.raises(ContractError, match="not the artifact this dataset was built from"):
+        run_golden_gate(dataset_small.dataset_dir, tmp_path / "s2", tmp_path / "gg2")

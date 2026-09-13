@@ -8,14 +8,23 @@ Checks that make a tree usable:
 
 * the three artifacts describe the same bytes (one ``source_sha256``), and it is present —
   a tree extracted with ``--no-hash`` cannot anchor a dataset's provenance (§21);
+* the standalone ``pano_mapping.json`` and the mapping report carried inside
+  ``extraction_manifest.json`` agree; two 0B artifacts that contradict each other are not
+  combined into one story;
 * the extraction is ``registered`` in the ``SOURCE`` frame, because the frame chain starts
   there. A ``--raw`` (SCANNER-frame) tree is refused, not re-registered here;
 * every file the manifests reference exists under the tree.
+
+And one check that happens at *consumption*: ``verify_scan`` / ``verify_image`` re-hash a
+file the first time 0C reads it and compare against the digest the extractor recorded. A
+scan or image edited after extraction is refused, and the verified digest — computed once —
+is what the dataset's provenance then records (§21). Provenance describes the bytes that
+were actually consumed, not the bytes that once were.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from minegs.core.errors import ContractError
@@ -36,6 +45,8 @@ class StagingTree:
     mapping: PanoMappingReport
     extraction: E57ExtractionManifest
     artifact_assets: list[SourceAsset]
+    #: file name -> digest, filled by ``verify_scan`` / ``verify_image`` (each file hashed once)
+    verified: dict[str, str] = field(default_factory=dict)
 
     # ---------------------------------------------------------------- lookups
     def scan_output(self, scan_id: str) -> ScanOutput:
@@ -97,6 +108,69 @@ class StagingTree:
         assert self.extraction.source_sha256 is not None  # checked in load_staging
         return self.extraction.source_sha256
 
+    # ---------------------------------------------------------------- digests at consumption
+    def _verify(self, path: Path, recorded: str | None, what: str) -> str:
+        if recorded is None:
+            raise ContractError(f"{self.root}: {what} has no recorded digest (§21)")
+        key = path.name
+        if key in self.verified:
+            return self.verified[key]
+        actual = sha256_file(path)
+        if actual != recorded:
+            raise ContractError(
+                f"{self.root}: {what} ({path.name}) does not match the digest the extractor "
+                f"recorded (recorded {recorded[:12]}…, file now {actual[:12]}…). The file was "
+                "changed after extraction; a dataset built from it could not name the bytes it "
+                "came from. Re-run the extraction."
+            )
+        self.verified[key] = actual
+        return actual
+
+    def verify_scan(self, scan_id: str) -> str:
+        """Digest of the scan file as it is *now*, checked against the extractor's record."""
+        return self._verify(
+            self.scan_ply(scan_id), self.scan_output(scan_id).sha256, f"scan {scan_id}"
+        )
+
+    def verify_image(self, image_id: str) -> str:
+        out = self.image_output(image_id)
+        if out.sha256 is None:
+            raise ContractError(
+                f"{self.root}: image {image_id} has no digest ({out.hash_skipped_reason}); "
+                "provenance cannot name it"
+            )
+        return self._verify(self.image_path(image_id), out.sha256, f"image {image_id}")
+
+
+def _mapping_reports_agree(
+    standalone: PanoMappingReport, carried: PanoMappingReport | None
+) -> list[str]:
+    """Where the two copies of the mapping story disagree. Empty means they agree."""
+    if carried is None:
+        return ["extraction_manifest.json carries no mapping report"]
+    problems: list[str] = []
+    if standalone.source_sha256 != carried.source_sha256:
+        problems.append("source_sha256 differs")
+    a_ids = {i.image_id for i in standalone.images}
+    b_ids = {i.image_id for i in carried.images}
+    if a_ids != b_ids:
+        problems.append(f"image sets differ ({sorted(a_ids ^ b_ids)[:6]})")
+    b_rec = {m.image_id: m for m in carried.mappings}
+    for m in standalone.mappings:
+        c = b_rec.get(m.image_id)
+        if c is None:
+            problems.append(f"{m.image_id}: mapped in one report only")
+        elif (m.status, m.scan_id, m.station_id) != (c.status, c.scan_id, c.station_id):
+            problems.append(
+                f"{m.image_id}: {m.status}/{m.scan_id}/{m.station_id} vs "
+                f"{c.status}/{c.scan_id}/{c.station_id}"
+            )
+    a_in = {(i.role, i.sha256) for i in standalone.mapping_inputs}
+    b_in = {(i.role, i.sha256) for i in carried.mapping_inputs}
+    if a_in != b_in:
+        problems.append("mapping inputs differ")
+    return problems
+
 
 def load_staging(path: str | Path) -> StagingTree:
     root = Path(path)
@@ -134,6 +208,13 @@ def load_staging(path: str | Path) -> StagingTree:
         raise ContractError(
             f"{root}: the three artifacts disagree about the source digest: {digests}"
         )
+    disagreements = _mapping_reports_agree(mapping, extraction.mapping_report)
+    if disagreements:
+        raise ContractError(
+            f"{root}: pano_mapping.json and the mapping report inside extraction_manifest.json "
+            f"contradict each other: {'; '.join(disagreements[:6])}. Two 0B artifacts that tell "
+            "different stories are not combined; re-run the extraction so they agree."
+        )
     for s in extraction.scan_outputs:
         if s.sha256 is None:
             raise ContractError(f"{root}: scan {s.scan_id} has no recorded digest (§21)")
@@ -147,5 +228,5 @@ def load_staging(path: str | Path) -> StagingTree:
     ]
     tree = StagingTree(root, inventory, mapping, extraction, assets)
     for s in extraction.scan_outputs:
-        tree.scan_ply(s.scan_id)  # existence
+        tree.scan_ply(s.scan_id)  # existence; the digest is checked when the scan is consumed
     return tree
