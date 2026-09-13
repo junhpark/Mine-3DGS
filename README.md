@@ -166,9 +166,10 @@ work/
 
 invalid-state 마스크는 좌표·RGB·intensity·row/column 에 **동일하게** 적용된다(길이가 다른 컬럼은
 하드 실패). 색 범위는 scan 의 `colorLimits` 에서 읽어 변환 사실을 manifest 에 남기고, 선언이
-없으면 8-bit 라고 가정하지 않고 raw 로 보존한다. 임베디드 이미지는 spherical·cylindrical 만
-꺼내며 바이트가 선언한 코덱과 맞는지 확인한다 — pinhole 등은 이유와 함께 `skipped_images` 에
-기록되고 다른 projection 으로 재해석되지 않는다.
+없으면 8-bit 라고 가정하지 않고 raw 로 보존한다. 임베디드 이미지는 spherical·cylindrical·pinhole
+을 꺼내며(쓰는 것은 blob 바이트 복사이고, pinhole 의 *해석* 은 Phase 0C 다) 바이트가 선언한 코덱과
+맞는지 확인한다 — visual-reference 등 의미가 선언되지 않은 representation 은 이유와 함께
+`skipped_images` 에 기록되고 다른 projection 으로 재해석되지 않는다.
 
 추출은 전부 성공했을 때만 publish 된다. run 은 `.<name>.minegs-partial` 임시 트리에 쓰이고
 마지막에 `work_dir` 로 rename 되므로, 40개 중 12번째 scan 에서 실패해도 "scan 12개 + manifest
@@ -182,6 +183,39 @@ invalid-state 마스크는 좌표·RGB·intensity·row/column 에 **동일하게
 pye57 에는 chunked reader 가 없어 scan 을 통째로 읽는다. 큰 scan 은 예상 peak memory 를 note 로
 알려주고 `--max-scan-points` 로 fail-closed 할 수 있다. production 규모 타일링은
 `minegs ingest e57 tiles` 의 PDAL 경로가 담당한다(PDAL C++ 라이브러리 필요; 없으면 fail-closed).
+
+## Metric dataset 과 Golden Gate (Phase 0C)
+
+0B staging tree 를 dataset 계약으로 materialize 하고, frame/camera convention 이 맞는지 **증명**한다.
+
+```bash
+minegs dataset calibrate-camera work/ --out camera_convention.json     # 24 축 규약 × 3 station, RGB residual
+minegs dataset build-config-example > build.yaml                      # 편집: source_frame, split, centerline, holdout
+minegs dataset from-e57 work/ data/tunnelA/dataset --config build.yaml
+minegs dataset validate data/tunnelA/dataset --strict
+minegs eval protocol data/tunnelA/dataset
+minegs dataset golden-gate data/tunnelA/dataset --staging work/ --out data/tunnelA/golden_gate
+minegs viz view data/tunnelA/dataset --golden-gate data/tunnelA/golden_gate
+```
+
+핵심 규칙 (docs/ROADMAP.md §Phase 0C):
+
+* **SOURCE 는 TLS_GLOBAL 이 아니다.** `source_frame.mode: explicit_identity` (이 파일의 registered
+  frame 을 survey 기준으로 채택한다는 *선언*) 또는 `explicit_transform` (4×4 SE(3)) 이 필요하다.
+  선언 없이 identity 를 고르지 않는다. `TLS_GLOBAL` 은 측지 좌표계(UTM/EPSG) 를 뜻하지 않는다 —
+  "여러 scan/camera 를 하나의 metric survey 좌표계로 표현하는 평가 기준 프레임" 이다.
+* **LOCAL_METRIC** 은 translation-only (`R=I`, scale 1), 원점은 station centroid 를 0.1 m 로 round.
+* **Pinhole intrinsics 는 E57 이 선언한 값에서만** (`fx = focalLength / pixelWidth`); 축 규약은
+  `calibrate-camera` 가 **RGB 있는 scan 3 station 이상**에서 측정하거나 config 에 명시한다
+  (Matterport 증거: `cam(+X,-Y,-Z)` = `diag(1,-1,-1)`). calibration artifact 는 source digest 로
+  staging tree 에 묶인다.
+* **Provenance 는 소비한 바이트를 기술한다**: 읽는 scan/image 마다 extractor 의 digest 와 대조하고
+  불일치면 거부한다. `--overwrite` 는 이 도구가 쓴 dataset 만 교체한다.
+* **Split 은 요청될 때만**, **geometry holdout 은 centerline 이 있을 때만**. holdout 구간 point 는 실제
+  좌표를 centerline 에 투영해 `init_points.ply` 와 `points3D.txt` 양쪽에서 제거되고, publish 전에 PLY 를
+  다시 읽어 확인한다.
+* `golden-gate` 의 `structural_result` 는 수치 검사 결과이고 `real_data_validation_status` 는 항상
+  `pending_human_inspection` 이다. G2 는 사람이 overlay 와 Viser 를 본 뒤에만 PASS 다.
 
 ## 데이터셋 계약 (§4)
 
@@ -252,7 +286,7 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 |---|---|
 | 0A Foundation & Contract Freeze | **implemented + G1 통과** |
 | 0B Real E57 ingest | **0B.1–0B.3 implemented** (inventory·증거 기반 매핑·추출), **not validated** — 실제 E57 필요 |
-| 0C Metric dataset golden gate | implemented, **not validated** (재투영 오버레이·Viser 정합 미수행) |
+| 0C Metric dataset golden gate | **implementation complete, G1 structurally tested** — 합성 staging → `from-e57` → 재투영 Golden Gate 가 CI 에서 돈다. **G2 real-data Golden Gate pending** (실제 E57 미실행) |
 | 0D Local GS baseline | implemented, **not validated** (GPU 학습 미수행). Docker `--resume` entry blocker 는 ROADMAP §Phase 0D 에 기록 |
 | 1 Metric surface & evaluation | 부분 — 양방향 지표·단면·체적 구현, surface 추출(depth/TSDF) 미구현 |
 | 2 E57 end-to-end MVP (v0.1) | 미착수 |

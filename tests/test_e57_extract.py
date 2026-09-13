@@ -913,13 +913,14 @@ def test_unsupported_representations_are_recorded_not_reinterpreted(fake_e57, tm
         ),
     )
     m = extract(path, tmp_path / "out", compute_hash=False)
-    assert m.image_outputs == []
-    assert [s.image_id for s in m.skipped_images] == ["image_000", "image_001"]
-    pinhole, unknown = m.skipped_images
-    assert pinhole.representation == "pinhole" and "unsupported" in pinhole.reason
-    assert "no perspective handling" in pinhole.reason
-    assert unknown.representation == "unknown"
-    assert not (tmp_path / "out" / "images").exists(), "nothing was written for them"
+    # A pinhole image is written like any other blob (Phase 0C interprets it); an entry whose
+    # representation nothing models is recorded and skipped, never reinterpreted.
+    assert [o.image_id for o in m.image_outputs] == ["image_000"]
+    assert m.image_outputs[0].representation == "pinhole"
+    assert [s.image_id for s in m.skipped_images] == ["image_001"]
+    (unknown,) = m.skipped_images
+    assert unknown.representation == "unknown" and "unsupported" in unknown.reason
+    assert sorted(p.name for p in (tmp_path / "out" / "images").iterdir()) == ["image_000.jpg"]
 
 
 def test_a_blob_whose_bytes_contradict_its_label_is_refused(fake_e57, tmp_path):

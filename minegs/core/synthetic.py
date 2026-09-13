@@ -219,8 +219,9 @@ def generate(root: str | Path, spec: SyntheticSpec | None = None) -> SyntheticRe
     init_cloud = PointCloud(pts_local[init_idx], rgb[init_idx], frame="LOCAL_METRIC")
     write_ply(init_cloud, ds / "init_points.ply")
 
-    # sparse points: small subsample, no tracks (synthetic)
-    sp_idx = rng.choice(len(pts_local), size=min(len(pts_local), 5000), replace=False)
+    # sparse points: a subsample of the *same* leak-free init set, no tracks (synthetic).
+    # Never the full cloud: points3D.txt must not be a second route for holdout geometry (§20).
+    sp_idx = rng.choice(init_idx, size=min(len(init_idx), 5000), replace=False)
     points3D = {
         int(i) + 1: colmap_io.Point3D(int(i) + 1, pts_local[j], rgb[j])
         for i, j in enumerate(sp_idx)
