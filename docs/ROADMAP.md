@@ -22,8 +22,8 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 |---|---|---|
 | 0A | Foundation & Contract Freeze | **implemented, G1 통과** — PR #1 이 closeout |
 | 0B | Real E57 Ingest | **0B.1·0B.2·0B.3 implemented** (inventory·매핑·추출), **not validated** — 실제 E57 필요 |
-| 0C | Metric Dataset Golden Gate | implemented, **not validated** — Golden Gate 미수행 |
-| 0D | Local GS Baseline | **0D.1 resume safety contract implemented + structurally tested**. **0D.2 not run** — 실제 GPU 학습 미수행. 0D 전체는 **NOT COMPLETE** (§0D) |
+| 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2 real-data Golden Gate pending** |
+| 0D | Local GS Baseline | **0D.1 resume safety contract implemented + structurally tested**. **0D.2 not run** — 실제 GPU 학습 미수행이며 Phase 0C G2 통과 전에는 시작 금지. 0D 전체는 **NOT COMPLETE** (§0D) |
 | 1 | Metric Surface & Evaluation | 부분 implemented (지표·단면·체적), surface 추출 미구현 |
 | 2 | E57 End-to-End MVP | 미착수 |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
@@ -204,16 +204,83 @@ minegs ingest e57 extract   REAL.e57 output/
 
 ### Phase 0C — Metric Dataset Golden Gate
 
-E57 point cloud · 파노라마 · 카메라 pose · LOCAL_METRIC 좌표가 실제 공간에서 일치함을 검증한다.
+E57 point cloud · 카메라 pose · 이미지 · LOCAL_METRIC 좌표가 실제 공간에서 일치함을 증명한다.
+데이터셋을 만드는 것이 목적이 아니라 **frame/camera convention 이 맞다는 것을 증명**하는 것이 목적이다.
 
-**범위**: 파노라마 규약, equirect → ring crop, 합성 intrinsics, station pose → COLMAP,
-데이터셋 계약 생성, `init_points.ply`, TLS_GLOBAL ↔ LOCAL_METRIC, Viser 정합, 재투영 오버레이.
+```
+E57 SOURCE  --explicit SE(3)-->  TLS_GLOBAL  --deterministic origin-->  LOCAL_METRIC
+                                                                           |
+                                          COLMAP cameras + images + leak-free TLS init
+```
 
-**Gate (G2) — Golden Gate**: 실제 TLS 포인트를 파노라마에 재투영했을 때 벽면 edge, 파이프,
-케이블, 갱도 경계, 식별 가능한 물체가 영상과 정렬된다. Viser 에서 TLS · camera frustum ·
-initialization point 가 동일 공간에서 일치한다.
+**상태**: `Phase 0C implementation complete · G1 structurally tested · G2 real-data Golden Gate pending`.
+실제 E57 은 아직 이 경로로 실행하지 않았다. G2 는 사람이 오버레이와 Viser 를 보는 검사를 포함하며,
+자동 점수 하나로 PASS 하지 않는다.
 
-**이 Gate 가 실패하면 Phase 0D 로 이동하지 않는다.**
+**입력**: Phase 0B.3 staging tree (`inventory.json` · `pano_mapping.json` · `extraction_manifest.json` ·
+`scans/` · `images/`). 원본 E57 을 다시 해석하지 않는다. `--raw`(SCANNER 프레임) 트리와 `--no-hash`
+트리는 거부한다 — 전자는 배치할 수 없고, 후자는 provenance 를 세울 수 없다.
+
+**구현** (`minegs/dataset/`, `minegs dataset from-e57 STAGING OUT --config build.yaml`):
+
+* **SOURCE 는 TLS_GLOBAL 이 아니다.** `source_frame.mode` 가 `explicit_identity` 또는
+  `explicit_transform` 이어야 하고, 둘 다 사용자의 선언이다. 선언 없는 identity 는 없다. 반사(det −1),
+  scale, 비강체 행렬은 거부한다. `TLS_GLOBAL` 의 GLOBAL 은 측지 CRS 가 아니라 "여러 scan/camera 를
+  하나의 metric survey 좌표계로 표현하는 평가 기준 프레임" 이다 (ARCHITECTURE §3).
+* **LOCAL_METRIC 은 translation-only.** `R = I`, scale 1. 원점은 `station_centroid_rounded`
+  (station 위치 centroid 를 0.1 m 로 round) 또는 `explicit`. 같은 입력·설정이면 같은 변환이다.
+* **Pinhole camera path 가 primary** (실제 Matterport Pro3 E57 = 121 scan × 6 pinhole face, 4096²).
+  intrinsics 는 E57 `pinholeRepresentation` 이 선언한 `focalLength / pixelWidth / pixelHeight /
+  principalPointX/Y` 에서만 온다 (`fx = focalLength / pixelWidth`). 하나라도 없으면 거부.
+  FOV·focal·principal point 를 추측하지 않는다. 파일명(`Skybox 3`)과 index 는 orientation 근거가 아니다.
+* **축 규약은 측정한다.** `minegs dataset calibrate-camera STAGING` 이 24 개 axis-aligned proper
+  rotation 을 station 자신의 scan 을 station 자신의 image 에 투영해 RGB residual 로 채점하고,
+  spatially separated **3 station 이상**(principal axis 기준 early/middle/late, index hard-code 아님)
+  에서 같은 후보가 margin 이상으로 이기면 `camera_convention.json` 에 `selected` 로 기록한다.
+  station 이 3 개 미만이면 `insufficient`, 불일치면 `inconsistent`, margin 부족이면 `ambiguous` 이고
+  builder 는 모두 거부한다. scan 에 RGB 가 없으면 calibration 자체를 거부한다 — 색 없이 threshold 를
+  넘길 수 있는 scoring 은 baseline 에 없으므로, 그 경우는 `R_e57cam_from_cam` 을 명시하는 사용자
+  책임 경로만 남는다. artifact 는 `source_sha256` 으로 staging tree 에 묶이며, 다른 survey 에서 측정한
+  artifact 는 유효해도 거부된다. 규약은 `R_e57cam_from_cam` (E57 image frame ← COLMAP camera frame)
+  으로 저장되며, PR #3 의 Matterport 증거 `diag(1,−1,−1)` = `cam(+X,−Y,−Z)` 는 default 가 아니라
+  명시적 설정 또는 calibration 결과로만 들어온다.
+* **COLMAP pose 는 방향이 이름에 있다**: `T_local_from_cam = T_local_from_tls @ T_tls_from_source @
+  T_source_from_e57cam @ R_e57cam_from_cam`.
+* **Capture group** = resolved mapping 이 확정한 `image → scan → station` 하나당 `tls_station` 하나.
+  `unmapped / ambiguous / orphan / conflict` 이미지가 하나라도 있으면 드롭하지 않고 build 를 거부한다.
+* **Split** 은 요청될 때만 (`test_every` 또는 명시 목록). 아무것도 없으면 reconstruction-only.
+* **Geometry holdout** 은 centerline 이 있을 때만, 그리고 모든 구간이 centerline 범위 **안에 완전히**
+  들어갈 때만 (`s_start ≤ lo < hi ≤ s_end`, 1e-6 m 허용) — 끝을 넘는 구간은 survey 에 없는 chainage 에
+  대한 형상 주장을 열어 준다. holdout 구간 point 는 **실제 좌표를 centerline 에 투영해** init 에서 제거하고, `points3D.txt` 는 **같은** leak-free 집합의 subsample 이다. 쓰고 난
+  PLY 를 다시 읽어 holdout 안에 point 가 없음을 확인한 뒤에야 publish 한다.
+* **Spherical path** 는 기존 `RingCropSpec`/`PanoConvention` 재사용. cylindrical 은 spherical 로
+  처리하지 않고 거부한다.
+* **Provenance 는 실제로 소비한 바이트를 기술한다.** 0C 가 읽는 scan/image 는 소비 시점에 다시 해싱해
+  extractor 가 기록한 digest 와 비교하고(불일치 = 거부, 파일당 한 번만 해싱), 그 검증된 digest 가
+  `source_assets` 에 들어간다. source E57 · 0B artifact 3개 · mapping input · camera convention ·
+  centerline · config 파일도 전부 포함되며, 결과를 바꾸는 설정 전체가 `config_hash` 에 들어간다.
+  `pano_mapping.json` 과 `extraction_manifest.json` 안의 mapping report 가 서로 모순이면 합치지
+  않고 거부한다. 해석된 설정은 `dataset/build_config.json` 에 남는다.
+* **Transactional**: `.<name>.minegs-partial` 에서 build → `Manifest.load_dataset` →
+  `consistency_issues` → `judge` → §27 수치 검사 → 그 뒤에만 rename. `--overwrite` 는 이 도구가 쓴
+  dataset(`manifest.json` + `build_config.json`, 그 외 파일 없음) 만 교체한다 — 오타 난 경로가 남의
+  디렉토리를 지울 수 없어야 한다 (0B 와 같은 규칙).
+
+**Golden Gate** (`minegs dataset golden-gate DATASET --staging STAGING --out DIR`): sampled station 의 scan 을
+각 image 에 재투영한 depth/TLS-RGB overlay, 24 규약 재채점과 margin, 좌표 범위, roundtrip, holdout 누수
+재검사, `report.json`, Viser 용 LOCAL_METRIC TLS sample. staging tree 는 같은 E57 이라는 것으로는
+부족하고 — artifact·scan·image 가 dataset provenance 에 기록된 digest 와 **정확히** 일치해야 한다
+(재추출·재매핑한 tree 는 다른 입력이다). `structural_result` 는 수치가 말하는 것이고 실패면 report 와
+overlay 를 먼저 쓴 뒤 non-zero 로 종료한다. `real_data_validation_status` 는 항상
+`pending_human_inspection` 이다.
+
+**Gate (G2) — Golden Gate** (실데이터): 실제 0B production path (`inventory → pano-map → extract`) 로 만든
+staging 에서 dataset 을 만들고, early/middle/late 3 station 이상에서 (Matterport 라면 face 여러 장) 벽면
+edge · 갱도 경계 · 파이프/케이블 · 표지/물체 · 천장/바닥 방향 · scanner 위치 · 좌우 일관성이 overlay 와
+정렬되고, Viser 에서 TLS ≈ init cloud, frustum 이 실제 station 위에, 시선이 갱도 영상과 맞는다.
+PR #3 의 one-off exporter 출력은 G2 증거가 아니다.
+
+**이 Gate 가 실패하면 Phase 0D.2 로 이동하지 않는다.** 잘못된 convention 으로 GPU 를 돌리는 것은 시간 낭비다.
 
 ### Phase 0D — Local GS Baseline
 
@@ -513,7 +580,27 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `unreadable`/`invalid` pose 의 추출 | `E57PoseUnusableError` | 깨진 pose 를 identity 로 대체하지 않는다 | 해당 없음 (설계) |
 | 길이가 다른 point/attribute 컬럼 | `ContractError` | 한쪽을 잘라 맞추면 속성이 엉뚱한 점에 붙는다 | 해당 없음 (설계) |
 | 선언한 코덱과 다른 image blob | `ContractError` / `skipped` | 내용으로 포맷을 추측하지 않는다 | 해당 없음 (설계) |
-| 미지원 image representation | `skipped_images` 에 이유 기록 | 다른 projection 으로 재해석하지 않는다 | Phase 0C |
+| 미지원 image representation (visual-reference, unknown) | `skipped_images` 에 이유 기록 | 다른 projection 으로 재해석하지 않는다 | 해당 없음 (설계) |
+| 선언 없는 SOURCE → TLS_GLOBAL | build config 검증 실패 | identity 도 사용자의 선언이어야 한다 (0C §5) | 해당 없음 (설계) |
+| 반사·scale·비강체 `T_tls_from_source` | `ContractError` | 거울 프레임은 모든 카메라의 좌우를 뒤집는다 | 해당 없음 (설계) |
+| E57 pinhole intrinsic 누락 | `ContractError` | FOV/focal/principal point 를 추측하지 않는다 | 해당 없음 (설계) |
+| image pose 없음/비단위 quaternion | `ContractError` | 파일명·index 는 orientation 근거가 아니다 | 해당 없음 (설계) |
+| camera convention 미선언·미측정 | build config 검증 실패 | 추측한 축 규약으로 학습하면 수렴까지 하고 결과만 무의미하다 | 해당 없음 (설계) |
+| calibration `ambiguous`/`inconsistent` | `ContractError` | 근거가 하나를 특정하지 못한다 | 해당 없음 (설계) |
+| `unmapped/ambiguous/orphan/conflict` 이미지가 dataset 입력에 존재 | `ContractError` (드롭 아님) | 조용히 빠진 face 는 아무도 모른다 | 해당 없음 (설계) |
+| centerline 없는 geometry holdout | build config 검증 실패 | scan 순서는 chainage 가 아니다 | 해당 없음 (설계) |
+| cylindrical 을 spherical 로 | `ContractError` | 검증 없는 projection 재해석 금지 | 별도 설계 |
+| `--raw` / `--no-hash` staging tree 로 dataset build | `ContractError` | 배치 불가 / provenance 불가 | 해당 없음 (설계) |
+| init PLY 에 holdout point 잔존 | publish 거부 | manifest 필드가 아니라 실제 PLY 로 증명한다 | 해당 없음 (설계) |
+| 추출 후 바뀐 scan/image 바이트 | `ContractError` (소비 시점 재해싱) | provenance 는 실제 소비한 바이트를 기술한다 | 해당 없음 (설계) |
+| 서로 모순인 `pano_mapping.json` 과 carried mapping report | `ContractError` | 다른 이야기를 하는 두 artifact 는 합치지 않는다 | 해당 없음 (설계) |
+| 다른 source 에서 측정한 calibration artifact | `ContractError` | 다른 survey 에 대한 증거다 | 해당 없음 (설계) |
+| station 3 개 미만의 calibration | `insufficient` / `--stations < 3` 거부 | 한 station 의 규약은 규약이 아니다 | 해당 없음 (설계) |
+| RGB 없는 scan 의 자동 calibration | `ContractError` | threshold 를 넘길 수 있는 색 없는 scoring 이 없다 | 명시적 규약 (사용자 책임) |
+| centerline 끝을 넘는 holdout 구간 | `ContractError` | survey 에 없는 chainage 에 대한 주장을 연다 | 해당 없음 (설계) |
+| provenance 와 다른 staging tree 로 golden-gate | `ContractError` | 같은 E57 ≠ 같은 입력 | 해당 없음 (설계) |
+| golden-gate `structural_result=fail` | report/overlay 기록 후 exit 2 | 실패한 gate 가 성공처럼 끝나면 안 된다 | 해당 없음 (설계) |
+| `--overwrite` 대상이 이 도구의 dataset 이 아니거나 외부 파일을 포함 | `ContractError` | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
 | 이미 추출 산출물이 있는 디렉토리 (`inventory.json` 하나라도) | `ContractError` (`--overwrite` 로 교체) | 두 실행이 섞이면 구분할 수 없다 | 해당 없음 (설계) |
 | 추출기 산출물 아닌 파일이 있는 디렉토리 | `ContractError` (`--overwrite` 여도) | 오타 난 경로가 데이터를 지울 수 없어야 한다 | 해당 없음 (설계) |
 | 대상 경로가 디렉토리가 아님 | `ContractError` | staging 은 자기 디렉토리를 요구한다 | 해당 없음 (설계) |
