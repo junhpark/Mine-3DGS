@@ -289,7 +289,7 @@ PR #3 의 one-off exporter 출력은 G2 증거가 아니다.
 | 하위 | 범위 | 상태 |
 |---|---|---|
 | **0D.1** | resume safety contract — silent restart 경로 제거, gsplat resume 능력 독립 확인, fail-closed 거부 | **implemented + structurally tested** |
-| **0D.2** | 실제 GPU baseline (중단 없는 단일 학습) | **미수행** |
+| **0D.2** | 실제 GPU baseline (중단 없는 단일 학습) | **미수행 — Phase 0C G2 통과 전 시작 금지** |
 | **0D.3** | MineGS 소유 resumable trainer & checkpoint contract | **보류 — 필요할 때만** |
 
 **Phase 0D entry blocker — Docker `--resume`.** PR #1 검증에서 확인된 문제이며 0D 시작 시
@@ -350,6 +350,10 @@ Mine-3DGS 가 완전한 training state 를 복원할 수 있는 trainer/checkpoi
 때까지 보류한다 (0D.3).
 
 #### Phase 0D.2 — 실제 GPU baseline (미수행)
+
+**진입 조건**: Phase 0C **G2 real-data Golden Gate 가 PASS 한 뒤에만** 시작한다. 프레임·카메라
+convention 이 실제 데이터에서 확인되지 않은 상태로 GPU 를 돌리면, 학습이 성공해도 그 결과가
+무엇을 뜻하는지 말할 수 없다. 0D.2 는 별도 PR 로 진행한다 (`phase-0d2-real-gpu-baseline`).
 
 **범위**: pinned GPU docker image, gsplat v1.5.3 executable contract, LocalRunner,
 light profile, staging, checkpoint/output, LOCAL_METRIC 출력 정규화 계약.
