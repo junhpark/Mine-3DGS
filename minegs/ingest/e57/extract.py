@@ -95,10 +95,12 @@ _CONSUMED = set(CARTESIAN_FIELDS + SPHERICAL_FIELDS + RGB_FIELDS) | {
     "sphericalInvalidState",
 }
 
-#: Image representations Phase 0B.3 writes out. Pinhole and visual-reference images are
-#: recorded and skipped: handling them means perspective geometry, which this phase does not
-#: have (no crop, no cube map, no COLMAP camera, no undistortion).
-SUPPORTED_IMAGE_REPRESENTATIONS = PANORAMA_REPRESENTATIONS
+#: Image representations Phase 0B.3 writes out. Writing an image is a byte copy of its blob
+#: whatever the projection, so pinhole images (a Matterport cube face, say) are written like
+#: panoramas; *interpreting* them — intrinsics, pose, axis convention, COLMAP camera — is
+#: Phase 0C (``minegs.dataset``). Visual-reference and unknown representations are recorded
+#: and skipped: nothing states what their pixels mean.
+SUPPORTED_IMAGE_REPRESENTATIONS = PANORAMA_REPRESENTATIONS | {"pinhole"}
 
 _BLOB_SUFFIX = {"jpegImage": ".jpg", "pngImage": ".png"}
 _BLOB_MAGIC = {"jpegImage": b"\xff\xd8\xff", "pngImage": b"\x89PNG\r\n\x1a\n"}
@@ -778,9 +780,9 @@ def _image_results(
                     image_id=asset.image_id,
                     representation=asset.representation,
                     reason=(
-                        f"unsupported: {asset.representation} images are not written in Phase "
-                        "0B.3, which has no perspective handling (no crop, cube map, COLMAP "
-                        "camera or undistortion). The entry is recorded, not reinterpreted"
+                        f"unsupported: {asset.representation} images are not written, because "
+                        "nothing declares how their pixels project. The entry is recorded, "
+                        "not reinterpreted"
                     ),
                     mapping_status=rec.status,
                 )
