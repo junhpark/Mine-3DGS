@@ -92,6 +92,31 @@ def test_resume_request_fails_before_the_trainer_and_leaves_no_run_directory(
     assert not run_dir.exists()
 
 
+@pytest.mark.parametrize("target", ["", "."])
+def test_a_resume_target_that_names_nothing_is_still_a_resume_request(
+    synthetic, tmp_path, no_exec, target
+):
+    """A guard on truthiness would let ``resume_from=""`` through into a fresh run.
+
+    That is the silent restart in its purest form: the user asked to continue something, and got
+    an iteration-0 run recorded under a new id instead. No CLI value produces it today — typer
+    renders ``--resume-from ""`` as ``Path(".")`` — but the refusal must not rest on that.
+    """
+    run_dir = tmp_path / "runs" / target.strip(".") or tmp_path / "runs" / "child"
+    r = get_runner("local", RunnerConfig(runner="local", native=True))
+    with pytest.raises(ContractError, match="does not support resuming training"):
+        r.submit(
+            RunConfig(
+                dataset_dir=str(synthetic.dataset_dir),
+                profile="light",
+                run_dir=str(run_dir),
+                resume_from=target,
+            )
+        )
+    assert no_exec.calls == []
+    assert not run_dir.exists()
+
+
 def test_a_backend_declaring_resume_still_has_nowhere_to_resume_from():
     """Deliberately unimplemented rather than partially implemented.
 

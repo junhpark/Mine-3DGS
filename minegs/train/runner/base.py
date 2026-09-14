@@ -166,7 +166,12 @@ class Runner(ABC):
                 from minegs.core.frames import SE3
 
                 T_tls_from_local = SE3.from_matrix(chunk.T_tls_from_local)
-        if run.resume_from:
+        # `is not None`, not truthiness: resume_from="" is still a resume *request*, and one
+        # that names nothing is the least honourable of all — under a truthiness test it would
+        # fall through to a fresh iteration-0 run, which is the exact silent restart this phase
+        # exists to forbid. No CLI value can produce it today (typer renders --resume-from ""
+        # as Path(".")), but the guard should not depend on that.
+        if run.resume_from is not None:
             refuse_resume(backend)
         run_dir.mkdir(parents=True, exist_ok=True)
         record = RunRecord(
