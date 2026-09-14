@@ -198,3 +198,43 @@ def test_a_fresh_run_never_picks_up_a_checkpoint_lying_around(
     argv = no_exec.calls[-1]
     assert not any(a.startswith("--ckpt") for a in argv)
     assert Path(run_dir / "run.json").exists()
+
+
+def test_the_printed_train_command_is_the_command_that_runs(synthetic, tmp_path, monkeypatch):
+    """``shlex.join`` is only half of it: rich must then print the string verbatim.
+
+    Wrapped to the console width, ``console.print`` emits *real* newlines, so pasting the output
+    runs the first line alone — and the first line of a gsplat invocation is a runnable training
+    command that has lost ``--no-normalize_world_space`` and ``--max_steps``. A long dataset path
+    is folded mid-token. A value containing brackets is read as rich markup and partly deleted.
+    Each one makes the printed line a different command from the one that runs, which is the very
+    failure ``shlex.join`` was chosen to prevent — so this asserts a round trip against the real
+    argv rather than matching a substring, which is what let the wrapping through.
+    """
+    import shlex as _shlex
+
+    from minegs.cli.main import app
+    from minegs.train.backends.gsplat import GsplatBackend
+    from typer.testing import CliRunner
+
+    monkeypatch.setenv("COLUMNS", "60")  # narrow enough that any wrapping would show
+    pf = tmp_path / "p.yaml"
+    pf.write_text(
+        'schema_version: "1.0"\nname: p\nbackend: gsplat\nmax_steps: 10\n'
+        # markup, and whitespace: both must survive into the printed line
+        'backend_args:\n  tag: "[bold red]drift 3[/]"\n'
+    )
+    out_dir = Path("/data/run/backend_out")  # the CLI default
+    r = CliRunner().invoke(
+        app, ["train", "command", str(synthetic.dataset_dir), "--profile", str(pf)]
+    )
+    assert r.exit_code == 0, r.output
+    printed = r.output.splitlines()[0]
+
+    expected = (
+        GsplatBackend()
+        .build_command(synthetic.dataset_dir, out_dir, load_profile(str(pf)), check_trainer=False)
+        .argv
+    )
+    assert _shlex.split(printed) == expected, printed
+    assert "[bold red]drift 3[/]" in printed

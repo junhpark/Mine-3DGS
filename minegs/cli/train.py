@@ -46,7 +46,15 @@ def command(
         cmd = be.build_command(dataset_dir, out_dir, prof, check_trainer=False)
         # shlex.join, not " ".join: a value containing whitespace would otherwise print as two
         # arguments, so the line a reader copies would not be the command that runs.
-        console.print(shlex.join(cmd.argv))
+        #
+        # ...and then printed verbatim, which rich does not do by default. Wrapped to the console
+        # width it emits real newlines, so pasting the output runs the first line as a command of
+        # its own — a *runnable* training command that has quietly lost --no-normalize_world_space
+        # and --max_steps. A long enough dataset path is folded mid-token. And a value containing
+        # brackets is parsed as rich markup and partly deleted, so the printed --tag is not the
+        # --tag that runs. soft_wrap keeps it one line, markup=False keeps the value, and
+        # highlight=False keeps rich from colouring what is meant to be copied.
+        console.print(shlex.join(cmd.argv), soft_wrap=True, markup=False, highlight=False)
         console.print(
             f"[dim]data_dir above is the staged dataset at run time; "
             f"max_images={prof.max_images} applied by staging[/]"
