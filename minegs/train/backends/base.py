@@ -30,6 +30,8 @@ class BackendCapabilities:
     mcmc_strategy: bool = False
     pose_refinement: bool = False
     depth_render: bool = False  # can export depth maps (needed for GS -> surface, §1.7)
+    # Can *continue training* from a checkpoint. Loading weights for evaluation is not resume:
+    # a run that starts its schedule at iteration 0 is a different experiment (§0D.1).
     resume: bool = False
 
     def has(self, name: str) -> bool:
@@ -71,10 +73,16 @@ class TrainBackend(ABC):
         dataset_dir: Path,
         out_dir: Path,
         profile: Profile,
-        resume: bool = False,
         **kwargs: object,
     ) -> TrainCommand:
-        """``dataset_dir`` is the *staged* dataset written by ``minegs.train.staging``."""
+        """``dataset_dir`` is the *staged* dataset written by ``minegs.train.staging``.
+
+        There is no resume parameter. No shipped backend can continue training, and the shape a
+        resume argument should take is part of the checkpoint contract that does not exist yet
+        (docs/ROADMAP.md §Phase 0D) — freezing one now around gsplat's ``--ckpt`` would fix the
+        interface to a backend that cannot honour it. ``--resume-from`` is refused in
+        ``Runner.prepare`` instead, before a command is built.
+        """
 
     @abstractmethod
     def normalize_outputs(

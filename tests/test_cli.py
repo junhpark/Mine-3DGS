@@ -405,3 +405,54 @@ def test_cli_golden_gate_fails_loudly_on_a_wrong_convention(tmp_path):
         ],
     )
     assert r.exit_code == 2 and "at least 3" in " ".join(r.output.split())
+
+
+def test_cli_resume_target_is_explicit_and_fails_closed(tmp_path):
+    """--resume-from names a run; a target that cannot be honoured is an error, not a fresh run."""
+    r = runner.invoke(app, ["train", "run", "--help"])
+    assert r.exit_code == 0 and "--resume-from" in r.output
+    # the removed boolean must not linger as a silently-accepted alias
+    assert "--resume " not in r.output and "--no-resume" not in r.output
+    root = tmp_path / "syn"
+    assert (
+        runner.invoke(
+            app,
+            [
+                "dataset",
+                "synthetic",
+                str(root),
+                "--length-m",
+                "45",
+                "--n-stations",
+                "3",
+                "--image-size",
+                "32",
+            ],
+        ).exit_code
+        == 0
+    )
+    r = runner.invoke(
+        app,
+        [
+            "train",
+            "run",
+            str(root / "dataset"),
+            "--profile",
+            "light",
+            "--native",
+            "--resume-from",
+            str(tmp_path / "runs" / "does-not-exist"),
+        ],
+    )
+    # Exit 2, a contract error, and a message that says what to do about it. The refusal comes
+    # from the backend declaring it cannot resume, not from the missing directory: gsplat v1.5.3
+    # cannot continue training at all, so nothing looks the target up (docs/ROADMAP.md §Phase 0D).
+    # Whitespace-normalised because rich wraps to the terminal width, and an assertion that
+    # depends on COLUMNS tests the environment rather than the contract.
+    out = " ".join(r.output.split())
+    assert r.exit_code == 2
+    assert "does not support resuming training" in out
+    assert "evaluation only" in out and "Phase 0D" in out
+    # ...and the refusal happens before anything is written: this invocation used the default
+    # run directory (<dataset>/../runs/<run_id>), the path every real user takes.
+    assert not (root / "runs").exists()

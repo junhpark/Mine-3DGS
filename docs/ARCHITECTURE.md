@@ -264,8 +264,13 @@ RunHandle.status() / .logs() / .fetch_artifacts()
 * `LocalRunner` — `docker run --gpus all minegs:gpu@sha256:...`. CUDA 없으면 거부하고
   RunPod 저가 GPU 라우팅 제안.
 * `RunPodRunner` — 파드 생성(네트워크 볼륨) → `sync.push`(dataset 만) → 엔트리 →
-  폴링 → `sync.pull`(ply·로그) → 종료. 체크포인트는 볼륨에, `--resume`.
+  폴링 → `sync.pull`(ply·로그) → 종료.
 * 두 러너의 GPU 이미지 digest 는 동일. run.json 에 기록.
+* **Training resume 은 구현되어 있지 않다.** `--resume-from` 은 명시적 옵션으로 존재하지만
+  `Runner.prepare` 에서 항상 거부되며, 이는 trainer 실행 이전이자 run directory 생성 이전이다.
+  gsplat v1.5.3 은 학습을 이어붙일 수 없고 (`--ckpt` = evaluation only), 진짜 resume 은 완전한
+  training state 를 복원하는 checkpoint contract 를 요구한다 — Phase 0D.3, ROADMAP 참조.
+  재시작은 "조금 느린 resume" 이 아니라 다른 실험이므로 fail closed 한다.
 
 ### 8.3 프로파일
 | | light | heavy |

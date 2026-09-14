@@ -83,8 +83,10 @@ class LocalRunner(Runner):
             "init_points": staged.init_points,
             "sha256": sha256_tree(staged.path, ("sparse/0/*.txt", "images/**/*", "masks/**/*")),
         }
+        # No resume branch here on purpose: --resume-from is refused in Runner.prepare, before
+        # this method runs and before the run directory exists (docs/ROADMAP.md §Phase 0D).
         if self.config.native:
-            cmd = backend.build_command(staged.path, work, profile, resume=run.resume)
+            cmd = backend.build_command(staged.path, work, profile)
             argv = cmd.argv
         else:
             if not docker_available():
@@ -99,7 +101,6 @@ class LocalRunner(Runner):
                 Path("/data/run/staged"),
                 Path("/data/run/backend_out"),
                 profile,
-                resume=run.resume,
                 check_trainer=False,  # the trainer lives inside the image
             )
             argv = [

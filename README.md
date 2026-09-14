@@ -287,7 +287,7 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 | 0A Foundation & Contract Freeze | **implemented + G1 통과** |
 | 0B Real E57 ingest | **0B.1–0B.3 implemented** (inventory·증거 기반 매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C Metric dataset golden gate | **implementation complete, G1 structurally tested** — 합성 staging → `from-e57` → 재투영 Golden Gate 가 CI 에서 돈다. **G2 real-data Golden Gate pending** (실제 E57 미실행) |
-| 0D Local GS baseline | implemented, **not validated** (GPU 학습 미수행). Docker `--resume` entry blocker 는 ROADMAP §Phase 0D 에 기록 |
+| 0D Local GS baseline | **0D.1 resume safety contract: implemented + structurally tested** — gsplat v1.5.3 training resume 은 unsupported 이고 fail closed. **0D.2 real GPU baseline 미수행, Phase 0C G2 통과 전에는 시작 금지** → 0D 전체 **NOT COMPLETE** (ROADMAP §Phase 0D) |
 | 1 Metric surface & evaluation | 부분 — 양방향 지표·단면·체적 구현, surface 추출(depth/TSDF) 미구현 |
 | 2 E57 end-to-end MVP (v0.1) | 미착수 |
 | 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |

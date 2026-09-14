@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import typer
@@ -43,7 +44,17 @@ def command(
         be = get_backend(backend)
         prof = load_profile(profile)
         cmd = be.build_command(dataset_dir, out_dir, prof, check_trainer=False)
-        console.print(" ".join(cmd.argv))
+        # shlex.join, not " ".join: a value containing whitespace would otherwise print as two
+        # arguments, so the line a reader copies would not be the command that runs.
+        #
+        # ...and then printed verbatim, which rich does not do by default. Wrapped to the console
+        # width it emits real newlines, so pasting the output runs the first line as a command of
+        # its own — a *runnable* training command that has quietly lost --no-normalize_world_space
+        # and --max_steps. A long enough dataset path is folded mid-token. And a value containing
+        # brackets is parsed as rich markup and partly deleted, so the printed --tag is not the
+        # --tag that runs. soft_wrap keeps it one line, markup=False keeps the value, and
+        # highlight=False keeps rich from colouring what is meant to be copied.
+        console.print(shlex.join(cmd.argv), soft_wrap=True, markup=False, highlight=False)
         console.print(
             f"[dim]data_dir above is the staged dataset at run time; "
             f"max_images={prof.max_images} applied by staging[/]"
@@ -66,11 +77,23 @@ def run(
     backend: str = typer.Option("gsplat"),
     config: Path | None = typer.Option(None, help="configs/runner/*.yaml"),
     native: bool = typer.Option(False, help="local: run in this python env instead of docker"),
-    resume: bool = typer.Option(False),
+    resume_from: Path | None = typer.Option(
+        None,
+        "--resume-from",
+        help="continue an existing run: path to runs/<run_id>. NOT IMPLEMENTED — neither the "
+        "runner (no checkpoint discovery, no host/container path translation) nor any shipped "
+        "backend (gsplat v1.5.3 cannot continue training) can honour it, so it always fails "
+        "closed rather than silently restarting from iteration 0 (Phase 0D.3, docs/ROADMAP.md).",
+    ),
     chunk: str | None = typer.Option(None),
     wait: bool = typer.Option(False),
 ) -> None:
-    """Submit a training run. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8)."""
+    """Submit a training run. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8).
+
+    --resume-from names a parent run explicitly, and always fails closed today: neither the
+    runner nor any shipped backend implements resuming, and a restart from iteration 0 is a
+    different experiment, not a slower resume (docs/ROADMAP.md §Phase 0D).
+    """
     from minegs.train.backends import get_backend
     from minegs.train.profiles import load_profile
     from minegs.train.runner import RunConfig, get_runner
@@ -93,7 +116,7 @@ def run(
                 profile=profile,
                 backend=backend,
                 runner=rname,
-                resume=resume,
+                resume_from=str(resume_from) if resume_from else None,
                 chunk_id=chunk,
             )
         )

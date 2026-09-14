@@ -25,6 +25,19 @@ Phase 0A/0D refuses two requests outright rather than supporting them partially:
   tracks, and TLS-initialised staging replaces ``points3D`` with ``init_points.ply`` and
   clears those tracks (``minegs.train.staging``). Depth supervision is redesigned in Phase 4.
 
+A third refusal is forced by the pinned trainer itself: **v1.5.3 cannot resume training.**
+``Config.ckpt`` is documented upstream as *"Path to the .pt files. If provide, it will skip
+training and run evaluation only."*, and ``main()`` branches on it — ``if cfg.ckpt is not
+None:`` runs ``eval``/``render_traj`` and returns, ``else:`` runs ``train()``. ``train()``
+sets ``init_step = 0`` unconditionally and never loads a checkpoint, and the saved ``.pt``
+holds only ``{"step", "splats"}`` (plus pose/appearance modules) — no optimizer moments and
+no densification-strategy state. So there is no combination of upstream flags that continues
+a run: passing ``--ckpt`` alongside training arguments produces an *evaluation* pass on the
+parent's weights, which is neither the requested experiment nor a visible failure. This
+adapter therefore declares ``resume=False``, and ``--resume-from`` is refused before a command
+is built. Resuming would need a trainer and checkpoint that restore the whole training state
+(Phase 0D.3, docs/ROADMAP.md); Phase 0D.2 runs its baseline uninterrupted instead.
+
 ``T_local_from_internal`` is therefore identity on every command this adapter builds, and
 ``run.json`` records it explicitly.
 """
@@ -60,6 +73,17 @@ DEPTH_LOSS_REFUSAL = (
     "init_points.ply as points3D and clears image point3D_ids). This capability is deferred "
     "to Phase 4 (docs/ROADMAP.md); set requests.depth_loss: false to run this profile."
 )
+RESUME_REFUSAL = (
+    f"gsplat v{PINNED_GSPLAT}'s examples/simple_trainer.py cannot continue training from a "
+    "checkpoint: --ckpt is documented as 'If provide, it will skip training and run evaluation "
+    "only', main() runs eval instead of train() whenever it is set, train() starts at "
+    "init_step = 0 unconditionally, and the saved .pt carries only step and splats (no "
+    "optimizer or densification-strategy state). Passing --ckpt to a training run would "
+    "silently produce an evaluation pass on the parent's weights rather than a continuation, "
+    "so this adapter refuses resume instead of appearing to support it. Resuming would need a "
+    "trainer and checkpoint that restore the whole training state — optimizer, schedulers, "
+    "strategy state, step, RNG (Phase 0D.3, docs/ROADMAP.md)."
+)
 
 
 def locate_trainer(require: bool = True) -> Path | None:
@@ -77,25 +101,49 @@ def locate_trainer(require: bool = True) -> Path | None:
 
 
 # Options whose *enabled* form must never appear in an assembled command, whatever route
-# (capability request, raw backend_args, future edit) tried to put it there.
-REFUSED_FLAGS = {"depth_loss": DEPTH_LOSS_REFUSAL, "normalize_world_space": NORMALIZE_REFUSAL}
+# (capability request, raw backend_args, future edit) tried to put it there. ``ckpt`` is here
+# because a backend_args entry would otherwise be forwarded verbatim by the passthrough loop
+# and turn the run into an evaluation pass (see RESUME_REFUSAL) with no error anywhere.
+REFUSED_FLAGS = {
+    "depth_loss": DEPTH_LOSS_REFUSAL,
+    "normalize_world_space": NORMALIZE_REFUSAL,
+    "ckpt": RESUME_REFUSAL,
+}
+
+
+def canonical_option(raw: object) -> str:
+    """One spelling per option, for a ``backend_args`` key and an assembled token alike.
+
+    A refusal that matches one spelling of a flag is not a refusal. tyro (gsplat's CLI parser)
+    accepts ``--depth-loss`` and ``--depth_loss`` alike, so hyphens fold to underscores; and a
+    key written with its dashes already attached — ``backend_args: {"--ckpt": ...}`` — used to be
+    emitted as ``--__ckpt`` and sail past a guard keyed on ``ckpt``, so leading dashes come off
+    too. Surrounding whitespace is stripped for the same reason: ``{"ckpt ": ...}`` rendered as
+    ``--ckpt <path>`` in the printed command while matching nothing. Leading underscores go the
+    same way, so the guard still recognises a token like ``--__ckpt`` however it was produced; no
+    gsplat option name begins with one.
+    """
+    return str(raw).strip(" \t\r\n-_").replace("-", "_")
 
 
 def _assert_no_refused_flags(argv: list[str]) -> None:
     """Last line of defence: scan the assembled argv, not just the inputs that built it."""
     for token in argv:
-        if not token.startswith("--"):
+        if not token.startswith("-"):
             continue
-        name = token[2:].split("=", 1)[0].replace("-", "_")
+        name = canonical_option(token.split("=", 1)[0])
         if name.startswith("no_"):  # --no-<opt> disables it; that is the safe direction
             continue
-        if name in REFUSED_FLAGS:
-            raise ContractError(REFUSED_FLAGS[name])
+        # Case-folded because REFUSED_FLAGS is lower-case and no gsplat option is not: matching
+        # only the exact case would let ``--CKPT`` through a guard whose whole job is to be the
+        # spelling-independent one.
+        if name.casefold() in REFUSED_FLAGS:
+            raise ContractError(REFUSED_FLAGS[name.casefold()])
 
 
 class GsplatBackend(TrainBackend):
     name = "gsplat"
-    capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL}
+    capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL, "resume": RESUME_REFUSAL}
 
     def __init__(self, trainer: Path | None = None) -> None:
         self._trainer = trainer
@@ -121,7 +169,8 @@ class GsplatBackend(TrainBackend):
             mcmc_strategy=True,
             pose_refinement=True,
             depth_render=True,
-            resume=True,
+            # v1.5.3 has no resume path at all; see RESUME_REFUSAL and the module docstring.
+            resume=False,
         )
 
     def build_command(
@@ -129,18 +178,24 @@ class GsplatBackend(TrainBackend):
         dataset_dir: Path,
         out_dir: Path,
         profile: Profile,
-        resume: bool = False,
         trainer: Path | None = None,
         check_trainer: bool = True,
     ) -> TrainCommand:
         """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
         enabled = self.resolve_requests(profile)
-        # tyro (gsplat's CLI parser) accepts --depth-loss and --depth_loss alike, so a hyphen
-        # spelling in backend_args would otherwise slip past the refusals below and be forwarded
-        # verbatim by the passthrough loop. Canonicalise to underscores first: one key, one guard.
+        # Canonicalise every backend_args key first, so the refusals below and the argv scan at
+        # the end are comparing the same thing the user wrote (see ``canonical_option``): one
+        # key, one guard. Without this a refused option smuggled in under a second spelling is
+        # forwarded verbatim by the passthrough loop.
         args: dict[str, object] = {}
         for raw_key, value in profile.backend_args.items():
-            key = str(raw_key).replace("-", "_")
+            key = canonical_option(raw_key)
+            if not key or any(c.isspace() for c in key):
+                raise ContractError(
+                    f"backend_args key {raw_key!r} is not an option name. A key with inner "
+                    "whitespace cannot be passed as a flag, and a command printed with one reads "
+                    "as two arguments."
+                )
             if key in args:
                 raise ContractError(
                     f"backend_args has two spellings of the same option ({raw_key!r} collides with "
@@ -195,14 +250,6 @@ class GsplatBackend(TrainBackend):
                 argv += [f"--{k}", *[str(x) for x in v]]
             else:
                 argv += [f"--{k}", str(v)]
-        if resume:
-            ck = (
-                sorted((out_dir / "ckpts").glob("ckpt_*.pt"))
-                if (out_dir / "ckpts").exists()
-                else []
-            )
-            if ck:
-                argv += ["--ckpt", str(ck[-1])]
         _assert_no_refused_flags(argv)
         # identity by construction: normalisation is refused above (BACKEND_INTERNAL == LOCAL_METRIC)
         return TrainCommand(

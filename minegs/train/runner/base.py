@@ -73,7 +73,11 @@ class RunConfig(VersionedModel):
     profile: str = "light"
     backend: str = "gsplat"
     runner: str = "local"
-    resume: bool = False
+    # The run directory to continue from. Explicit because a boolean could not say *which* run
+    # it meant — run ids are minted per submission — and an ambiguous target is one that can
+    # quietly become a fresh run. No shipped backend can resume training, so setting this always
+    # fails closed today; see ``Runner.prepare`` and docs/ROADMAP.md §Phase 0D.
+    resume_from: str | None = None
     chunk_id: str | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
 
@@ -151,7 +155,6 @@ class Runner(ABC):
         if not run.run_dir:
             run.run_dir = str(dataset_dir.parent / "runs" / run.run_id)
         run_dir = Path(run.run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
         T_tls_from_local = manifest.T_tls_from_local
         if run.chunk_id:
             if manifest.chunks is None:
@@ -163,6 +166,14 @@ class Runner(ABC):
                 from minegs.core.frames import SE3
 
                 T_tls_from_local = SE3.from_matrix(chunk.T_tls_from_local)
+        # `is not None`, not truthiness: resume_from="" is still a resume *request*, and one
+        # that names nothing is the least honourable of all — under a truthiness test it would
+        # fall through to a fresh iteration-0 run, which is the exact silent restart this phase
+        # exists to forbid. No CLI value can produce it today (typer renders --resume-from ""
+        # as Path(".")), but the guard should not depend on that.
+        if run.resume_from is not None:
+            refuse_resume(backend)
+        run_dir.mkdir(parents=True, exist_ok=True)
         record = RunRecord(
             run_id=run.run_id,
             dataset_id=manifest.dataset_id,
@@ -180,6 +191,36 @@ class Runner(ABC):
     @staticmethod
     def write_record(record: RunRecord, run_dir: Path) -> Path:
         return record.save(run_dir / "run.json")
+
+
+def refuse_resume(backend: Any) -> None:
+    """``--resume-from`` always fails closed today, before the run directory exists.
+
+    A restart from iteration 0 is not a slow resume, it is a different experiment recorded
+    under a run id that claims to continue another one — so the only safe answer to a resume
+    request no backend can honour is a refusal, never a fresh run.
+
+    Two refusals, in order. The first is the one users hit: no shipped backend continues
+    training, and gsplat v1.5.3 in particular turns ``--ckpt`` into an evaluation pass (see
+    ``minegs.train.backends.gsplat``), so the adapter declares ``resume=False`` and this raises
+    with that reason. The second covers a backend that *does* declare the capability: resuming
+    needs a checkpoint contract that restores the whole training state — optimizer, schedulers,
+    strategy state, step, RNG — and Mine-3DGS does not own one yet. Deliberately not a partial
+    implementation: a resume that silently drops optimizer state is a different experiment too.
+    """
+    from minegs.core.errors import NotYetImplementedError
+
+    if not backend.capabilities().has("resume"):
+        note = backend.capability_notes.get("resume", "")
+        raise ContractError(
+            f"backend {backend.name} does not support resuming training, so --resume-from "
+            f"cannot be honoured. {note}".strip()
+        )
+    raise NotYetImplementedError(
+        f"resuming a run (--resume-from) with backend {backend.name}: checkpoint discovery, "
+        "host/container path translation and parent-run compatibility are not implemented",
+        "0D.3",
+    )
 
 
 def load_record(run_dir: str | Path) -> RunRecord:

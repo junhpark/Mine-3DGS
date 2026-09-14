@@ -23,7 +23,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 0A | Foundation & Contract Freeze | **implemented, G1 통과** — PR #1 이 closeout |
 | 0B | Real E57 Ingest | **0B.1·0B.2·0B.3 implemented** (inventory·매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2 real-data Golden Gate pending** |
-| 0D | Local GS Baseline | implemented (어댑터·스테이징·러너), **not validated** — GPU 학습 미수행. **entry blocker 있음** (§0D) |
+| 0D | Local GS Baseline | **0D.1 resume safety contract implemented + structurally tested**. **0D.2 not run** — 실제 GPU 학습 미수행이며 Phase 0C G2 통과 전에는 시작 금지. 0D 전체는 **NOT COMPLETE** (§0D) |
 | 1 | Metric Surface & Evaluation | 부분 implemented (지표·단면·체적), surface 추출 미구현 |
 | 2 | E57 End-to-End MVP | 미착수 |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
@@ -284,12 +284,13 @@ PR #3 의 one-off exporter 출력은 G2 증거가 아니다.
 
 ### Phase 0D — Local GS Baseline
 
-실제 소구간을 로컬 GPU 에서 gsplat baseline 으로 끝까지 학습한다. 두 단계로 나눈다.
+실제 소구간을 로컬 GPU 에서 gsplat baseline 으로 끝까지 학습한다.
 
-| 하위 | 범위 |
-|---|---|
-| **0D.1** | LocalRunner, Docker staging, checkpoint path mapping, `--resume`, fail-closed missing checkpoint |
-| **0D.2** | 실제 GPU baseline, checkpoint 생성, 중단, resume, 이어붙임 검증 |
+| 하위 | 범위 | 상태 |
+|---|---|---|
+| **0D.1** | resume safety contract — silent restart 경로 제거, gsplat resume 능력 독립 확인, fail-closed 거부 | **implemented + structurally tested** |
+| **0D.2** | 실제 GPU baseline (중단 없는 단일 학습) | **미수행 — Phase 0C G2 통과 전 시작 금지** |
+| **0D.3** | MineGS 소유 resumable trainer & checkpoint contract | **보류 — 필요할 때만** |
 
 **Phase 0D entry blocker — Docker `--resume`.** PR #1 검증에서 확인된 문제이며 0D 시작 시
 **가장 먼저** 해결한다. 0B.2–0B.3 PR 에서는 고치지 않는다.
@@ -299,20 +300,102 @@ PR #3 의 one-off exporter 출력은 G2 증거가 아니다.
 > namespace. A requested but missing checkpoint must fail closed; silent restart from
 > iteration 0 is forbidden.
 
-현재 Docker 학습 경로는 container 안의 checkpoint 경로를 host 에서 검사하기 때문에 체크포인트를
-찾지 못하고, `--resume` 을 요청해도 조용히 iteration 0 부터 다시 시작할 수 있다. 요청한
-체크포인트가 없으면 fail-closed 여야 한다 — 재시작은 "조금 느린 resume" 이 아니라 다른 실험이다.
+당시 Docker 학습 경로는 container 안의 checkpoint 경로를 host 에서 검사했기 때문에 체크포인트를
+찾지 못하고, `--resume` 을 요청해도 조용히 iteration 0 부터 다시 시작할 수 있었다. 재시작은
+"조금 느린 resume" 이 아니라 다른 실험이다.
+
+#### Phase 0D.1 — resume safety contract (완료)
+
+Phase 0D.1 resume safety contract: **implemented + structurally tested.**
+gsplat v1.5.3 training resume is unsupported and fails closed.
+
+0D.1 이 실제로 보장하는 것은 다음 여섯 가지다.
+
+* 이전의 silent restart 경로를 제거했다. `if resume: glob(out_dir/"ckpts")` 는 사라졌다.
+* gsplat 의 training resume 능력을 upstream 소스로 **독립 확인**했다 (아래).
+* `GsplatBackend` 는 `resume=False` 를 선언한다.
+* resume 요청은 fail closed — `--resume-from` 은 `Runner.prepare` 에서 거부되고, 이는
+  trainer 실행 이전이자 **child run directory 생성 이전**이다.
+* raw `--ckpt` 가 학습 run 을 eval-only 로 바꿀 수 없다. `backend_args` 를 통한 경로도 포함해
+  조립된 argv 를 스캔해서 거부하며, **철자에 의존하지 않는다** — key 와 argv token 을 같은
+  규칙으로 정규화하므로 `--ckpt`, `-ckpt`, `ckpt `, `CKPT` 가 모두 같은 거부에 걸린다. 한 가지
+  철자만 잡는 거부는 거부가 아니다.
+* fresh command 에는 checkpoint 인자가 없다. run directory 안에 우연히 checkpoint 가 있어도
+  자동 resume 하지 않는다 — resume 은 요청되는 것이지 추론되는 것이 아니다.
+
+**주장하지 않는 것**: host/container resume 실행은 production capability 로 검증되지 않았다.
+generic LocalRunner resume 은 구현되어 있지 않다. resume 가능한 backend 가 capability flag 만
+켜면 되는 상태도 아니다 — checkpoint contract 자체가 아직 없다 (0D.3).
+
+`--resume-from` 은 미래 인터페이스를 명확히 하기 위해 CLI 에 남아 있으나, 오늘은 항상 실패한다.
+
+**gsplat v1.5.3 은 training 을 resume 할 수 없다** — upstream `examples/simple_trainer.py`
+(sha256 `79319e1cd7404e4d1ba0c425634235c39e6054f0643b904a01feea6179462c05`, pinned image 가
+clone 하는 것과 동일) 확인 결과:
+
+* `Config.ckpt` docstring: *"Path to the .pt files. If provide, it will skip training and run
+  evaluation only."*
+* `main()` 은 `if cfg.ckpt is not None:` 이면 `eval`/`render_traj` 만 하고 끝나고, 아니면
+  `train()` 을 부른다. 둘은 **상호 배타적**이다.
+* `train()` 은 `init_step = 0` 을 무조건 설정하고 checkpoint 를 전혀 읽지 않는다.
+* 저장되는 `.pt` 에는 `step` 과 `splats` (+ pose/appearance 모듈) 만 있다. optimizer moment 도,
+  densification strategy 상태도 없다.
+
+학습 argv 에 `--ckpt` 를 넣으면 학습이 아니라 parent 가중치에 대한 **evaluation pass** 가
+실행되며 아무 오류도 나지 않는다. 그래서 거부한다.
+
+**PO/architect 결정 (채택: (a)).** gsplat v1.5.3 용 training resume 은 구현하지 않는다.
+0D.2 는 중단 없는 단일 학습으로 첫 실제 GPU baseline 을 검증한다. 진짜 중단-이어붙임은
+Mine-3DGS 가 완전한 training state 를 복원할 수 있는 trainer/checkpoint contract 를 소유할
+때까지 보류한다 (0D.3).
+
+#### Phase 0D.2 — 실제 GPU baseline (미수행)
+
+**진입 조건**: Phase 0C **G2 real-data Golden Gate 가 PASS 한 뒤에만** 시작한다. 프레임·카메라
+convention 이 실제 데이터에서 확인되지 않은 상태로 GPU 를 돌리면, 학습이 성공해도 그 결과가
+무엇을 뜻하는지 말할 수 없다. 0D.2 는 별도 PR 로 진행한다 (`phase-0d2-real-gpu-baseline`).
 
 **범위**: pinned GPU docker image, gsplat v1.5.3 executable contract, LocalRunner,
 light profile, staging, checkpoint/output, LOCAL_METRIC 출력 정규화 계약.
 
 **원칙**: `normalize_world_space=false`, BACKEND_INTERNAL = LOCAL_METRIC.
 
-**Gate (G2)**: 실제 갱도 소구간 학습 성공 — trainer 가 실행되고, 설정한 step 까지 도달하고,
-PLY 가 생성되고, PLY 좌표 범위가 물리적으로 타당하고, 출력 프레임이 LOCAL_METRIC 이며,
-TLS_GLOBAL 로 변환했을 때 입력 TLS 와 겹친다.
+**Gate (G2)** — 중단 없는 단일 학습으로 다음 10 항목을 모두 확인한다.
+
+1. pinned GPU image 를 빌드/사용한다 (`image@sha256:...`).
+2. 작은 실제 또는 합성 갱도 구간으로 학습 job 을 실행한다.
+3. CUDA / runtime 을 확인한다.
+4. checkpoint 생성을 확인한다.
+5. 예상한 training iteration 진행을 확인한다.
+6. 생성된 PLY 를 확인한다.
+7. BACKEND_INTERNAL → LOCAL_METRIC 계약을 확인한다.
+8. `run.json` / provenance 를 확인한다.
+9. runtime 과 GPU memory 를 기록한다.
+10. 시각적·과학적 sanity check 를 수행한다.
+
+기존의 "중단 → resume → 이어붙임" gate 는 0D.3 으로 연기한다.
 
 GPU smoke 를 통과하지 않으면 Phase 0D 완료라고 하지 않는다.
+
+#### Phase 0D.3 — MineGS-owned resumable trainer & checkpoint contract (보류)
+
+진짜 resume 이 필요해진 경우에만 착수한다. 구현 **이전에** checkpoint 가 최소한 다음을 담도록
+정의해야 한다.
+
+* model / splats
+* optimizer states
+* LR scheduler states
+* densification strategy state
+* current training step
+* pose / appearance / bilateral optimization state (활성화된 경우)
+* 관련 RNG state
+* checkpoint schema version
+* trainer / backend version
+
+Cross-version checkpoint migration 은 명시적으로 설계되기 전까지 지원하지 않으며 fail closed
+한다. 이 계약이 정의되기 전에 checkpoint 이름 규칙(`ckpt_<iteration>.pt`,
+`ckpt_<iteration>_rank<n>.pt`)이나 `--ckpt` 같은 gsplat 고유 가정 위에 generic resume API 를
+고정하지 않는다.
 
 ### Phase 1 — Metric Surface & Evaluation
 
@@ -400,7 +483,8 @@ image → point observation track 을 사용한다. 현재 staging 은 `init_poi
 infrastructure 이므로 로컬 scientific workflow 가 안정화된 뒤 구현한다.
 
 **범위**: 동일 GPU 이미지 digest, dataset-only 업로드, network volume, pod-side staging,
-resume, checkpoint, **exit-code 기반 status**, artifact 동기화 복귀, provenance, GPU 타입 기록.
+checkpoint, **exit-code 기반 status**, artifact 동기화 복귀, provenance, GPU 타입 기록.
+resume 은 Phase 6 범위가 아니다 — runner 와 무관하게 Phase 0D.3 이다 (§Phase 0D).
 
 **현재 상태**: `RunPodRunner.submit` 은 외부 호출 전에 `NotYetImplementedError` 를 던진다.
 필요한 단계는 `minegs/train/runner/runpod.py` docstring 에 있다. 특히 이전 스케치에 없던
@@ -532,7 +616,10 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | 남아 있는 임시 트리 안의 외부 파일 | `ContractError` | 이 도구가 쓰지 않은 것은 지우지 않는다 | 해당 없음 (설계) |
 | E57 의 orphan association 을 사용자 매핑이 덮어씀 | `conflict` (scan_id 없음) | target 이 없다고 진술이 없는 것은 아니다 | 명시적 override 정책 (미설계) |
 | 결과를 바꾸는 입력이 provenance 에 없음 | E57·매핑 파일·vendor manifest·외부 이미지 전부 hash | 재현할 수 없는 결과는 근거가 아니다 | 해당 없음 (설계) |
-| Docker `--resume` 의 없는 checkpoint | (미구현) 현재 iteration 0 재시작 가능 | **Phase 0D entry blocker** — §Phase 0D | Phase 0D.1 |
+| gsplat 에 `--resume-from` | `ContractError` (upstream 근거 인용, run directory 생성 이전) | v1.5.3 은 학습을 이어붙일 수 없다 — §Phase 0D | Phase 0D.3 (보류) |
+| resume=true 를 선언하는 backend 에 `--resume-from` | `NotYetImplementedError` (Phase 0D.3) | 완전한 training state 를 복원하는 checkpoint contract 가 아직 없다 | Phase 0D.3 (보류) |
+| `backend_args` 로 들어온 `ckpt` (모든 철자) | `ContractError` | 학습이 아니라 evaluation pass 가 조용히 실행된다 | 해당 없음 (설계) |
+| option name 이 될 수 없는 `backend_args` key (내부 공백) | `ContractError` | flag 로 넘길 수 없고, 출력된 command 에서는 인자 두 개로 읽힌다 | 해당 없음 (설계) |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |
 | `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 4 |
