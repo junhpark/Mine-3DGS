@@ -7,6 +7,7 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from minegs.core.errors import MinegsError
 
@@ -16,6 +17,17 @@ err_console = Console(stderr=True)
 EXIT_CONTRACT = 2
 EXIT_PROTOCOL = 3
 EXIT_MISSING_DEP = 4
+
+
+def _report(label: str, e: BaseException) -> None:
+    """Print ``label`` as markup and the message verbatim.
+
+    Interpolating the message into the markup string let rich parse it too, and an error whose
+    remedy is ``pip install 'minegs[e57]'`` reads ``[e57]`` as a style tag and deletes it — so
+    the one line telling the user how to fix their install told them to run a command that does
+    nothing. Every remedy this CLI prints names an extra in brackets.
+    """
+    err_console.print(label, escape(str(e)))
 
 
 def run_guarded(fn, *args, **kwargs):
@@ -30,16 +42,16 @@ def run_guarded(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except ProtocolViolation as e:
-        err_console.print(f"[bold red]protocol violation:[/] {e}")
+        _report("[bold red]protocol violation:[/]", e)
         raise typer.Exit(EXIT_PROTOCOL) from None
     except MissingDependencyError as e:
-        err_console.print(f"[bold yellow]missing dependency:[/] {e}")
+        _report("[bold yellow]missing dependency:[/]", e)
         raise typer.Exit(EXIT_MISSING_DEP) from None
     except NotYetImplementedError as e:
-        err_console.print(f"[bold yellow]not yet:[/] {e}")
+        _report("[bold yellow]not yet:[/]", e)
         raise typer.Exit(EXIT_MISSING_DEP) from None
     except (ContractError, MinegsError) as e:
-        err_console.print(f"[bold red]error:[/] {e}")
+        _report("[bold red]error:[/]", e)
         raise typer.Exit(EXIT_CONTRACT) from None
 
 

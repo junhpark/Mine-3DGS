@@ -220,7 +220,16 @@ def run_golden_gate(
         problems.append(f"init_points frame is {init.frame}")
     tls_lo, tls_hi = (np.array(b) for b in resolved["tls_bounds_local_metric"])
     imin, imax = init.bounds()
-    if np.any(imin < tls_lo - 1e-6) or np.any(imax > tls_hi + 1e-6):
+    # Compare at the precision the file is stored at. ``init_points.ply`` holds float32 while
+    # these bounds were accumulated in float64 from the same clouds, so the extreme point that
+    # *defined* a bound comes back rounded — by up to one float32 ulp, ~4e-6 m at survey-scale
+    # LOCAL_METRIC coordinates, several times the geometric slack. Compared in float64 this
+    # measured which way the write rounded rather than where the points are, and whether it
+    # fired depended on how many points survived the voxel filter: a run of 339k passed and a
+    # run of 509k failed on the same scene. Rounding the bounds the same way makes the check
+    # deterministic and keeps it about geometry.
+    lo32, hi32 = tls_lo.astype(np.float32), tls_hi.astype(np.float32)
+    if np.any(imin.astype(np.float32) < lo32) or np.any(imax.astype(np.float32) > hi32):
         problems.append("init point bounds exceed the TLS bounds")
     centres = np.array([im.center for im in model.images.values()])
     if not np.all(np.isfinite(centres)):

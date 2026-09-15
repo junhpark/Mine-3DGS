@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from minegs.cli.main import app
 from typer.testing import CliRunner
 
@@ -456,3 +457,44 @@ def test_cli_resume_target_is_explicit_and_fails_closed(tmp_path):
     # ...and the refusal happens before anything is written: this invocation used the default
     # run directory (<dataset>/../runs/<run_id>), the path every real user takes.
     assert not (root / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    ("exc_factory", "needle"),
+    [
+        (lambda: _dep("pye57", "e57", "reading E57 files"), "pip install 'minegs[e57]'"),
+        (lambda: _dep("viser", "viz", "the web viewer"), "pip install 'minegs[viz]'"),
+        (lambda: _contract("holdout [20.0, 26.0] is outside"), "[20.0, 26.0]"),
+    ],
+)
+def test_an_error_message_reaches_the_user_with_its_brackets_intact(capsys, exc_factory, needle):
+    """Rich must not parse the error text: every install remedy names an extra in brackets.
+
+    ``pip install 'minegs[e57]'`` rendered as ``pip install 'minegs'`` — rich read ``[e57]`` as
+    a style tag and dropped it, so the one line telling the user how to fix their install told
+    them to run a command that changes nothing.
+    """
+    import typer
+    from minegs.cli._common import run_guarded
+
+    exc = exc_factory()
+
+    def boom():
+        raise exc
+
+    with pytest.raises(typer.Exit):
+        run_guarded(boom)
+    printed = " ".join(capsys.readouterr().err.split())  # rich wraps to the terminal width
+    assert needle in printed, printed
+
+
+def _dep(module: str, extra: str, purpose: str):
+    from minegs.core.errors import MissingDependencyError
+
+    return MissingDependencyError(module, extra, purpose)
+
+
+def _contract(message: str):
+    from minegs.core.errors import ContractError
+
+    return ContractError(message)

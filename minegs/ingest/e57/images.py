@@ -202,7 +202,12 @@ def discover_embedded_images(path: str | Path) -> list[ImageAsset]:
             ) from e
         assets: list[ImageAsset] = []
         for i in range(count):
-            node = images.get(i)
+            # ``images[i]``, never ``images.get(i)``: pye57 binds ``get`` to the raw C++
+            # signature, which returns a base node, and only ``__getitem__`` runs the result
+            # through ``cast_node``. Off a base node every field read below raises and is
+            # caught, so a perfectly good Matterport image reads as an entry declaring nothing
+            # — representation unknown, no guid, no association, no blob.
+            node = images[i]
             rep, rep_node_name = classify_representation(node)
             details = _representation_details(node, rep_node_name)
             issues: list[str] = []
