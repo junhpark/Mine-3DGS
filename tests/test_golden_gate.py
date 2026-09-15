@@ -292,3 +292,68 @@ def test_golden_gate_refuses_a_reextracted_tree(dataset_small, staging_small, tm
     load_staging(tmp_path / "s2")  # consistent
     with pytest.raises(ContractError, match="not the artifact this dataset was built from"):
         run_golden_gate(dataset_small.dataset_dir, tmp_path / "s2", tmp_path / "gg2")
+
+
+def _rebuild_init(ds: Path, xyz, rgb) -> None:
+    from minegs.core.pointcloud import PointCloud, write_ply
+
+    write_ply(PointCloud(xyz, rgb, frame="LOCAL_METRIC"), ds / "init_points.ply")
+
+
+def _rounds_down_past(tolerance: float, near: float) -> float:
+    """A float64 value whose float32 image sits more than ``tolerance`` below it."""
+    rng = np.random.default_rng(7)
+    for v in near + rng.uniform(-1.0, 1.0, 100_000):
+        if v - float(np.float32(v)) > tolerance:
+            return float(v)
+    raise AssertionError(f"no float64 value near {near} rounds down past {tolerance}")
+
+
+def test_init_bounds_are_compared_at_the_precision_they_are_stored_at(
+    dataset_small, staging_small, tmp_path
+):
+    """float32 storage rounding is not a bounds violation; a real excursion still is.
+
+    ``init_points.ply`` is written float32 while ``tls_bounds_local_metric`` is accumulated in
+    float64, so the extreme point that *defined* a bound reads back rounded by up to half a
+    float32 ulp. Past |x| ~ 32 m that half-ulp exceeds the 1e-6 m slack the check used to allow,
+    so the comparison stopped measuring geometry and started measuring which way the write
+    rounded — and did it non-deterministically, because whether an extreme point rounded outward
+    depended on how many points survived the voxel filter. The same synthetic scene passed at
+    339k init points and failed at 509k.
+
+    The bound below is placed in that regime and constructed to round down past the old
+    tolerance, so this reproduces the real condition instead of a scene that happens to trip it.
+    """
+    import shutil
+
+    from minegs.core.pointcloud import read_ply
+
+    ds = tmp_path / "ds"
+    shutil.copytree(dataset_small.dataset_dir, ds)
+    cfg_path = ds / "build_config.json"
+    resolved = json.loads(cfg_path.read_text())
+    init = read_ply(ds / "init_points.ply")
+
+    # -40 m: far enough out that one float32 step (3.8e-6 m) dwarfs the old 1e-6 m slack. The
+    # small fixtures live under 32 m, where a float32 step is 1.9e-6 m and the bug cannot show
+    # — which is why nothing in CI ever saw it. The value rounds *outward* past the lower bound,
+    # the direction that used to be reported as geometry leaving the survey.
+    lo = np.array(resolved["tls_bounds_local_metric"][0], dtype=float)
+    hi = np.array(resolved["tls_bounds_local_metric"][1], dtype=float)
+    lo[0] = _rounds_down_past(1e-6, -40.0)
+    assert lo[0] - float(np.float32(lo[0])) > 1e-6  # the old check's failure condition
+    resolved["tls_bounds_local_metric"] = [lo.tolist(), hi.tolist()]
+    cfg_path.write_text(json.dumps(resolved, indent=2) + "\n")
+
+    # a point sitting exactly on that bound, as the extreme point that defined it does
+    on_bound = np.array([lo[0], init.xyz[:, 1].min(), init.xyz[:, 2].min()])
+    _rebuild_init(ds, np.vstack([init.xyz, on_bound]), np.vstack([init.rgb, init.rgb[:1]]))
+    rep = run_golden_gate(ds, staging_small.staging_dir, tmp_path / "gg_ok", raise_on_fail=False)
+    assert "init point bounds exceed the TLS bounds" not in rep["structural_problems"]
+
+    # ...and a millimetre past it is a real excursion, still caught.
+    outside = np.array([lo[0] - 1e-3, on_bound[1], on_bound[2]])
+    _rebuild_init(ds, np.vstack([init.xyz, outside]), np.vstack([init.rgb, init.rgb[:1]]))
+    rep = run_golden_gate(ds, staging_small.staging_dir, tmp_path / "gg_bad", raise_on_fail=False)
+    assert "init point bounds exceed the TLS bounds" in rep["structural_problems"]

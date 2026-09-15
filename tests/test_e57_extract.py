@@ -1371,3 +1371,163 @@ def test_real_e57_extraction_reads_points_while_inventory_does_not(tmp_path, mon
     assert calls == [], "the inventory must never read point data"
     extract(path, tmp_path / "out", compute_hash=False)
     assert calls == [0], "extraction must read it exactly once per scan"
+
+
+# --------------------------------------------- real libE57 embedded images (Phase 0C G2)
+
+
+def _write_real_e57_with_images(path, n_scans=3, faces=2):
+    """A genuine E57 carrying ``/images2D`` pinhole entries, written through libE57 itself.
+
+    pye57 has no images2D writer, so the entries are built with the same node API a vendor
+    exporter uses. This exists because every other image test drives the fake harness, and a
+    fake that is kinder than the library is how a reader ships broken: the production reader
+    used ``VectorNode.get(i)``, which pye57 binds without ``cast_node``, and every Matterport
+    image in a real file therefore read as an entry declaring nothing.
+    """
+    from pye57 import libe57
+
+    f = pye57.E57(str(path), mode="w")
+    try:
+        guids = []
+        for i in range(n_scans):
+            n = 6
+            f.write_scan_raw(
+                {
+                    "cartesianX": np.arange(n, dtype=np.float64) + i * 10.0,
+                    "cartesianY": np.zeros(n),
+                    "cartesianZ": np.zeros(n),
+                    "colorRed": np.arange(n, dtype=np.float64),
+                    "colorGreen": np.arange(n, dtype=np.float64) + 100,
+                    "colorBlue": np.arange(n, dtype=np.float64) + 200,
+                },
+                name=f"Sweep {i}",
+                translation=np.array([i * 10.0, 0.0, 0.0]),
+            )
+            guids.append(f.get_header(i)["guid"].value())
+
+        imf = f.image_file
+        images2D = libe57.VectorNode(imf.root().get("images2D"))
+        for i, guid in enumerate(guids):
+            for k in range(faces):
+                entry = libe57.StructureNode(imf)
+                entry.set("guid", libe57.StringNode(imf, f"{{img-{i}-{k}}}"))
+                entry.set("name", libe57.StringNode(imf, f"Skybox {k}"))
+                entry.set("associatedData3DGuid", libe57.StringNode(imf, guid))
+                rep = libe57.StructureNode(imf)
+                rep.set("imageWidth", libe57.IntegerNode(imf, 8))
+                rep.set("imageHeight", libe57.IntegerNode(imf, 8))
+                for field, value in (
+                    ("focalLength", 0.004096),
+                    ("pixelWidth", 2e-6),
+                    ("pixelHeight", 2e-6),
+                    ("principalPointX", 4.0),
+                    ("principalPointY", 4.0),
+                ):
+                    rep.set(field, libe57.FloatNode(imf, value))
+                payload = b"\xff\xd8\xff\xdbFAKEJPEG"
+                blob = libe57.BlobNode(imf, len(payload))
+                rep.set("jpegImage", blob)
+                entry.set("pinholeRepresentation", rep)
+                images2D.append(entry)  # attaches the blob to the tree...
+                blob.write(bytearray(payload), 0, len(payload))  # ...so it can be written
+    finally:
+        f.close()
+    return path
+
+
+def test_a_real_embedded_image_is_read_not_reported_as_empty(tmp_path):
+    """Regression for the Phase 0C G2 blocker: a real pinhole entry must resolve in full.
+
+    Against ``images.get(i)`` every assertion below fails at once — representation ``unknown``,
+    every field ``None``, mapping ``unmapped`` — and the CLI tells the operator their survey
+    carries no association evidence, which is a false statement about their data.
+    """
+    from minegs.ingest.e57.images import discover_embedded_images
+    from minegs.ingest.e57.mapping import build_mapping_report
+
+    path = _write_real_e57_with_images(tmp_path / "images.e57", n_scans=2, faces=2)
+
+    (first, *_rest) = assets = discover_embedded_images(path)
+    assert len(assets) == 4
+    assert first.representation == "pinhole"
+    assert first.representation_source == "pinholeRepresentation"
+    assert (first.width, first.height) == (8, 8)
+    assert first.blob_field == "jpegImage" and first.blob_bytes == 12
+    assert first.guid == "{img-0-0}" and first.name == "Skybox 0"
+    assert first.associated_scan_guid  # the evidence Phase 0B.2 maps on
+    assert not first.issues
+    # the pinhole intrinsics Phase 0C reads straight off this record
+    assert first.vendor_metadata == {
+        "focalLength": pytest.approx(0.004096),
+        "pixelWidth": pytest.approx(2e-6),
+        "pixelHeight": pytest.approx(2e-6),
+        "principalPointX": pytest.approx(4.0),
+        "principalPointY": pytest.approx(4.0),
+    }
+
+    report = build_mapping_report(path, compute_hash=False)
+    assert [m.status for m in report.mappings] == ["confirmed"] * 4
+    assert {m.evidence_type for m in report.mappings} == {"e57_associated_guid"}
+    assert [m.scan_id for m in report.mappings] == ["scan_000", "scan_000", "scan_001", "scan_001"]
+
+
+def test_a_real_embedded_image_survives_extraction(tmp_path):
+    """...and the blob reaches disk, which reads the node through a second call site."""
+    path = _write_real_e57_with_images(tmp_path / "images.e57", n_scans=2, faces=2)
+    m = extract(path, tmp_path / "out", compute_hash=False)
+    assert [o.image_id for o in m.image_outputs] == [
+        "image_000",
+        "image_001",
+        "image_002",
+        "image_003",
+    ]
+    assert m.skipped_images == []
+    written = sorted(p.name for p in (tmp_path / "out" / "images").iterdir())
+    assert written == ["image_000.jpg", "image_001.jpg", "image_002.jpg", "image_003.jpg"]
+    assert (tmp_path / "out" / "images" / "image_000.jpg").read_bytes().startswith(b"\xff\xd8\xff")
+
+
+def test_a_scan_subset_does_not_drag_in_the_whole_file_s_images(tmp_path):
+    """``--scan`` selects scans; the images have to follow, or the tree is unbuildable.
+
+    The mapping report still describes the whole file — that is a fact about the E57 — but an
+    image whose scan was not extracted has no points and no pose here, and Phase 0C refuses
+    such a tree with "scan scan_000 was not extracted". Phase 0C G2 samples 5 of 121 stations,
+    so this is the path a real validation run takes.
+    """
+    path = _write_real_e57_with_images(tmp_path / "images.e57", n_scans=4, faces=2)
+    m = extract(path, tmp_path / "out", scan_ids=["scan_001", "scan_002"], compute_hash=False)
+
+    assert [s.scan_id for s in m.scan_outputs] == ["scan_001", "scan_002"]
+    assert [o.mapped_scan_id for o in m.image_outputs] == ["scan_001"] * 2 + ["scan_002"] * 2
+    assert sorted(p.name for p in (tmp_path / "out" / "images").iterdir()) == [
+        "image_002.jpg",
+        "image_003.jpg",
+        "image_004.jpg",
+        "image_005.jpg",
+    ]
+    # the other four are recorded, not silently dropped, and the reason names the scan
+    assert [s.image_id for s in m.skipped_images] == [
+        "image_000",
+        "image_001",
+        "image_006",
+        "image_007",
+    ]
+    assert all("did not extract" in s.reason for s in m.skipped_images)
+    # the mapping report is unchanged: it describes the file, not this run
+    assert len(m.mapping_report.images) == 8
+
+
+def test_a_subset_staging_tree_builds_a_dataset(tmp_path):
+    """The point of the above: Phase 0C must accept what a subset extraction produced."""
+    from minegs.dataset.materialize import select_stations
+    from minegs.dataset.staging_input import load_staging
+
+    path = _write_real_e57_with_images(tmp_path / "images.e57", n_scans=4, faces=2)
+    stg = tmp_path / "staging"
+    extract(path, stg, scan_ids=["scan_001", "scan_002"], compute_hash=True)
+
+    stations = select_stations(load_staging(stg), "pinhole")
+    assert sorted(stations) == ["S001", "S002"]
+    assert [len(st.image_ids) for st in stations.values()] == [2, 2]

@@ -743,7 +743,7 @@ def extract_image(handle: Any, asset: ImageAsset, out_dir: Path) -> tuple[Path, 
     """
     if asset.blob_field is None or asset.representation_source is None:
         raise ContractError(f"{asset.image_id} has no embedded pixel data to extract")
-    node = handle.root["images2D"].get(asset.source_index)
+    node = handle.root["images2D"][asset.source_index]  # subscript downcasts, .get() does not
     payload = _read_blob(node, asset.representation_source, asset.blob_field)
     magic = _BLOB_MAGIC[asset.blob_field]
     if not payload.startswith(magic):
@@ -763,14 +763,41 @@ def _image_results(
     report: PanoMappingReport,
     staged: Path,
     work_dir: Path,
+    extracted_scan_ids: set[str] | None = None,
 ) -> tuple[list[ImageOutput], list[SkippedImage], list[str]]:
-    """Write each supported image into ``staged``, recording its published ``work_dir`` path."""
+    """Write each supported image into ``staged``, recording its published ``work_dir`` path.
+
+    ``extracted_scan_ids`` is the ``--scan`` selection. The mapping report deliberately covers
+    the whole file — the mapping is a fact about the E57, not about this run — but an image
+    whose scan was not extracted has no points and no pose to go with it, so writing it would
+    stage a camera that looks into nothing. Phase 0C refuses such a tree outright ("scan
+    scan_000 was not extracted"), which made a subset extraction unbuildable; the entry is
+    recorded as skipped instead, with the reason, so nothing goes missing silently.
+    """
     outputs: list[ImageOutput] = []
     skipped: list[SkippedImage] = []
     issues: list[str] = []
     records = {m.image_id: m for m in report.mappings}
     for asset in report.images:
         rec = records[asset.image_id]
+        if (
+            extracted_scan_ids is not None
+            and rec.scan_id is not None
+            and rec.scan_id not in extracted_scan_ids
+        ):
+            skipped.append(
+                SkippedImage(
+                    image_id=asset.image_id,
+                    representation=asset.representation,
+                    reason=(
+                        f"maps to {rec.scan_id}, which this run did not extract (--scan). The "
+                        "entry stays in the mapping report, which describes the file; the "
+                        "pixels belong to a scan this tree does not hold"
+                    ),
+                    mapping_status=rec.status,
+                )
+            )
+            continue
         if asset.source == "external_file":
             outputs.append(_external_image_output(asset, rec))
             continue
@@ -973,7 +1000,13 @@ def extract(
                 )
             )
         if with_images:
-            image_outputs, skipped, image_issues = _image_results(handle, report, staged, published)
+            image_outputs, skipped, image_issues = _image_results(
+                handle,
+                report,
+                staged,
+                published,
+                {s.scan_id for s in selected} if scan_ids is not None else None,
+            )
             issues.extend(image_issues)
 
         inv.save(staged / "inventory.json")
