@@ -92,20 +92,58 @@ class FakeNode:
         return len(self._children)
 
     def get(self, index_or_name: Any) -> Any:
+        """``VectorNode.get``, including pye57's missing downcast.
+
+        pye57 binds ``get(int)`` straight to the C++ signature, which returns a base ``Node``;
+        only ``__getitem__`` runs the result through ``cast_node``. So ``vec.get(i)`` hands back
+        something with none of a structure node's accessors, and code that reads fields off it
+        sees an entry that declares nothing. Modelling that here is the point: a fake that
+        answered ``get(i)`` fully is what let the real reader ship broken.
+        """
         if isinstance(index_or_name, int):
-            return list(self._children.values())[index_or_name]
+            return FakeBareNode(list(self._children.values())[index_or_name])
         return self[index_or_name]
 
     def isDefined(self, key: str) -> bool:
         return key in self._children
 
-    def __getitem__(self, key: str) -> Any:
+    def __getitem__(self, key: Any) -> Any:
+        """``__getitem__``, which pye57 *does* downcast — by name or by index."""
+        if isinstance(key, int):
+            children = list(self._children.values())
+            if not -len(children) <= key < len(children):
+                raise IndexError(key)
+            return children[key]
         if key not in self._children:
             raise FakeE57Error(f"node {key!r} is not defined")
         return self._children[key]
 
     def __len__(self) -> int:
         return len(self._children)
+
+
+class FakeBareNode:
+    """What ``VectorNode.get(i)`` returns in pye57: a base ``Node``, not a structure node.
+
+    The real object carries only ``elementName``/``type``/``pathName``/``parent``-style
+    accessors (checked against pye57 0.4.19). Reading a child off it raises, which is what
+    ``minegs.ingest.e57._nodes`` turns into "this entry declares nothing".
+    """
+
+    def __init__(self, node: Any) -> None:
+        self._node = node
+
+    def elementName(self) -> str:
+        return self._node.elementName()
+
+    def type(self) -> str:
+        return "E57_STRUCTURE"
+
+    def pathName(self) -> str:
+        return "/" + self._node.elementName()
+
+    def isRoot(self) -> bool:
+        return False
 
 
 class ExplodingNode(FakeNode):
