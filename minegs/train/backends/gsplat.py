@@ -44,7 +44,9 @@ is built. Resuming would need a trainer and checkpoint that restore the whole tr
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -54,7 +56,12 @@ from minegs.core.errors import ContractError
 from minegs.core.frames import SE3, Sim3
 from minegs.core.pointcloud import read_ply, write_ply
 from minegs.ingest.common import colmap_io
-from minegs.train.backends.base import BackendCapabilities, TrainBackend, TrainCommand
+from minegs.train.backends.base import (
+    BackendCapabilities,
+    TrainBackend,
+    TrainCommand,
+    TrainEvidence,
+)
 from minegs.train.profiles import Profile
 
 PINNED_GSPLAT = "1.5.3"
@@ -109,6 +116,38 @@ REFUSED_FLAGS = {
     "normalize_world_space": NORMALIZE_REFUSAL,
     "ckpt": RESUME_REFUSAL,
 }
+
+
+#: ``ckpt_6999_rank0.pt`` -> 6999, ``point_cloud_6999.ply`` -> 6999, ``train_step6999_rank0``
+#: -> 6999. The first run of digits after the last underscore-delimited word that starts one.
+_STEP_RE = re.compile(r"(?:step|ckpt|point_cloud)[_]?(\d+)")
+
+
+def _step_of(name: str) -> int | None:
+    m = _STEP_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _as_float(v: object) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+#: ``key: value`` at the top level of the trainer's own ``cfg.yml``. Read with a regex rather
+#: than a YAML parser on purpose: upstream writes it with ``yaml.dump(vars(cfg))`` (v1.5.3
+#: simple_trainer.py:552-554), whose default Dumper tags ``strategy`` as
+#: ``!!python/object:gsplat.strategy...``. ``safe_load`` refuses that, and ``unsafe_load`` would
+#: import gsplat to reconstruct it — executing trainer output to read a flag is not a trade this
+#: check needs to make. Nested fields are indented, so this sees only the top level.
+_CFG_LINE = re.compile(r"(?m)^([A-Za-z_]\w*):[ \t]+(.+?)[ \t]*$")
+
+
+def _trainer_config(path: Path) -> dict[str, str]:
+    """What the trainer recorded about its own configuration, as plain strings."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return {}
+    return {m.group(1): m.group(2) for m in _CFG_LINE.finditer(text)}
 
 
 def canonical_option(raw: object) -> str:
@@ -279,6 +318,57 @@ class GsplatBackend(TrainBackend):
                     shutil.rmtree(dst)
                 shutil.copytree(out_dir / sub, dst)
         return produced
+
+    def collect_evidence(self, out_dir: Path, profile: Profile) -> TrainEvidence:
+        """Read back what ``simple_trainer.py`` wrote (§0D.2 D2-4, D2-5, D2-6, D2-9).
+
+        Layout and filenames are taken from upstream v1.5.3 itself (sha256
+        ``79319e1c…62c05``), not guessed: ``result_dir`` gains ``ckpts/``, ``stats/``,
+        ``renders/`` and ``ply/`` (lines 321-328), the checkpoint is
+        ``ckpts/ckpt_{step}_rank{n}.pt`` and the PLY ``ply/point_cloud_{step}.ply``.
+
+        The step numbers are the trap. Both are written at ``step == max_steps - 1``, so a
+        7000-step run ends at step 6999 and a check expecting 7000 would fail every real run.
+        ``stats/train_step{step:04d}_rank{n}.json`` carries ``{"mem", "ellipse_time",
+        "num_GS"}`` — ``mem`` being ``torch.cuda.max_memory_allocated()`` in GiB, measured
+        inside the trainer, which is the only honest source for this run's peak GPU memory.
+        """
+        ev = TrainEvidence(configured_max_steps=profile.max_steps)
+
+        ev.checkpoints = sorted(out_dir.glob("ckpts/ckpt_*.pt"))
+        if ev.checkpoints:
+            by_step = sorted(ev.checkpoints, key=lambda p: (_step_of(p.name) or -1, p.name))
+            ev.final_checkpoint = by_step[-1]
+            ev.checkpoint_step = _step_of(ev.final_checkpoint.name)
+
+        plys = sorted(out_dir.glob("ply/*.ply")) + sorted(out_dir.glob("point_cloud/*.ply"))
+        if plys:
+            ev.final_model = max(plys, key=lambda p: (_step_of(p.name) or -1, p.name))
+
+        stats = sorted(out_dir.glob("stats/train_step*.json"))
+        steps = [s for s in (_step_of(p.name) for p in stats) if s is not None]
+        if steps:
+            ev.observed_final_step = max(steps)
+        # The checkpoint's own step is the stronger witness: it is written by the same branch
+        # that saves the weights, so it cannot outrun what was actually trained.
+        if ev.checkpoint_step is not None:
+            ev.observed_final_step = max(ev.observed_final_step or 0, ev.checkpoint_step)
+
+        if stats:
+            last = max(stats, key=lambda p: (_step_of(p.name) or -1, p.name))
+            try:
+                blob = json.loads(last.read_text())
+            except (OSError, ValueError) as e:
+                ev.notes.append(f"{last.name} could not be read ({e})")
+            else:
+                ev.peak_gpu_memory_gb = _as_float(blob.get("mem"))
+                ev.train_seconds = _as_float(blob.get("ellipse_time"))
+                num_gs = blob.get("num_GS")
+                ev.gaussian_count = int(num_gs) if isinstance(num_gs, (int, float)) else None
+
+        ev.renders = sorted(p for p in out_dir.glob("renders/*") if p.is_file())
+        ev.trainer_config = _trainer_config(out_dir / "cfg.yml")
+        return ev
 
 
 # ------------------------------------------------- gsplat normalisation (FUTURE WORK, unused)

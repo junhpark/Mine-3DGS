@@ -22,8 +22,8 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 |---|---|---|
 | 0A | Foundation & Contract Freeze | **implemented, G1 통과** — PR #1 이 closeout |
 | 0B | Real E57 Ingest | **0B.1·0B.2·0B.3 implemented** (inventory·매핑·추출), **not validated** — 실제 E57 필요 |
-| 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2 real-data Golden Gate pending** |
-| 0D | Local GS Baseline | **0D.1 resume safety contract implemented + structurally tested**. **0D.2 not run** — 실제 GPU 학습 미수행이며 Phase 0C G2 통과 전에는 시작 금지. 0D 전체는 **NOT COMPLETE** (§0D) |
+| 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2: DEFERRED / NOT VALIDATED** (PO 결정, §0C) |
+| 0D | Local GS Baseline | **0D.1 resume safety contract** 및 **0D.2 local GPU baseline execution contract** implemented + structurally tested. **실제 GPU baseline 미실행**. 0D 전체는 **NOT COMPLETE** (§0D) |
 | 1 | Metric Surface & Evaluation | 부분 implemented (지표·단면·체적), surface 추출 미구현 |
 | 2 | E57 End-to-End MVP | 미착수 |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
@@ -213,7 +213,9 @@ E57 SOURCE  --explicit SE(3)-->  TLS_GLOBAL  --deterministic origin-->  LOCAL_ME
                                           COLMAP cameras + images + leak-free TLS init
 ```
 
-**상태**: `Phase 0C implementation complete · G1 structurally tested · G2 real-data Golden Gate pending`.
+**상태**: `Phase 0C implementation complete · G1 structurally tested · G2: DEFERRED / NOT VALIDATED`.
+G2 는 Product Owner 결정으로 개발 blocking gate 에서 일시적으로 제외했다. **PASS 로 간주하지 않는다** —
+실제 E57 로 프레임·카메라 convention 을 확인하기 전까지 이 저장소는 실데이터 결과를 주장하지 않는다.
 실제 E57 은 아직 이 경로로 실행하지 않았다. G2 는 사람이 오버레이와 Viser 를 보는 검사를 포함하며,
 자동 점수 하나로 PASS 하지 않는다.
 
@@ -289,7 +291,7 @@ PR #3 의 one-off exporter 출력은 G2 증거가 아니다.
 | 하위 | 범위 | 상태 |
 |---|---|---|
 | **0D.1** | resume safety contract — silent restart 경로 제거, gsplat resume 능력 독립 확인, fail-closed 거부 | **implemented + structurally tested** |
-| **0D.2** | 실제 GPU baseline (중단 없는 단일 학습) | **미수행 — Phase 0C G2 통과 전 시작 금지** |
+| **0D.2** | 실제 GPU baseline (중단 없는 단일 학습) | **execution contract implemented + structurally tested — 실제 GPU run 미실행** |
 | **0D.3** | MineGS 소유 resumable trainer & checkpoint contract | **보류 — 필요할 때만** |
 
 **Phase 0D entry blocker — Docker `--resume`.** PR #1 검증에서 확인된 문제이며 0D 시작 시
@@ -351,16 +353,22 @@ Mine-3DGS 가 완전한 training state 를 복원할 수 있는 trainer/checkpoi
 
 #### Phase 0D.2 — 실제 GPU baseline (미수행)
 
-**진입 조건**: Phase 0C **G2 real-data Golden Gate 가 PASS 한 뒤에만** 시작한다. 프레임·카메라
-convention 이 실제 데이터에서 확인되지 않은 상태로 GPU 를 돌리면, 학습이 성공해도 그 결과가
-무엇을 뜻하는지 말할 수 없다. 0D.2 는 별도 PR 로 진행한다 (`phase-0d2-real-gpu-baseline`).
+**진입 조건**: Phase 0C G2 는 DEFERRED 이므로 0D.2 **개발**은 진행한다. 다만 프레임·카메라
+convention 이 실제 데이터에서 확인되지 않았으므로, 실제 신풍갱 데이터로 돌린 결과는 scientific
+validation 으로 주장하지 않는다 — 합성 데이터 위의 execution contract 검증이다.
+
+**현재 상태**: execution contract 는 구현·구조 검증 완료. `LocalRunner` 는 trainer 의 exit code
+만으로 성공을 기록하지 않고, checkpoint·final PLY·step 진행·finite 좌표·frame invariant 를 모두
+확인한 뒤에만 `SUCCEEDED` 를 publish 한다. **실제 GPU run 은 아직 수행하지 않았다.**
 
 **범위**: pinned GPU docker image, gsplat v1.5.3 executable contract, LocalRunner,
 light profile, staging, checkpoint/output, LOCAL_METRIC 출력 정규화 계약.
 
 **원칙**: `normalize_world_space=false`, BACKEND_INTERNAL = LOCAL_METRIC.
 
-**Gate (G2)** — 중단 없는 단일 학습으로 다음 10 항목을 모두 확인한다.
+**Gate** — 중단 없는 단일 학습으로 다음 10 항목을 모두 확인한다. 1·3·4·5·6·7·8·9 는
+`LocalRunner` 가 run 마다 자동으로 확인하고 `run.json` 에 기록한다 (아래 fail-closed 표 참조);
+하나라도 확인되지 않으면 그 run 은 `SUCCEEDED` 가 되지 않는다. 2 와 10 은 사람이 한다.
 
 1. pinned GPU image 를 빌드/사용한다 (`image@sha256:...`).
 2. 작은 실제 또는 합성 갱도 구간으로 학습 job 을 실행한다.
@@ -619,6 +627,13 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | gsplat 에 `--resume-from` | `ContractError` (upstream 근거 인용, run directory 생성 이전) | v1.5.3 은 학습을 이어붙일 수 없다 — §Phase 0D | Phase 0D.3 (보류) |
 | resume=true 를 선언하는 backend 에 `--resume-from` | `NotYetImplementedError` (Phase 0D.3) | 완전한 training state 를 복원하는 checkpoint contract 가 아직 없다 | Phase 0D.3 (보류) |
 | `backend_args` 로 들어온 `ckpt` (모든 철자) | `ContractError` | 학습이 아니라 evaluation pass 가 조용히 실행된다 | 해당 없음 (설계) |
+| trainer exit 0 인데 checkpoint 없음 | `FAILED` + `failure_reason` | 아무것도 쓰지 않고 끝난 프로세스도 exit 0 이다 | 해당 없음 (설계) |
+| trainer exit 0 인데 최종 PLY 없음 | `FAILED` + `failure_reason` | 위와 같다 | 해당 없음 (설계) |
+| 출력 gaussian 좌표에 non-finite | `FAILED` | 학습이 발산했다 | 해당 없음 (설계) |
+| `max_steps` 에 못 미친 step 에서 종료 | `FAILED` | 짧게 끝난 run 은 다른 실험이다 | 해당 없음 (설계) |
+| trainer `cfg.yml` 이 `normalize_world_space: true` | `FAILED` | upstream 기본값이 true 다 — 출력이 metre 가 아니게 된다 | 해당 없음 (설계) |
+| 출력 span 이 init span 대비 20배 밖 | `FAILED` | scale 이 바뀌었다는 정황 (보조 신호) | 해당 없음 (설계) |
+| CUDA 없음 | `NoGpuError` (exit 4) | CPU 학습은 느린 GPU 학습이 아니라 다른 실험이다 | 해당 없음 (설계) |
 | option name 이 될 수 없는 `backend_args` key (내부 공백) | `ContractError` | flag 로 넘길 수 없고, 출력된 command 에서는 인자 두 개로 읽힌다 | 해당 없음 (설계) |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |

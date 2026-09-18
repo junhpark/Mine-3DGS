@@ -9,6 +9,7 @@ Both runners execute the *same* GPU image digest; ``run.json`` records it (§9).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -103,6 +104,34 @@ class RunRecord(VersionedModel):
     outputs: list[str] = Field(default_factory=list)
     provenance: ProvenanceRecord
 
+    # ---- Phase 0D.2 execution evidence. Added with defaults and *without* bumping
+    # SCHEMA_VERSION on purpose: RunRecord declares no migrations, so a bump would make every
+    # run.json already on disk unreadable. Absent fields simply mean "written before 0D.2".
+    image: str | None = None  # the full ref; docker_digest is the @sha256 half of it
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_s: float | None = None
+    command_env: dict[str, str] = Field(default_factory=dict)
+    #: What the runtime said about itself before the trainer started (§0D.2 D2-2).
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    max_steps: int | None = None
+    #: Read back from the trainer's own artifacts, not assumed from the profile (D2-4).
+    observed_final_step: int | None = None
+    checkpoints: list[str] = Field(default_factory=list)
+    final_checkpoint: str | None = None
+    checkpoint_step: int | None = None
+    final_model: str | None = None
+    gaussian_count: int | None = None
+    peak_gpu_memory_gb: float | None = None
+    train_seconds: float | None = None
+    #: Renders the trainer left, for the qualitative look-at-it check (D2-10). A path, not a
+    #: verdict: nothing here judges whether the result resembles a tunnel.
+    renders: list[str] = Field(default_factory=list)
+    #: Camera / init / output spans in metres, the evidence behind the frame check (D2-7).
+    extents: dict[str, Any] = Field(default_factory=dict)
+    #: Why a run is FAILED. A failed run that cannot say why is not much better than a silent one.
+    failure_reason: str | None = None
+
 
 class RunHandle(ABC):
     def __init__(self, run_id: str, run_dir: Path) -> None:
@@ -190,7 +219,17 @@ class Runner(ABC):
 
     @staticmethod
     def write_record(record: RunRecord, run_dir: Path) -> Path:
-        return record.save(run_dir / "run.json")
+        """Write ``run.json`` atomically.
+
+        The status field is what tells a later reader a run died mid-flight, so the file must
+        never be observed half-written. Atomicity lives here rather than in ``VersionedModel.save``,
+        which is shared with manifests and ingest configs that do not have this problem.
+        """
+        final = run_dir / "run.json"
+        tmp = run_dir / ".run.json.partial"
+        record.save(tmp)
+        os.replace(tmp, final)
+        return final
 
 
 def refuse_resume(backend: Any) -> None:
@@ -221,6 +260,180 @@ def refuse_resume(backend: Any) -> None:
         "host/container path translation and parent-run compatibility are not implemented",
         "0D.3",
     )
+
+
+#: How far the output may differ in span from the points it was initialised with before the run
+#: is refused (§0D.2 D2-7). Densification legitimately spreads gaussians past the input cloud, so
+#: this is deliberately loose; what it exists to catch is a *scale* change. gsplat's
+#: ``normalize_world_space`` rescales a scene to roughly unit size, which for a 60-100 m drift is
+#: a 30-100x shrink — an order of magnitude clear of anything densification does. A blow-up in the
+#: other direction is equally suspect, so the test is two-sided. This bounds the failure it is
+#: named for; it is not evidence that the output geometry is correct.
+MAX_EXTENT_RATIO = 20.0
+
+
+def runtime_info() -> dict[str, Any]:
+    """What the machine says about itself, best effort, before a trainer starts (§0D.2 D2-2).
+
+    Deliberately not fatal: the CUDA *gate* is ``cuda_available()``, which already refuses a run
+    with no GPU. This only describes what was there. ``nvidia-smi`` is queried rather than torch
+    because on the docker path torch lives inside the image and the host may not have it at all;
+    where torch is importable (the ``--native`` path) its view is recorded alongside.
+    """
+    info: dict[str, Any] = {}
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,driver_version,memory.total",
+                    "--format=csv,noheader",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                gpus = [line.strip() for line in out.stdout.strip().splitlines() if line.strip()]
+                info["gpus"] = gpus
+                first = gpus[0].split(",")
+                if len(first) >= 2:
+                    info["gpu_model"] = first[0].strip()
+                    info["driver_version"] = first[1].strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            info["nvidia_smi_error"] = str(e)
+    try:  # present on the native path; absent on a host that only runs the container
+        import torch
+
+        info["torch"] = torch.__version__
+        info["torch_cuda"] = torch.version.cuda
+        info["torch_cuda_available"] = bool(torch.cuda.is_available())
+    except Exception:
+        info["torch"] = None
+    return info
+
+
+def _span(xyz: Any) -> float:
+    """Largest side of the axis-aligned box, in metres. 0.0 for a degenerate set."""
+    import numpy as np
+
+    a = np.asarray(xyz, dtype=float)
+    if a.ndim != 2 or len(a) == 0:
+        return 0.0
+    return float(np.max(a.max(axis=0) - a.min(axis=0)))
+
+
+def verify_postconditions(
+    record: RunRecord,
+    evidence: Any,
+    run_dir: Path,
+    staged_dir: Path,
+    outputs: list[Path],
+) -> None:
+    """Everything that must be true before a run may be called SUCCEEDED (§0D.2 D2-4..D2-7).
+
+    Raises ``ContractError`` naming the first thing that is not. Exit code 0 is the weakest of
+    the signals here: a trainer that writes nothing exits 0 exactly like one that trains.
+    """
+    import numpy as np
+
+    from minegs.core.pointcloud import read_ply
+
+    if evidence.final_checkpoint is None:
+        raise ContractError(
+            "the trainer exited 0 but wrote no checkpoint. A run with no checkpoint is not a "
+            "baseline; it is a process that ended (§0D.2 D2-5)"
+        )
+    if evidence.final_checkpoint.stat().st_size == 0:
+        raise ContractError(f"{evidence.final_checkpoint} is empty (§0D.2 D2-5)")
+
+    if evidence.final_model is None:
+        raise ContractError(
+            "the trainer exited 0 but produced no model PLY (enable save_ply) (§0D.2 D2-6)"
+        )
+    if not outputs:
+        raise ContractError("no PLY reached the run's point_cloud/ (§0D.2 D2-6)")
+
+    # Step progression. Upstream writes its last checkpoint at ``max_steps - 1``, so a run that
+    # reached the end reports one less than the profile asked for; anything short of that ran
+    # fewer iterations than requested, whatever its exit code said.
+    want = evidence.configured_max_steps
+    got = evidence.observed_final_step
+    if want is not None:
+        if got is None:
+            raise ContractError(
+                f"the trainer left no step evidence, so reaching {want} steps cannot be shown "
+                "(§0D.2 D2-4)"
+            )
+        if got < want - 1:
+            raise ContractError(
+                f"training stopped at step {got} of a configured {want} ({want - 1} expected as "
+                "the final step). A short run is a different experiment (§0D.2 D2-4)"
+            )
+
+    final = read_ply(_in_run(outputs, evidence))
+    if len(final.xyz) == 0:
+        raise ContractError(f"{evidence.final_model}: the model holds no gaussians (§0D.2 D2-6)")
+    if not np.all(np.isfinite(final.xyz)):
+        n = int((~np.isfinite(final.xyz)).any(axis=1).sum())
+        raise ContractError(
+            f"{n} of {len(final.xyz)} gaussian centres are not finite; training diverged "
+            "(§0D.2 D2-6)"
+        )
+
+    # Frame invariant (§0D.2 D2-7). The evidence is gathered in full and recorded *before*
+    # either gate fires, so a refused run still explains itself in run.json.
+    ext: dict[str, Any] = {"output_span_m": _span(final.xyz), "unit": "m"}
+    sparse = staged_dir / "sparse" / "0"
+    if (sparse / "points3D.txt").exists():
+        from minegs.ingest.common import colmap_io
+
+        pts = colmap_io.read_model(sparse)
+        init_xyz = np.array([p.xyz for p in pts.points3D.values()])
+        cams = np.array([im.center for im in pts.images.values()])
+        ext["init_span_m"] = _span(init_xyz)
+        ext["camera_span_m"] = _span(cams)
+    init_span = ext.get("init_span_m") or 0.0
+    out_span = ext["output_span_m"]
+    ratio = out_span / init_span if init_span > 0 and out_span > 0 else None
+    if ratio is not None:
+        ext["output_over_init"] = ratio
+    declared = (getattr(evidence, "trainer_config", None) or {}).get("normalize_world_space")
+    if declared is not None:
+        ext["trainer_normalize_world_space"] = declared
+    # Assigned once, fully built: the model validates on assignment, so it stores a *copy* and
+    # anything written into ``ext`` afterwards would never reach the record — including the
+    # figures that explain a refusal.
+    record.extents = ext
+    record.gaussian_count = len(final.xyz)
+
+    # The trainer's own record of how it was configured leads. Upstream gsplat defaults
+    # ``normalize_world_space`` to True, so this is the difference between a baseline in metres
+    # and one in arbitrary units, and cfg.yml says which happened instead of leaving it inferred.
+    if declared is not None and declared.strip().lower() not in ("false", "0", "no"):
+        raise ContractError(
+            f"the trainer ran with normalize_world_space={declared!r}. BACKEND_INTERNAL must be "
+            "LOCAL_METRIC for this baseline, so the output is in arbitrary units and the run is "
+            "not a metric one (§0D.2 D2-7)"
+        )
+
+    # The span ratio corroborates; it does not lead. It is blind to rotation and translation by
+    # construction, and its margin against a real normalisation is thin — so it is the backstop
+    # for a backend that records no configuration, not the primary test.
+    if ratio is not None and not 1.0 / MAX_EXTENT_RATIO <= ratio <= MAX_EXTENT_RATIO:
+        raise ContractError(
+            f"output span {out_span:.3f} m against an initialisation span of "
+            f"{init_span:.3f} m is a factor of {ratio:.3g}, beyond the {MAX_EXTENT_RATIO}x "
+            "this baseline allows. BACKEND_INTERNAL is supposed to be LOCAL_METRIC, so a "
+            "scale change of this size means something normalised the scene (§0D.2 D2-7)"
+        )
+
+
+def _in_run(outputs: list[Path], evidence: Any) -> Path:
+    """The normalised copy of the backend's final model, by name."""
+    by_name = {p.name: p for p in outputs}
+    return by_name.get(evidence.final_model.name, outputs[-1])
 
 
 def load_record(run_dir: str | Path) -> RunRecord:

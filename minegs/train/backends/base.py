@@ -46,6 +46,35 @@ class BackendCapabilities:
 
 
 @dataclass
+class TrainEvidence:
+    """What a finished run actually left behind, *discovered* from the output tree.
+
+    Every field is read back off disk rather than assumed from the configuration, because the
+    question Phase 0D.2 asks is whether training happened — and a run that exits 0 having
+    written nothing exits 0 all the same. ``None`` means "this backend left no such evidence",
+    which the runner treats as a failure for the artifacts it requires.
+    """
+
+    checkpoints: list[Path] = field(default_factory=list)
+    final_checkpoint: Path | None = None
+    checkpoint_step: int | None = None
+    final_model: Path | None = None
+    gaussian_count: int | None = None
+    observed_final_step: int | None = None
+    #: What the profile asked for, so a reader can see the run reached it without re-deriving.
+    configured_max_steps: int | None = None
+    #: Peak CUDA memory in GiB, as the trainer itself measured it. A figure sampled from
+    #: outside the container would be the whole device's, not this run's.
+    peak_gpu_memory_gb: float | None = None
+    train_seconds: float | None = None
+    renders: list[Path] = field(default_factory=list)
+    #: The trainer's own record of the configuration it ran under, when it writes one.
+    #: Direct evidence, where an extent ratio is only circumstantial.
+    trainer_config: dict[str, str] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class TrainCommand:
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
@@ -90,6 +119,15 @@ class TrainBackend(ABC):
     ) -> list[Path]:
         """Move/convert outputs into ``run_dir`` with ``point_cloud/*.ply`` in LOCAL_METRIC.
         Returns the list of produced PLY files."""
+
+    @abstractmethod
+    def collect_evidence(self, out_dir: Path, profile: Profile) -> TrainEvidence:
+        """Read back what the trainer wrote into ``out_dir``.
+
+        Abstract rather than defaulted: a backend that cannot say what it produced cannot have a
+        run of it declared successful, and a silent default would let the next backend inherit
+        that silence. Discovery only — this reports, the runner decides (§0D.2 D2-4..D2-6).
+        """
 
     def check_profile(self, profile: Profile) -> list[str]:
         """Return capabilities the profile *requires* that this backend lacks."""

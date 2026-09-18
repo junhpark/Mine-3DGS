@@ -14,12 +14,60 @@ from minegs.train.runner.base import (
     RunConfig,
     RunHandle,
     Runner,
+    RunRecord,
     RunStatus,
     cuda_available,
     docker_available,
     load_record,
+    runtime_info,
+    verify_postconditions,
 )
 from minegs.train.staging import stage_dataset
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _elapsed(start: str, end: str) -> float | None:
+    from datetime import datetime
+
+    try:
+        return (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()
+    except ValueError:
+        return None
+
+
+def _record_evidence(rec: RunRecord, ev, run_dir: Path) -> None:
+    """Copy what the backend found into the record, as paths relative to the run directory.
+
+    ``normalize_outputs`` has already copied ``ckpts`` -> ``ckpt`` and ``stats`` -> ``stats``, so
+    the evidence is named where a reader of ``run.json`` will actually find it rather than in the
+    backend's scratch tree — which on the docker path is a container-side path anyway.
+    """
+
+    def rel(p: Path | None) -> str | None:
+        if p is None:
+            return None
+        try:
+            return str(Path("ckpt") / p.name) if p.suffix == ".pt" else str(Path(p).name)
+        except Exception:  # pragma: no cover - defensive
+            return str(p)
+
+    rec.checkpoints = [str(Path("ckpt") / c.name) for c in ev.checkpoints]
+    rec.renders = [str(Path("renders") / r.name) for r in ev.renders]
+    rec.final_checkpoint = rel(ev.final_checkpoint)
+    rec.checkpoint_step = ev.checkpoint_step
+    rec.final_model = (
+        str(Path("point_cloud") / ev.final_model.name) if ev.final_model is not None else None
+    )
+    rec.observed_final_step = ev.observed_final_step
+    rec.peak_gpu_memory_gb = ev.peak_gpu_memory_gb
+    rec.train_seconds = ev.train_seconds
+    if ev.gaussian_count is not None:
+        rec.gaussian_count = ev.gaussian_count
 
 
 class LocalHandle(RunHandle):
@@ -121,39 +169,83 @@ class LocalRunner(Runner):
                 *cmd.argv[1:],
             ]
         record.command = argv
+        record.command_env = dict(cmd.env)
         record.T_local_from_internal = cmd.T_local_from_internal.to_list()
+        record.image = self.config.image or None
+        record.max_steps = profile.max_steps
+        record.runtime = runtime_info()
+        record.started_at = _now()
         record.status = RunStatus.RUNNING
         self.write_record(record, run_dir)
-        log = open(run_dir / "log" / "train.log", "ab")  # noqa: SIM115 — handed to Popen
+        log = open(run_dir / "log" / "train.log", "ab")  # noqa: SIM115 — closed in _finalize
         proc = subprocess.Popen(
             argv, stdout=log, stderr=subprocess.STDOUT, env={**_env(), **cmd.env}
         )
         handle = LocalHandle(run.run_id, run_dir, proc)
-        return _FinalizingHandle(handle, backend, work, run_dir, record)
+        return _FinalizingHandle(handle, backend, work, run_dir, record, profile, log)
 
 
 class _FinalizingHandle(RunHandle):
-    """Wraps LocalHandle: on completion, normalise outputs into the run convention."""
+    """Wraps LocalHandle: on completion, verify the run before calling it one.
 
-    def __init__(self, inner: LocalHandle, backend, work: Path, run_dir: Path, record) -> None:
+    The trainer's exit code opens the question rather than answering it. A gsplat run that
+    writes no checkpoint, no PLY, or gaussians at infinity exits 0 exactly like one that
+    trained, so SUCCEEDED is published only after ``verify_postconditions`` has read the
+    artifacts back (§0D.2 D2-4..D2-7, §11). Anything that fails there makes the run FAILED with
+    the reason recorded — never a success with a caveat.
+    """
+
+    def __init__(
+        self, inner: LocalHandle, backend, work: Path, run_dir: Path, record, profile, log=None
+    ) -> None:
         super().__init__(inner.run_id, run_dir)
         self._inner, self._backend, self._work, self._record = inner, backend, work, record
-        self._finalized = False
+        self._profile, self._log = profile, log
+        #: The resolved terminal status, or None while the run is still in flight. A bare
+        #: "have I finalized" latch would let a finalization that *failed* be reported as the
+        #: process's own exit status on the next call.
+        self._terminal: RunStatus | None = None
 
     def status(self) -> RunStatus:
+        if self._terminal is not None:
+            return self._terminal
         st = self._inner.status()
-        if st in (RunStatus.SUCCEEDED, RunStatus.FAILED) and not self._finalized:
-            self._finalized = True
-            self._record.status = st
-            if st == RunStatus.SUCCEEDED:
-                from minegs.core.frames import Sim3
+        if st not in (RunStatus.SUCCEEDED, RunStatus.FAILED):
+            return st
+        return self._finalize(st)
 
+    def _finalize(self, exit_status: RunStatus) -> RunStatus:
+        from minegs.core.frames import Sim3
+
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+        rec = self._record
+        rec.completed_at = _now()
+        if rec.started_at:
+            rec.duration_s = _elapsed(rec.started_at, rec.completed_at)
+
+        if exit_status is RunStatus.FAILED:
+            rec.status = RunStatus.FAILED
+            rec.failure_reason = "the trainer exited non-zero; see log/train.log"
+        else:
+            try:
                 plys = self._backend.normalize_outputs(
-                    self._work, self.run_dir, Sim3.from_matrix(self._record.T_local_from_internal)
+                    self._work, self.run_dir, Sim3.from_matrix(rec.T_local_from_internal)
                 )
-                self._record.outputs = [str(p.relative_to(self.run_dir)) for p in plys]
-            Runner.write_record(self._record, self.run_dir)
-        return st
+                ev = self._backend.collect_evidence(self._work, self._profile)
+                _record_evidence(rec, ev, self.run_dir)
+                verify_postconditions(rec, ev, self.run_dir, self.run_dir / "staged", plys)
+            except ContractError as e:
+                rec.status = RunStatus.FAILED
+                rec.failure_reason = str(e)
+            else:
+                rec.outputs = [str(p.relative_to(self.run_dir)) for p in plys]
+                rec.status = RunStatus.SUCCEEDED
+
+        Runner.write_record(rec, self.run_dir)
+        self._terminal = rec.status
+        return self._terminal
 
     def logs(self, tail: int | None = None) -> str:
         return self._inner.logs(tail)
