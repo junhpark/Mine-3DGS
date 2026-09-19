@@ -506,10 +506,22 @@ scientific validation remain pending.**
   같은지를 먼저 강제한다. 아니면 한 파일의 digest 를 검사하고 다른 파일을 역투영하게 된다.
 * **renderer 가 재현하지 않는 run 은 거부**: `RENDER_CRITICAL_OPTIONS` = `pose_opt`(학습 중
   카메라 pose 갱신 → dataset pose 는 모델이 맞춰진 pose 가 아님), `antialiased`(opacity 누적
-  방식이 달라 expected depth 가 달라지고 equivalence 미측정). 증인은 셋 — 실행된 argv,
-  `backend_out/cfg.yml`, profile 의 requests — 이고 **하나라도** 걸리면 거부한다. 추가로
-  checkpoint 에 `pose_adjust` 가 있으면 `check_checkpoint_blob` 이 그것만으로 거부한다.
-  `normalize_world_space` 를 재구현 대신 거부한 것과 같은 논리다.
+  방식이 달라 expected depth 가 달라지고 equivalence 미측정). 증인은 넷 — 실행된 argv,
+  `backend_out/cfg.yml`, profile 의 requests, 그리고 `backend_args` — 이고 **하나라도** 걸리면
+  거부한다. 추가로 checkpoint 에 `pose_adjust` 가 있으면 `check_checkpoint_blob` 이 그것만으로
+  거부한다. `normalize_world_space` 를 재구현 대신 거부한 것과 같은 논리다.
+* **`backend_args` 는 allowlist 로 읽는다** (`RENDER_NEUTRAL_BACKEND_ARGS`). `build_command` 가
+  `backend_args` 를 trainer 에 그대로 전달하므로 나쁜 이름 목록으로는 `camera_model`·`with_ut`·
+  `far_plane` 처럼 boolean 도 아니고 이름도 모르는 옵션을 잡을 수 없다. argv 는 docker 플래그가
+  섞여 있어 이 방식이 불가능하지만 `backend_args` 는 순수한 gsplat 네임스페이스라 가능하다.
+  reasoned about 하지 않은 키는 거부한다.
+* **승격 시 재확인**: manifest 는 재현 가능 여부를 기록하지 않으므로 `build_depth_surface` 가
+  promotion 직전 `require_reproducible_render` 를 run record 에 대해 다시 돌린다. 가드가 없던
+  빌드가 만든 depth 가 manifest 존재만으로 승격되는 경로를 닫는다.
+* **`--no-holdout-only` 는 claim 을 내리지 않는다**: `geometry_accuracy` 는 정의상 holdout TLS
+  에 대한 주장(`Claim` docstring)이고, judge 가 그것을 허용한 이유도 그 구간이 초기화에서
+  제외되었기 때문이다. holdout mask 를 끄면 run 이 학습에 쓴 형상을 다시 재게 되므로 경고와
+  함께 `geometry_diagnostic` 으로 강등한다.
 * **camera model**: `RENDERABLE_CAMERA_MODELS = {PINHOLE, SIMPLE_PINHOLE}`. 왜곡 모델은
   pinhole 로 투영되어 모든 ray 가 조용히 틀어지므로 거부한다.
 * **fail closed, CPU fallback 없음**: run != succeeded · dataset id/hash 불일치 · checkpoint
@@ -702,6 +714,8 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `pose_opt`/`antialiased` run 의 depth 렌더 | `ContractError` (exit 2) | renderer 가 재현하지 않는 설정이다 — equivalence 미검증 재현은 증거가 아니다 | pose 복원·mode 재현을 실제로 검증한 뒤 |
 | 왜곡 camera model 의 depth 렌더 | `ContractError` (exit 2) | pinhole 로 투영되어 모든 ray 가 조용히 틀어진다 | 해당 없음 (설계) |
 | manifest 의 `file` 이 naming contract 와 다름 | `ContractError` (exit 2) | 검사한 파일과 역투영할 파일이 달라진다 | 해당 없음 (설계) |
+| reasoned about 하지 않은 `backend_args` 키의 depth 렌더 | `ContractError` (exit 2) | trainer 에 그대로 전달되는 옵션이 투영/frustum 을 바꿀 수 있다 | 해당 항목이 neutral 임을 보인 뒤 |
+| `--no-holdout-only` 에 `geometry_accuracy` | claim 을 `geometry_diagnostic` 으로 강등 + 경고 | 학습에 쓴 형상을 다시 재는 수치다 | 해당 없음 (설계) |
 | run 의 최종 checkpoint 가 아닌 manifest | `ContractError` (exit 2) | 다른 모델을 기술하면서 나머지 검사를 통과한다 | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 원시 PLY | `ContractError` (exit 2) | 가우시안 중심은 표면이 아니다 (§1A) | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 `external_unverified` surface | `ContractError` (exit 2) | 외부 depth 는 기록된 run 과 묶여 있지 않다 | Phase 1B (`minegs_render`) |

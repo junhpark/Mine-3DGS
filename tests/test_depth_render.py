@@ -36,7 +36,8 @@ from minegs.eval.surface.render import (
     render_depths,
 )
 from minegs.ingest.common.colmap_io import read_model
-from minegs.train.runner.base import RunStatus
+from minegs.train.profiles import load_profile
+from minegs.train.runner.base import RunRecord, RunStatus
 from typer.testing import CliRunner
 
 from test_surface import geometry_argv, write_run
@@ -470,3 +471,63 @@ def test_a_backend_with_no_renderer_is_refused(dataset_small, tmp_path):
     # and a renderer for the wrong backend cannot be substituted in either
     with pytest.raises(ContractError, match="renders gsplat models"):
         render_depths(run_dir, ds, tmp_path / "d2", renderer=FakeRenderer())
+
+
+def test_unreasoned_backend_args_are_refused_but_the_light_profile_is_not(dataset_small, tmp_path):
+    """backend_args reach the trainer verbatim, so an unknown key is refused, not assumed safe.
+
+    `camera_model`, `with_ut` and `far_plane` all change the projection or the frustum and none
+    of them is a boolean flag the other witnesses would notice.
+    """
+    ds = dataset_small.dataset_dir
+    light = load_profile("light").model_dump(mode="json")
+
+    ok_dir = tmp_path / "runs" / "light"
+    make_run(ds, ok_dir, run_id="light", profile=light)
+    _, depth_dir = render_depths(ok_dir, ds, tmp_path / "ok", renderer=FakeRenderer())
+    assert (depth_dir / DEPTH_MANIFEST_FILE).is_file()  # a real profile must still render
+
+    for i, (key, value) in enumerate(
+        [("camera_model", "fisheye"), ("with_ut", True), ("far_plane", 50.0)]
+    ):
+        profile = {**light, "backend_args": {**light["backend_args"], key: value}}
+        run_dir = tmp_path / "runs" / f"arg{i}"
+        make_run(ds, run_dir, run_id=f"arg{i}", profile=profile)
+        with pytest.raises(ContractError, match=key):
+            render_depths(run_dir, ds, tmp_path / f"bad{i}", renderer=FakeRenderer())
+        assert not (tmp_path / f"bad{i}").exists()
+
+
+def test_promotion_re_checks_reproducibility_it_does_not_trust_the_manifest(env, tmp_path):
+    """Depth written by a build without the render guard must not promote on its manifest."""
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+
+    record = RunRecord.load(env.run_dir / "run.json")
+    record.command = ["python", "simple_trainer.py", "--pose_opt"]
+    record.save(env.run_dir / "run.json")
+
+    with pytest.raises(ContractError, match="render-critical"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert not (tmp_path / "surface").exists()
+
+
+def test_accuracy_is_a_claim_about_the_holdout_only(synthetic, tmp_path):
+    """--no-holdout-only measures the chainage the run was initialised on: that is not a claim."""
+    ds = synthetic.dataset_dir
+    run_dir = tmp_path / "runs" / "holdout"
+    make_run(ds, run_dir, run_id="holdout")
+    _, depth_dir = render_depths(run_dir, ds, renderer=FakeRenderer(depth_m=3.0))
+    rec, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
+    assert rec.depth_source == "minegs_render"
+
+    held, whole = tmp_path / "held.json", tmp_path / "whole.json"
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic, held))
+    assert r.exit_code == 0, r.output
+    assert json.loads(held.read_text())["claim"] == "geometry_accuracy"
+
+    r = runner.invoke(app, [*geometry_argv(surface_dir, synthetic, whole), "--no-holdout-only"])
+    assert r.exit_code == 0, r.output
+    report = json.loads(whole.read_text())
+    assert report["claim"] == "geometry_diagnostic"
+    assert report["chainage_range_m"] is None
+    assert "fit to the data the run saw" in r.output

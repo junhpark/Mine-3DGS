@@ -292,6 +292,17 @@ def geometry(
             # that these points sample the tunnel wall, in the second nothing ties the depth
             # to the run (§18, §1A). _resolve_pred has already refused unless --diagnostic.
             claim = Claim.GEOMETRY_DIAGNOSTIC
+        if claim is Claim.GEOMETRY_ACCURACY and not (holdout_only and j.holdout_ranges_m):
+            # geometry_accuracy is defined as accuracy *on holdout TLS* (Claim docstring), and
+            # the manifest only grants it because those ranges were excluded from
+            # initialisation. Measuring over the whole cloud instead measures the model against
+            # the geometry it was initialised and trained on, which is the leak the protocol
+            # gate exists to prevent -- so --no-holdout-only reports a number, not a claim.
+            console.print(
+                "[yellow]warning: --no-holdout-only measures the training chainage too, so "
+                "these numbers are fit to the data the run saw; reporting as diagnostic[/]"
+            )
+            claim = Claim.GEOMETRY_DIAGNOSTIC
         pred_pc = _to_tls(points, m)
         ref = read_ply(tls_ply)
         if ref.frame != "TLS_GLOBAL":

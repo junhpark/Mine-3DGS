@@ -315,6 +315,10 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
   | surface artifact, `external_unverified` | `ContractError` — depth 가 run 과 묶여 있지 않음 (Phase 1B) | 경고 + `geometry_diagnostic` |
   | surface artifact, `minegs_render` (Phase 1B) | `geometry_accuracy` | `geometry_accuracy` |
 
+  여기에 더해 **`--no-holdout-only` 는 claim 을 내리지 않는다**: `geometry_accuracy` 는 정의상
+  holdout TLS 에 대한 주장이고, holdout 구간을 벗어난 수치는 run 이 초기화·학습에 쓴 형상을
+  다시 재는 것이다. 그래서 경고와 함께 `geometry_diagnostic` 으로 보고한다.
+
 ### Phase 1B — 렌더링된 depth 가 증거가 되는 조건
 
 `minegs eval render-depth` 는 gsplat rasterizer 를 `render_mode="ED"` 로 돌려 view 마다 카메라 +z
@@ -338,11 +342,18 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
   통과한다.
 * **renderer 가 재현하지 않는 run 은 거부한다**: `pose_opt`(학습 중 카메라 pose 를 갱신하므로
   dataset pose 는 더 이상 모델이 맞춰진 pose 가 아니다) 와 `antialiased`(opacity 누적 방식이
-  달라져 expected depth 가 달라지고, equivalence 를 측정한 적이 없다). 증인 셋 — 실행된 argv,
-  옆에 남아 있다면 trainer 자신의 `cfg.yml`, profile 의 capability requests — 중 **하나라도**
-  해당하면 거부하고, checkpoint 에 `pose_adjust` 가 들어 있으면 그것만으로도 거부한다.
-  `normalize_world_space` 를 재구현 대신 거부한 것과 같은 이유다: equivalence 미검증 재현은
-  claim 경로의 증거가 될 수 없다.
+  달라져 expected depth 가 달라지고, equivalence 를 측정한 적이 없다). 증인 넷 — 실행된 argv,
+  옆에 남아 있다면 trainer 자신의 `cfg.yml`, profile 의 capability requests, 그리고
+  `backend_args` — 중 **하나라도** 해당하면 거부하고, checkpoint 에 `pose_adjust` 가 들어 있으면
+  그것만으로도 거부한다. `normalize_world_space` 를 재구현 대신 거부한 것과 같은 이유다:
+  equivalence 미검증 재현은 claim 경로의 증거가 될 수 없다.
+* **`backend_args` 는 allowlist 로 본다**: profile 의 `backend_args` 는 trainer 에 그대로
+  전달되므로(`build_command`), 알려진 나쁜 이름 목록으로는 `camera_model`·`with_ut`·`far_plane`
+  같은 것을 놓친다. 그래서 *reasoned about 하지 않은 키는 거부*한다
+  (`RENDER_NEUTRAL_BACKEND_ARGS`). light profile 은 전부 neutral 이라 그대로 렌더된다.
+* **승격 시 재확인한다**: manifest 에는 재현 가능 여부가 기록되지 않으므로,
+  `build_depth_surface` 가 promotion 직전에 같은 검사를 run record 에 대해 다시 돌린다.
+  가드가 없던 빌드가 만든 depth 가 manifest 만으로 승격되지 않는다.
 * **왜곡 있는 camera model 도 거부한다**: rasterizer 는 pinhole 로 투영하므로 `SIMPLE_RADIAL`
   등은 왜곡이 조용히 빠진 채 모든 ray 가 틀어진다. `PINHOLE`/`SIMPLE_PINHOLE` 만 지원.
 * **fail closed**: run != succeeded · dataset id/hash 불일치 · checkpoint 없음/경로 깨짐 ·

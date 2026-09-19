@@ -236,12 +236,44 @@ RENDER_CRITICAL_OPTIONS = {
         "equivalence has never been measured"
     ),
 }
+#: ``backend_args`` keys this renderer has reasoned about and knows do not change the
+#: projection: they steer optimisation, initialisation, colour or what gets written, none of
+#: which moves a depth sample. Everything else is refused *because* it has not been reasoned
+#: about — the profile forwards arbitrary keys to the trainer verbatim
+#: (``GsplatBackend.build_command``), so an allowlist of known-bad names would silently miss
+#: ``camera_model``, ``with_ut``, ``far_plane`` and anything a future gsplat adds.
+RENDER_NEUTRAL_BACKEND_ARGS = frozenset(
+    {
+        "strategy",
+        "strategy.absgrad",
+        "init_type",
+        "init_num_pts",
+        "init_extent",
+        "sh_degree",
+        "eval_steps",
+        "save_steps",
+        "save_ply",
+        "ply_steps",
+        "normalize_world_space",  # refused when true, and the frame check covers it besides
+        "packed",
+        "batch_size",
+        "steps_scaler",
+    }
+)
+
 #: Camera models whose projection ``rasterization`` reproduces. Anything with distortion would
 #: be rendered as if it had none, which is a quiet geometric error in every view.
 RENDERABLE_CAMERA_MODELS = frozenset({"PINHOLE", "SIMPLE_PINHOLE"})
 
+UNREASONED_REASON = (
+    "this renderer has not reasoned about that option and does not pass it to the rasteriser, "
+    "so a run that set it was trained under a projection or frustum this render does not "
+    "reproduce. Add it to RENDER_NEUTRAL_BACKEND_ARGS once it is shown not to move a depth "
+    "sample, or reproduce it here"
+)
 
-def _require_reproducible_render(record, run_dir: Path) -> None:
+
+def require_reproducible_render(record, run_dir: Path) -> None:
     """Refuse a run configured in a way this renderer does not reproduce (§1B).
 
     Three independent witnesses, because any one of them can be absent: the argv the runner
@@ -267,9 +299,18 @@ def _require_reproducible_render(record, run_dir: Path) -> None:
     for cap, opt in (("pose_refinement", "pose_opt"), ("antialiasing", "antialiased")):
         if requests.get(cap):
             seen.setdefault(opt, f"the profile requires {cap}")
+    # The fourth witness, and the only one that can be read exhaustively: backend_args is a
+    # clean namespace of gsplat options, so an unknown key there is refused rather than
+    # assumed harmless. argv cannot be read this way — it is full of docker flags.
+    for key in (record.profile or {}).get("backend_args") or {}:
+        opt = canonical_option(key)
+        if opt in RENDER_NEUTRAL_BACKEND_ARGS or opt in seen:
+            continue
+        seen[opt] = f"the profile passes backend_args {key!r}"
     if seen:
         detail = "; ".join(
-            f"{opt} ({why}): {RENDER_CRITICAL_OPTIONS[opt]}" for opt, why in sorted(seen.items())
+            f"{opt} ({why}): {RENDER_CRITICAL_OPTIONS.get(opt, UNREASONED_REASON)}"
+            for opt, why in sorted(seen.items())
         )
         raise ContractError(
             f"run {record.run_id} used render-critical training options this renderer does not "
@@ -410,7 +451,7 @@ def render_depths(
     record = check_run(run_dir, manifest_ds.dataset_id, dataset_hash)
     run_id = record.run_id
     _require_metric_outputs(record)
-    _require_reproducible_render(record, run_dir)
+    require_reproducible_render(record, run_dir)
     ckpt = _require_checkpoint(record, run_dir)
 
     backend_name = record.backend.get("name", "")
@@ -503,9 +544,11 @@ __all__ = [
     "DEPTH_DIRNAME",
     "RENDERABLE_CAMERA_MODELS",
     "RENDER_CRITICAL_OPTIONS",
+    "RENDER_NEUTRAL_BACKEND_ARGS",
     "DepthRenderer",
     "GsplatDepthRenderer",
     "check_checkpoint_blob",
     "get_depth_renderer",
     "render_depths",
+    "require_reproducible_render",
 ]
