@@ -10,10 +10,11 @@ not be reported as a validated change volume.
 from __future__ import annotations
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from minegs.core.errors import ContractError
 from minegs.eval.sections.sections import SectionSeries
+from minegs.eval.volume.coverage import Interval, segmented_integral, subtract_intervals
 
 
 class ChangeReport(BaseModel):
@@ -29,6 +30,11 @@ class ChangeReport(BaseModel):
     valid_section_count: int
     missing_section_count: int
     reference_axis: str
+    #: The chainage spans ΔV was actually integrated over, and the spans inside the common range
+    #: that neither epoch covered. ΔV is the sum over the first list and says nothing about the
+    #: second (Phase 1C).
+    differenced_intervals_m: list[Interval] = Field(default_factory=list)
+    missing_intervals_m: list[Interval] = Field(default_factory=list)
     # never "change_volume": that claim needs the Phase 7 epoch-pair protocol (§5)
     claim: str = "geometry_diagnostic"
 
@@ -51,7 +57,10 @@ def diff_sections(
         delta.append(None if np.isnan(va) or np.isnan(vb) else float(vb - va))
     d = np.array([v if v is not None else np.nan for v in delta])
     m = ~np.isnan(d)
-    trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    # Gap-safe, for the same reason ``integrate_sections`` is (Phase 1C): a station missing from
+    # either epoch means nobody measured that span twice, and a trapezoid across it would report
+    # a difference over tunnel neither epoch observed.
+    dv, spans = segmented_integral(common.astype(float), d)
     return ChangeReport(
         epoch_a=epoch_a,
         epoch_b=epoch_b,
@@ -60,8 +69,12 @@ def diff_sections(
         section_interval_m=a.interval_m,
         chainage_m=[float(s) for s in common],
         delta_area_m2=delta,
-        delta_volume_m3=float(trap(d[m], common[m])) if m.sum() >= 2 else 0.0,
+        delta_volume_m3=dv,
         valid_section_count=int(m.sum()),
         missing_section_count=int((~m).sum()),
         reference_axis=reference_axis,
+        differenced_intervals_m=spans,
+        missing_intervals_m=subtract_intervals(
+            [(float(common[0]), float(common[-1]))] if len(common) >= 2 else [], spans
+        ),
     )

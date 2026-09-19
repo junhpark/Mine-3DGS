@@ -40,7 +40,8 @@ minegs eval    protocol  data/synthetic_tunnel/dataset
 # 단면 간격·슬랩 두께·각도 bin 은 점밀도에 맞춰야 한다. 출력의 "valid n/N" 로 확인할 것
 minegs eval sections data/synthetic_tunnel/raw/tls_full.ply data/synthetic_tunnel/dataset \
        --interval-m 2 --thickness-m 0.5 --angle-bins 72 --out sections.json
-minegs eval volume   sections.json data/synthetic_tunnel/dataset --design-radius-m 2.4
+# 원시 PLY 로 자른 단면은 raw_cloud 로 기록되어 volume_accuracy 를 만들 수 없다 (§1C)
+minegs eval volume   sections.json data/synthetic_tunnel/dataset --design-radius-m 2.4 --diagnostic
 # claim 을 담는 geometry 는 surface artifact 를 요구한다 (§1.7). 원시 PLY 는 --diagnostic 전용
 minegs eval geometry <surface_dir> data/synthetic_tunnel/dataset --tls-ply data/synthetic_tunnel/raw/tls_full.ply
 minegs train command data/synthetic_tunnel/dataset --profile light     # 실행할 gsplat 커맨드 확인
@@ -65,7 +66,7 @@ minegs/
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
     runner/    base · local(docker) · runpod(Phase 6, fail-closed) · sync(rclone)
     profiles/  light.yaml · heavy.yaml
-  eval/      protocol · register(Sim3 → ICP → diagnostics) · surface(render=gsplat depth · depth 역투영 → surface artifact) · geometry(양방향) · sections(A(s)) · volume(∫A ds, 설계대비) · change · render(PSNR/SSIM/LPIPS)
+  eval/      protocol · register(Sim3 → ICP → diagnostics) · surface(render=gsplat depth · depth 역투영 → surface artifact) · geometry(양방향) · sections(A(s) + section artifact) · volume(∫A ds gap-safe, 설계대비, coverage) · change · render(PSNR/SSIM/LPIPS)
   viz/       viewer(Viser) · overlay(규약 캘리브레이션 = 골든 게이트) · compare · export(.spz/.splat)
   cli/       ingest / dataset / train / eval / viz / sync
 docker/      Dockerfile.gpu · Dockerfile.cpu · entrypoint.sh
@@ -270,6 +271,8 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 
 ## Metric surface artifact (Phase 1A) · metric depth rendering (Phase 1B)
 
+> 단면·체적까지의 증거 경계는 아래 [Section / volume evidence boundary (Phase 1C)](#section--volume-evidence-boundary-phase-1c) 에 이어진다.
+
 **가우시안 중심은 표면이 아니다** (원칙 7). `runs/<run_id>/point_cloud/*.ply` 는 볼류메트릭 방사장의
 파라미터이지 갱도 벽면의 샘플이 아니므로, 그것을 TLS 와 비교하면 "복원이 얼마나 정확한가" 가 아니라
 "옵티마이저가 프리미티브를 어디에 두었는가" 를 재게 된다. 그래서 surface 는 **유도**하고, 유도 사실을
@@ -381,6 +384,108 @@ CUDA 도 gsplat 도 없다. 주변의 계약 검증은 전부 테스트되지만
 TSDF(`eval/surface/tsdf.py`)·mesh 재구성은 여전히 미구현이고, 실제 갱도 데이터의 과학적 검증도
 수행하지 않았다. 구조적 검증만이다 (`tests/test_surface.py` T1–T10, `tests/test_depth_render.py`).
 
+## Section / volume evidence boundary (Phase 1C)
+
+Phase 1A·1B 가 `run → rendered depth → surface` 까지 닫았지만, `eval volume` 은 여전히 dataset
+manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 줬다. manifest 는 *데이터셋* 이 그 주장을
+지탱할 수 있다고 말할 뿐, 누가 넣은 어떤 구름인지에 대해서는 아무 말도 하지 않는다. 그래서
+`raw/tls_full.ply` 로 자른 단면이 복원으로 자른 단면과 같은 주장에 도달했다. Phase 1C 는 체인을
+끝까지 연장하고, 결측 구간을 가로지르는 적분을 금지한다.
+
+```bash
+# surface artifact 를 자르면 provenance 가 붙은 section artifact 가 나온다
+minegs eval sections data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/dataset \
+       --interval-m 1 --thickness-m 0.5 --angle-bins 72 --out sections.json
+minegs eval volume   sections.json data/<id>/dataset --design-radius-m 2.4
+# → [volume_accuracy] V = ... m³ over 20.0-26.0 m
+#    integrated 6.00 of 6.00 m (100.0%) in 1 segment(s); gaps: none
+```
+
+### Section artifact
+
+`SectionRecord` (schema 1.0) 는 하나의 시계열에 대해 다음에 답한다 — **어느 dataset 의, 어느
+verified surface 에서, 어느 run 에서, 어떤 depth provenance 로, 어떤 reference axis 를 따라,
+어떤 parameters 로** 잘랐는가.
+
+`section_id · dataset_id · dataset_hash · source{kind, surface_id, run_id, depth_source,
+point_sha256, point_path} · reference_axis · reference_axis_sha256 · frame · unit · series ·
+parameters · provenance`.
+
+기록한 것은 전부 다시 대조한다 (`check_section_record`, `--diagnostic` 여부와 무관하게 실행):
+
+| 기록 | 무엇과 대조하는가 |
+|---|---|
+| `dataset_id` · `dataset_hash` | 지금의 dataset |
+| `reference_axis` | manifest 가 지금 선언하는 축 문자열 |
+| `reference_axis_sha256` | 축 CSV 파일 자체의 digest |
+| `series` 의 chainage 격자 | 지금의 centerline 과 기록된 parameters 로 다시 만든 station 격자 |
+| `source.surface_id` · `point_sha256` · `depth_source` | surface artifact 가 아직 디스크에 있다면 그것 (`check_surface` 포함) |
+| `series.frame` | record 의 `frame` (TLS_GLOBAL) |
+
+축 digest 가 따로 필요한 이유: `DATASET_HASH_PATTERNS` 는 dataset 루트의 `centerline.csv` 만
+덮는다. manifest 가 다른 경로를 가리키면 dataset hash 는 축 편집을 보지 못하고, chainage 는 다른
+polyline 위에서는 다른 뜻이 된다.
+
+### volume_accuracy 게이트
+
+다음이 **동시에** 성립해야 한다. 하나라도 빠지면 거부, `--diagnostic` 이면 `geometry_diagnostic`.
+
+1. dataset protocol 이 `VOLUME_ACCURACY` 를 허용한다;
+2. 입력이 bare series 가 아니라 section artifact 다;
+3. record 가 지금의 dataset·축·surface 와 일치한다 (위 표, 항상 검사);
+4. `source.kind == "surface"` 이고 `depth_source == "minegs_render"` 다;
+5. 적분이 선언된 geometry holdout 구간으로 제한된다;
+6. 그 구간의 coverage 가 완전하다.
+
+| 입력 | `--diagnostic` 없이 | `--diagnostic` |
+|---|---|---|
+| bare `SectionSeries` JSON (1C 이전) | `ContractError` — provenance 없음 | 경고 + `geometry_diagnostic` |
+| `raw_cloud` section artifact | `ContractError` — 어떤 복원에 대한 증거도 아님 | 경고 + `geometry_diagnostic` |
+| `external_unverified` surface 기반 | `ContractError` — depth 가 run 과 묶여 있지 않음 | 경고 + `geometry_diagnostic` |
+| `minegs_render` surface 기반, holdout coverage 불완전 | `ContractError` — 빠진 구간을 이름으로 보고 | 경고 + `geometry_diagnostic` (partial) |
+| `minegs_render` surface 기반, coverage 완전 | `volume_accuracy` | `volume_accuracy` |
+| 다른 dataset/축/변경된 surface | `ContractError` | `ContractError` (플래그로 면제되지 않음) |
+
+`eval geometry` 와 같은 이유로 **`--no-holdout-only` 는 claim 을 내린다**: `volume_accuracy` 는
+정의상 holdout 에 대한 주장이고, 전 구간 적분은 run 이 학습에 쓴 형상을 다시 재는 것이다.
+
+### Gap-safe 적분
+
+```
+chainage  0   1   2   3   4
+area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
+                                    integrated [0,1] ∪ [3,4], missing [1,3]
+```
+
+* 연속된 관측 station 의 run 안에서만 적분한다. gap 은 적분 경계이고, 그 구간의 체적은
+  추정하지도 보간하지도 않는다. 따라서 coverage 가 불완전하면 수치는 항상 **과소** 추정이다.
+* 서로 다른 holdout 구간 사이도 같은 이유로 절대 잇지 않는다. 구간이 겹치거나 맞닿으면 먼저
+  union 으로 합친 뒤 각각 독립 적분한다.
+* 관측 station 이 하나뿐인 run 은 길이가 0 이므로 적분에 기여하지 않는다. 그 station 은 여전히
+  "관측됨" 으로 세고, 주변 구간은 여전히 missing 이다. 둘 다 참이다.
+* coverage 는 **요청한 구간** 기준이다. 시계열이 holdout 중간에서 끝나면 coverage 는 절반이지
+  "짧은 갱도의 완전 coverage" 가 아니다.
+* `integrate_sections` · `compare_to_design` · `diff_sections` 가 모두 같은 helper
+  (`eval/volume/coverage.py`)를 쓴다. 셋이 "어느 구간이 관측되었는가" 에 대해 갈라지지 않는다.
+* `VolumeReport` 에 `coverage{requested_intervals_m, integrated_intervals_m, missing_intervals_m,
+  requested_length_m, covered_length_m, coverage_fraction, valid/missing_section_count,
+  missing_chainages_m}` 와 `segments[]` 가 실린다. `volume_m3` 는 segment 합과 정확히 같다.
+* **임의 임계값을 만들지 않는다.** 이 PR 은 80 %/90 % 같은 coverage threshold 를 도입하지
+  않는다. claim 은 "요청한 holdout 을 전부 적분할 수 있어야 한다" 로 두고, 실측 검증으로 허용
+  가능한 최소 coverage 가 정해지면 그때 별도 결정으로 완화한다.
+
+### 알려진 한계
+
+* **면적은 생산자의 선언이다.** 다시 계산하려면 점군이 필요한데 volume 평가는 그것을 받지
+  않는다. digest 와 station 격자가 record 를 이 dataset·이 축·이 surface 에 묶지만, 스스로
+  모순 없게 만든 파일은 진짜와 구별되지 않는다. `DepthManifest` 와 같은 경계 — 사고를 막는
+  경계이지 서명이 아니다.
+* `minegs eval change` 는 dataset 을 인자로 받지 않으므로 아무것도 대조하지 않는다. 그래서
+  결과는 영구히 `geometry_diagnostic` 이다 (pair protocol 은 Phase 7).
+* `--start-m`/`--end-m` 없이 자른 격자는 축 시작점부터 `interval_m` 간격이다. holdout 경계가
+  그 격자에 떨어지지 않으면 coverage 는 완전해질 수 없고, 거부 메시지가 재단(re-section)을
+  안내한다.
+
 ## 평가 주장 게이트 (§5)
 
 `minegs eval protocol <dataset>` 이 manifest 의 `split`/`initialization` 만 보고 주장 가능 범위를 판정한다.
@@ -402,7 +507,7 @@ TSDF(`eval/surface/tsdf.py`)·mesh 재구성은 여전히 미구현이고, 실�
 | 0B Real E57 ingest | **0B.1–0B.3 implemented** (inventory·증거 기반 매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C Metric dataset golden gate | **implementation complete, G1 structurally tested** — 합성 staging → `from-e57` → 재투영 Golden Gate 가 CI 에서 돈다. **G2: DEFERRED / NOT VALIDATED** (실제 E57 미실행) |
 | 0D Local GS baseline | **0D.1 resume safety contract** + **0D.2 local GPU baseline execution contract: implemented + structurally tested** — gsplat v1.5.3 training resume 은 unsupported 이고 fail closed; 성공한 run 은 checkpoint·PLY·step 진행·frame invariant 를 모두 통과한 것만 기록된다. **실제 GPU baseline 미실행** → 0D 전체 **NOT COMPLETE** (ROADMAP §Phase 0D) |
-| 1 Metric surface & evaluation | **1A metric surface artifact + depth fusion** 및 **1B metric depth rendering: implemented + structurally tested** — 학습된 run → 렌더 depth + manifest → 검증된 surface artifact → claim 을 담는 geometry. 검증된 manifest 가 있을 때만 `minegs_render` 이고, 외부 depth 는 diagnostic 전용이다. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), **TSDF/mesh: NOT IMPLEMENTED**, 실측 데이터 과학적 검증: **NOT VALIDATED** |
+| 1 Metric surface & evaluation | **1A metric surface artifact + depth fusion**, **1B metric depth rendering**, **1C section/volume evidence boundary: implemented + structurally tested** — 학습된 run → 렌더 depth + manifest → 검증된 surface artifact → section artifact → gap-safe 체적 → claim. 검증된 manifest 가 있을 때만 `minegs_render` 이고, 외부 depth·원시 PLY·bare series 는 diagnostic 전용이다. 결측 구간을 가로지르는 적분은 없다. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), **TSDF/mesh: NOT IMPLEMENTED**, 실측 데이터 과학적 검증: **NOT VALIDATED** |
 | 2 E57 end-to-end MVP (v0.1) | 미착수 |
 | 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |
 | 4 Advanced GS / heavy | 미착수 — `depth_loss`·`normalize_world_space` 를 여기서 설계 |

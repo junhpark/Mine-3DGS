@@ -356,9 +356,48 @@ def geometry(
     run_guarded(go)
 
 
+RAW_SECTIONS_WARNING = (
+    "these sections were cut from a raw point cloud, not from a verified surface artifact. "
+    "They are recorded as such and can never support a volume_accuracy claim, whatever the "
+    "dataset protocol allows. For a claim-capable series, render depth with "
+    "`minegs eval render-depth`, fuse it with `minegs eval surface-depth`, and section the "
+    "surface directory."
+)
+
+
+def _unverified_sections(rec) -> str:
+    src = rec.source
+    if src.kind != "surface":
+        return (
+            f"sections {rec.section_id} were cut from a raw point cloud "
+            f"({src.point_path}), so they carry no evidence about any reconstruction: the same "
+            "cloud paired with any dataset would produce the same series. A volume_accuracy "
+            "claim needs sections cut from a surface minegs rendered and fused (§1C). "
+            "Pass --diagnostic for non-claim numbers."
+        )
+    return (
+        f"sections {rec.section_id} were cut from surface {src.surface_id}, whose depth maps "
+        f"minegs did not render (depth_source={src.depth_source}). Nothing ties those maps to "
+        f"run {src.run_id}, so the surface cannot carry a geometry claim and neither can a "
+        "volume integrated from it (§1A, §1C). Pass --diagnostic for non-claim numbers."
+    )
+
+
+BARE_SERIES = (
+    "this is a bare section series with no provenance: it records no dataset, no surface and "
+    "no run, so nothing can be checked about where its areas came from. A volume_accuracy "
+    "claim needs a section artifact from `minegs eval sections` over a verified surface (§1C). "
+    "Pass --diagnostic for non-claim numbers."
+)
+
+
 @app.command()
 def sections(
-    ply: Path = typer.Argument(...),
+    pred: Path = typer.Argument(
+        ...,
+        help="surface artifact directory from `eval surface-depth`; a raw PLY is accepted but "
+        "is recorded as diagnostic-only",
+    ),
     dataset_dir: Path = typer.Argument(...),
     interval_m: float = typer.Option(1.0),
     thickness_m: float = typer.Option(0.1),
@@ -367,65 +406,194 @@ def sections(
     end_m: float | None = typer.Option(None),
     out: Path | None = typer.Option(None),
 ) -> None:
-    """Cross-section areas A(s) along the centerline (§11)."""
-    from minegs.core.pointcloud import read_ply
-    from minegs.eval.sections import extract_sections
+    """Cross-section areas A(s) along the centerline, as a section artifact (§11).
+
+    The artifact records which dataset, which surface, which run and which reference axis the
+    series was cut from. That provenance is what `eval volume` interrogates before it grants a
+    volume_accuracy claim; a raw PLY still sections fine and is recorded as what it is.
+    """
+    import numpy as np
+
+    from minegs.eval.sections import build_section_record, section_source
 
     def go() -> None:
         m, cl = _load_dataset_and_centerline(dataset_dir)
-        pc = _to_tls(read_ply(ply), m)
-        ser = extract_sections(pc.xyz, cl, interval_m, thickness_m, angle_bins, start_m, end_m)
-        console.print(
-            f"sections valid {ser.valid_count()}/{len(ser.sections)}  mean A = {float(__import__('numpy').nanmean(ser.areas())):.3f} m²"
+        points, surface = _resolve_pred(pred, dataset_dir, m, diagnostic=True)
+        pc = _to_tls(points, m)
+        src = section_source(surface, pred)
+        rec = build_section_record(
+            pc.xyz,
+            src,
+            dataset_dir,
+            m,
+            cl,
+            interval_m=interval_m,
+            thickness_m=thickness_m,
+            angle_bins=angle_bins,
+            start_m=start_m,
+            end_m=end_m,
         )
-        dump_json(ser, out)
+        ser = rec.series
+        console.print(
+            f"sections [bold]{rec.section_id}[/] ({src.kind}"
+            + (f", depth {src.depth_source}, run {src.run_id}" if src.kind == "surface" else "")
+            + f"): valid {ser.valid_count()}/{len(ser.sections)}  "
+            f"mean A = {float(np.nanmean(ser.areas())):.3f} m²"
+        )
+        if src.kind == "raw_cloud":
+            console.print(f"[yellow]warning: {RAW_SECTIONS_WARNING}[/]")
+        elif not src.supports_accuracy_claim:
+            console.print(
+                f"[yellow]warning: depth_source={src.depth_source}; these sections cannot "
+                "support a volume_accuracy claim[/]"
+            )
+        dump_json(rec, out)
 
     run_guarded(go)
 
 
+def _incomplete_coverage(rep, ranges) -> str:
+    cov = rep.coverage
+    asked = ", ".join(f"{lo:g}-{hi:g} m" for lo, hi in ranges)
+    return (
+        f"volume_accuracy is a claim about the whole declared holdout {asked}, and "
+        f"{cov.covered_length_m:.2f} m of {cov.requested_length_m:.2f} m of it "
+        f"({cov.coverage_fraction * 100:.1f}%) has no observed sections: {cov.describe_gaps()}. "
+        "The volume over a gap is not measured, and this project does not interpolate it or "
+        "accept a coverage threshold it has not validated. Re-section over the holdout "
+        "(`--start-m`/`--end-m`) once the reconstruction covers it, or pass --diagnostic for "
+        "the partial volume with this coverage reported alongside it."
+    )
+
+
 @app.command()
 def volume(
-    sections_json: Path = typer.Argument(...),
+    sections_json: Path = typer.Argument(
+        ..., help="section artifact from `eval sections` (a bare series is diagnostic-only)"
+    ),
     dataset_dir: Path = typer.Argument(...),
     design_radius_m: float | None = typer.Option(
         None, help="circular design profile for over/underbreak"
     ),
+    holdout_only: bool = typer.Option(
+        True, help="restrict the integration to the manifest's holdout chainage ranges"
+    ),
     diagnostic: bool = typer.Option(False),
     out: Path | None = typer.Option(None),
 ) -> None:
-    """∫A(s)ds from a sections JSON (+ design comparison) (§11)."""
-    import json
+    """∫A(s)ds from a section artifact (+ design comparison) (§11).
 
-    from minegs.core.errors import ProtocolViolation
-    from minegs.core.manifest import Manifest
+    A ``volume_accuracy`` claim needs all of: a dataset whose protocol grants it, a section
+    artifact belonging to *this* dataset and axis, sections cut from a surface minegs rendered,
+    integration restricted to the declared holdout, and complete coverage of it. Anything else
+    is refused, or computed as ``geometry_diagnostic`` with --diagnostic.
+    """
+    from minegs.core.errors import ContractError, ProtocolViolation
+    from minegs.core.provenance import sha256_tree
     from minegs.eval.protocol import Claim, judge
-    from minegs.eval.sections.sections import SectionSeries
+    from minegs.eval.sections import check_section_record, load_section_input, reference_axis_of
     from minegs.eval.volume import compare_to_design, integrate_sections
+    from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
     def go() -> None:
-        m = Manifest.load_dataset(dataset_dir, strict_layout=False)
+        m, cl = _load_dataset_and_centerline(dataset_dir)
         j = judge(m)
-        claim = Claim.VOLUME_ACCURACY
-        if not j.allows(claim):
-            if not diagnostic:
-                raise ProtocolViolation(
-                    f"{m.dataset_id}: protocol {j.primary.value} cannot claim volume_accuracy; pass --diagnostic"
+        rec, ser = load_section_input(sections_json)
+        if rec is not None:
+            # Unconditional, --diagnostic included: a series whose provenance names another
+            # dataset, another axis or a surface that has since changed is not a weaker number,
+            # it is a different tunnel (§1C).
+            check_section_record(
+                rec,
+                m.dataset_id,
+                sha256_tree(dataset_dir, DATASET_HASH_PATTERNS),
+                dataset_dir,
+                m,
+                cl,
+            )
+            console.print(
+                f"sections [bold]{rec.section_id}[/] ({rec.source.kind}"
+                + (
+                    f", depth {rec.source.depth_source}, surface {rec.source.surface_id}, "
+                    f"run {rec.source.run_id}"
+                    if rec.source.kind == "surface"
+                    else ""
                 )
+                + f", {len(ser.sections)} stations along {rec.reference_axis})"
+            )
+
+        claim = Claim.VOLUME_ACCURACY
+        refusal: tuple[type[Exception], str] | None = None
+        if not j.allows(claim):
+            refusal = (
+                ProtocolViolation,
+                f"{m.dataset_id}: protocol {j.primary.value} cannot claim volume_accuracy "
+                f"({'; '.join(j.refusals) or 'no chainage holdout declared'}); "
+                "pass --diagnostic for non-claim numbers",
+            )
+        elif not j.holdout_ranges_m:
+            refusal = (
+                ProtocolViolation,
+                f"{m.dataset_id}: volume_accuracy is defined on the declared geometry holdout, "
+                "and this manifest declares no chainage range to evaluate over",
+            )
+        elif rec is None:
+            refusal = (ContractError, f"{sections_json}: {BARE_SERIES}")
+        elif not rec.supports_accuracy_claim:
+            refusal = (ContractError, _unverified_sections(rec))
+        if refusal is not None:
+            if not diagnostic:
+                raise refusal[0](refusal[1])
+            console.print(f"[yellow]diagnostic: {refusal[1]}[/]")
             claim = Claim.GEOMETRY_DIAGNOSTIC
-        ser = SectionSeries.model_validate(json.loads(sections_json.read_text()))
-        axis = (
-            f"centerline:{m.centerline.source}:{m.centerline.file}" if m.centerline else "unknown"
-        )
-        rep = integrate_sections(ser, axis)
+
+        if claim is Claim.VOLUME_ACCURACY and not holdout_only:
+            # Same downgrade `eval geometry` makes, for the same reason: volume_accuracy is
+            # defined over the holdout (Claim docstring), and the manifest grants it only
+            # because those ranges were kept out of initialisation. Integrating the whole drift
+            # measures the run against the geometry it was fitted to, so it reports a number.
+            console.print(
+                "[yellow]warning: --no-holdout-only integrates the training chainage too, so "
+                "this volume is fit to the data the run saw; reporting as diagnostic[/]"
+            )
+            claim = Claim.GEOMETRY_DIAGNOSTIC
+
+        axis = reference_axis_of(m) if m.centerline else "unknown"
+        # On the claim path the integration is restricted to the holdout ranges, because that is
+        # what volume_accuracy is defined as (Claim docstring) and what the manifest excluded
+        # from initialisation. Mixing the training chainage in would measure the run against the
+        # geometry it was fitted to.
+        ranges = list(j.holdout_ranges_m) if claim is Claim.VOLUME_ACCURACY else None
+        rep = integrate_sections(ser, axis, ranges=ranges)
+        if claim is Claim.VOLUME_ACCURACY and not rep.coverage.complete:
+            if not diagnostic:
+                raise ContractError(_incomplete_coverage(rep, ranges))
+            console.print(f"[yellow]diagnostic: {_incomplete_coverage(rep, ranges)}[/]")
+            claim = Claim.GEOMETRY_DIAGNOSTIC
+            ranges = None
+            rep = integrate_sections(ser, axis, ranges=ranges)
         rep.claim = claim.value
+        if rec is not None:
+            rep.section_id = rec.section_id
+            rep.source = rec.source.model_dump(mode="json")
+        cov = rep.coverage
         console.print(
-            f"\\[{claim.value}] V = {rep.volume_m3:.2f} m³ over {rep.start_chainage_m}-{rep.end_chainage_m} m ({rep.valid_section_count} valid / {rep.missing_section_count} missing sections)"
+            f"\\[{claim.value}] V = {rep.volume_m3:.2f} m³ over "
+            f"{rep.start_chainage_m}-{rep.end_chainage_m} m "
+            f"({rep.valid_section_count} valid / {rep.missing_section_count} missing sections)"
+        )
+        console.print(
+            f"  integrated {cov.covered_length_m:.2f} of {cov.requested_length_m:.2f} m "
+            f"({cov.coverage_fraction * 100:.1f}%) in {len(rep.segments)} segment(s); "
+            f"gaps: {cov.describe_gaps()}"
         )
         result = {"volume": rep}
         if design_radius_m:
-            dc = compare_to_design(ser, design_radius_m)
+            dc = compare_to_design(ser, design_radius_m, ranges=ranges)
             console.print(
-                f"overbreak {dc.overbreak_m3:.2f} m³  underbreak {dc.underbreak_m3:.2f} m³ (design A={dc.design_area_m2:.2f} m²)"
+                f"overbreak {dc.overbreak_m3:.2f} m³  underbreak {dc.underbreak_m3:.2f} m³ "
+                f"(design A={dc.design_area_m2:.2f} m², same {len(dc.overbreak_segments_m3)} "
+                "segment(s))"
             )
             result["design"] = dc
         dump_json(result, out)
@@ -445,14 +613,15 @@ def change(
 
     Diagnostic only: a validated change_volume claim needs the Phase 7 epoch-pair protocol.
     """
-    import json
-
     from minegs.eval.change import diff_sections
-    from minegs.eval.sections.sections import SectionSeries
+    from minegs.eval.sections import load_section_input
 
     def go() -> None:
-        a = SectionSeries.model_validate(json.loads(a_json.read_text()))
-        b = SectionSeries.model_validate(json.loads(b_json.read_text()))
+        # Either input shape: a section artifact or a bare pre-1C series. Neither is checked
+        # against a dataset here, because this command names no dataset -- which is part of why
+        # its result can never be more than diagnostic.
+        _, a = load_section_input(a_json)
+        _, b = load_section_input(b_json)
         rep = diff_sections(a, b, epoch_a, epoch_b, "centerline")
         console.print(
             f"\\[{rep.claim}] ΔV = {rep.delta_volume_m3:+.2f} m³ over "
