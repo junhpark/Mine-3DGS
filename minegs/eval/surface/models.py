@@ -257,7 +257,8 @@ def find_depth_manifest(depth_dir: str | Path) -> Path | None:
 def verify_depth_manifest(
     manifest: DepthManifest,
     depth_dir: Path,
-    run_id: str,
+    run,
+    run_dir: Path,
     dataset_id: str,
     dataset_hash: str,
     cameras: dict,
@@ -271,11 +272,13 @@ def verify_depth_manifest(
     bytes on disk. Any one of those drifting means the maps are no longer describing the thing
     the surface will be compared to, so this refuses rather than downgrading silently.
     """
+    from minegs.eval.surface.depth import depth_map_path
+
     where = depth_dir / DEPTH_MANIFEST_FILE
-    if manifest.run_id != run_id:
+    if manifest.run_id != run.run_id:
         raise ContractError(
             f"{where}: depth was rendered from run {manifest.run_id!r}, but --run-dir names "
-            f"{run_id!r}"
+            f"{run.run_id!r}"
         )
     if manifest.dataset_id != dataset_id:
         raise ContractError(
@@ -288,6 +291,8 @@ def verify_depth_manifest(
             f"but {dataset_id} now hashes to {dataset_hash[:12]}; the cameras these maps were "
             "rendered for are not the cameras they would be back-projected with"
         )
+
+    _verify_checkpoint_identity(manifest, where, run, run_dir)
 
     entries = manifest.by_image_name()
     if len(entries) != len(manifest.depths):
@@ -317,6 +322,17 @@ def verify_depth_manifest(
                 f"{where}: {name} was rendered at {entry.width}x{entry.height}, but camera "
                 f"{cam.id} is {cam.width}x{cam.height}"
             )
+        # The fuser finds its maps by the naming contract, not by reading this field, so a
+        # manifest naming some *other* file would have its digest checked while a different
+        # file was consumed. Pinning the two together is what keeps "verified bytes" and
+        # "back-projected bytes" the same bytes.
+        expected_file = depth_map_path(depth_dir, name).name
+        if entry.file != expected_file:
+            raise ContractError(
+                f"{where}: {name} is recorded as {entry.file!r}, but the depth naming contract "
+                f"makes it {expected_file!r}. The map that would be verified is not the map that "
+                "would be back-projected."
+            )
         f = depth_dir / entry.file
         if not f.is_file():
             raise ContractError(f"{where}: {entry.file} is listed but missing")
@@ -325,4 +341,37 @@ def verify_depth_manifest(
             raise ContractError(
                 f"{where}: {entry.file} hashes to {digest[:12]}, the manifest says "
                 f"{entry.sha256[:12]}. This depth map was changed after it was rendered."
+            )
+
+
+def _verify_checkpoint_identity(manifest: DepthManifest, where: Path, run, run_dir: Path) -> None:
+    """The weights named by the manifest must be the weights the run ended on.
+
+    Recording the checkpoint was only half of it: a manifest rendered from an earlier
+    checkpoint of the same run passes every other check — same run id, same dataset, same
+    views, same digests — while describing a different model than the one `run.json` presents
+    as the result. The digest is re-checked when the file is still there, which is the case
+    that matters; a checkpoint deleted after rendering leaves the file and step to agree on.
+    """
+    recorded = manifest.checkpoint or {}
+    file, step = recorded.get("file"), recorded.get("step")
+    if file != run.final_checkpoint:
+        raise ContractError(
+            f"{where}: depth was rendered from checkpoint {file!r}, but run {run.run_id} ended "
+            f"on {run.final_checkpoint!r}"
+        )
+    if step != run.checkpoint_step:
+        raise ContractError(
+            f"{where}: depth was rendered at step {step}, but run {run.run_id} ended at "
+            f"{run.checkpoint_step}"
+        )
+    if not file:
+        raise ContractError(f"{where}: the manifest names no checkpoint")
+    ckpt = Path(run_dir) / file
+    if ckpt.is_file():
+        digest = sha256_file(ckpt)
+        if digest != recorded.get("sha256"):
+            raise ContractError(
+                f"{where}: {file} hashes to {digest[:12]}, but the depth was rendered from "
+                f"{str(recorded.get('sha256'))[:12]}. These are different weights."
             )

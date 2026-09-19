@@ -496,15 +496,27 @@ scientific validation remain pending.**
   frame · unit · depths[{image_id, camera_id, image_name, file, width, height, sha256,
   valid_ratio, min_m, max_m}] · provenance`.
 * **승격 (§1A 연결)**: `build_depth_surface` 는 depth 디렉터리의 manifest 를 **검증한다** —
-  `verify_depth_manifest` 가 run id, dataset id/hash, view 집합, camera 해상도, 파일별 digest 를
-  모두 대조해야 `depth_source = minegs_render` 다. 하나라도 어긋나면 강등이 아니라 거부한다
-  (어긋났다는 것은 무언가 움직였다는 뜻이고, 그때 조용히 계속하는 것이 가장 나쁘다).
-  manifest 가 없으면 `external_unverified` — PR #9 에서 남겨 둔 문자열 우회는 production path
-  에서 닫혔다.
+  `verify_depth_manifest` 가 run id, dataset id/hash, checkpoint identity(file·step, 파일이
+  남아 있으면 digest), view 집합, camera 해상도, 파일별 digest 를 모두 대조해야
+  `depth_source = minegs_render` 다. 하나라도 어긋나면 강등이 아니라 거부한다 (어긋났다는 것은
+  무언가 움직였다는 뜻이고, 그때 조용히 계속하는 것이 가장 나쁘다). manifest 가 없으면
+  `external_unverified` — PR #9 에서 남겨 둔 문자열 우회는 production path 에서 닫혔다.
+* **검증한 bytes 와 소비한 bytes 는 같아야 한다**: fuser 는 manifest 의 `file` 을 읽지 않고
+  naming contract(`<image stem>.npy`)로 파일을 찾으므로, verifier 는 `entry.file` 이 그 이름과
+  같은지를 먼저 강제한다. 아니면 한 파일의 digest 를 검사하고 다른 파일을 역투영하게 된다.
+* **renderer 가 재현하지 않는 run 은 거부**: `RENDER_CRITICAL_OPTIONS` = `pose_opt`(학습 중
+  카메라 pose 갱신 → dataset pose 는 모델이 맞춰진 pose 가 아님), `antialiased`(opacity 누적
+  방식이 달라 expected depth 가 달라지고 equivalence 미측정). 증인은 셋 — 실행된 argv,
+  `backend_out/cfg.yml`, profile 의 requests — 이고 **하나라도** 걸리면 거부한다. 추가로
+  checkpoint 에 `pose_adjust` 가 있으면 `check_checkpoint_blob` 이 그것만으로 거부한다.
+  `normalize_world_space` 를 재구현 대신 거부한 것과 같은 논리다.
+* **camera model**: `RENDERABLE_CAMERA_MODELS = {PINHOLE, SIMPLE_PINHOLE}`. 왜곡 모델은
+  pinhole 로 투영되어 모든 ray 가 조용히 틀어지므로 거부한다.
 * **fail closed, CPU fallback 없음**: run != succeeded · dataset id/hash 불일치 · checkpoint
   미기록/부재 · `T_local_from_internal` 비항등 · backend 가 `depth_render` 미선언 · 지원하지 않는
-  backend · torch/gsplat 부재 · CUDA 부재 · view 누락/중복/유령 · 해상도 불일치 · Inf/음수 depth ·
-  전 픽셀 empty · 출력 디렉터리 존재.
+  backend · torch/gsplat 부재 · CUDA 부재 · view 누락/중복/유령 · image stem 충돌 · 해상도
+  불일치 · Inf/음수 depth · 전 픽셀 empty · 출력 디렉터리 존재 · render-critical 옵션 ·
+  왜곡 camera model.
 * **실행되지 않은 부분**: `GsplatDepthRenderer.render` 는 gsplat rasterization API 에 맞춰 작성했고
   이 저장소에서 **한 번도 실행된 적이 없다** — CI 에 CUDA 도 gsplat 도 없다. 주변 계약은 전부
   테스트되지만 rasterizer 호출은 아니다. `tests/test_depth_render.py` 는 adapter 를 대체하되
@@ -687,6 +699,10 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | CUDA·gsplat 없이 `eval render-depth` | `NoGpuError` / `MissingDependencyError` (exit 4) | rasterizer 는 CUDA 전용이고 CPU fallback 은 없다 | 해당 없음 (설계) |
 | `T_local_from_internal` 이 항등이 아닌 run 의 depth 렌더 | `ContractError` (exit 2) | backend 단위가 미터라고 보장할 수 없다 | 해당 없음 (설계) |
 | 검증에 실패하는 depth manifest | `ContractError` (exit 2) | 강등이 아니라 거부 — 무언가 움직였다는 신호다 | 해당 없음 (설계) |
+| `pose_opt`/`antialiased` run 의 depth 렌더 | `ContractError` (exit 2) | renderer 가 재현하지 않는 설정이다 — equivalence 미검증 재현은 증거가 아니다 | pose 복원·mode 재현을 실제로 검증한 뒤 |
+| 왜곡 camera model 의 depth 렌더 | `ContractError` (exit 2) | pinhole 로 투영되어 모든 ray 가 조용히 틀어진다 | 해당 없음 (설계) |
+| manifest 의 `file` 이 naming contract 와 다름 | `ContractError` (exit 2) | 검사한 파일과 역투영할 파일이 달라진다 | 해당 없음 (설계) |
+| run 의 최종 checkpoint 가 아닌 manifest | `ContractError` (exit 2) | 다른 모델을 기술하면서 나머지 검사를 통과한다 | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 원시 PLY | `ContractError` (exit 2) | 가우시안 중심은 표면이 아니다 (§1A) | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 `external_unverified` surface | `ContractError` (exit 2) | 외부 depth 는 기록된 run 과 묶여 있지 않다 | Phase 1B (`minegs_render`) |
 | surface.json 과 내용이 다른 `point_file` | `ContractError` (exit 2) | record 는 surface 가 아니다 | 해당 없음 (설계) |

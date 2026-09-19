@@ -329,11 +329,27 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
 * **NaN 정책**: ray 가 `--min-alpha`(기본 0.5) 만큼 불투명도를 쌓지 못한 픽셀은 거리값이 없으므로
   **NaN** 이다. 0 을 쓰면 렌즈 위치에 표면이 생기고, far plane 을 쓰면 없는 벽을 만든다.
   `backproject_depth` 가 이미 NaN 을 버린다.
+* **검증한 bytes = 소비한 bytes**: manifest 의 `file` 은 depth naming contract 가 정하는 이름과
+  같아야 한다. 아니면 거부한다 — 한 파일의 digest 를 검사하고 다른 파일을 역투영하는 순간
+  provenance 경계가 이름만 남는다.
+* **checkpoint identity 도 검증한다**: manifest 의 `checkpoint.file`·`step` 이 run.json 의
+  `final_checkpoint`·`checkpoint_step` 과 같아야 하고, 파일이 아직 있으면 digest 도 대조한다.
+  같은 run 의 이전 checkpoint 로 렌더한 manifest 는 다른 모델을 기술하면서 나머지 검사를 전부
+  통과한다.
+* **renderer 가 재현하지 않는 run 은 거부한다**: `pose_opt`(학습 중 카메라 pose 를 갱신하므로
+  dataset pose 는 더 이상 모델이 맞춰진 pose 가 아니다) 와 `antialiased`(opacity 누적 방식이
+  달라져 expected depth 가 달라지고, equivalence 를 측정한 적이 없다). 증인 셋 — 실행된 argv,
+  옆에 남아 있다면 trainer 자신의 `cfg.yml`, profile 의 capability requests — 중 **하나라도**
+  해당하면 거부하고, checkpoint 에 `pose_adjust` 가 들어 있으면 그것만으로도 거부한다.
+  `normalize_world_space` 를 재구현 대신 거부한 것과 같은 이유다: equivalence 미검증 재현은
+  claim 경로의 증거가 될 수 없다.
+* **왜곡 있는 camera model 도 거부한다**: rasterizer 는 pinhole 로 투영하므로 `SIMPLE_RADIAL`
+  등은 왜곡이 조용히 빠진 채 모든 ray 가 틀어진다. `PINHOLE`/`SIMPLE_PINHOLE` 만 지원.
 * **fail closed**: run != succeeded · dataset id/hash 불일치 · checkpoint 없음/경로 깨짐 ·
   `T_local_from_internal` 이 항등이 아님(= backend 단위가 미터라고 보장 못 함) · backend 가
   `depth_render` 미선언 · 지원하지 않는 backend · CUDA 없음 · torch/gsplat 없음 · view 누락/중복/
-  유령 view · 해상도 불일치 · Inf 또는 음수 depth · 전 픽셀 empty · 출력 디렉터리 존재.
-  **CPU fallback 은 없다.**
+  유령 view · image stem 충돌 · 해상도 불일치 · Inf 또는 음수 depth · 전 픽셀 empty ·
+  출력 디렉터리 존재. **CPU fallback 은 없다.**
 
 **아직 아닌 것**: `GsplatDepthRenderer` 자체는 이 저장소에서 **한 번도 실행된 적이 없다** — CI 에는
 CUDA 도 gsplat 도 없다. 주변의 계약 검증은 전부 테스트되지만 rasterizer 호출은 아니다.

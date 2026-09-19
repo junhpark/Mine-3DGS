@@ -201,8 +201,9 @@ def staged_dir(out: Path) -> Iterator[Path]:
     tmp.rename(out)
 
 
-def check_run(run_dir: Path, dataset_id: str, dataset_hash: str) -> str:
-    """The §10 run checks. Returns the run id."""
+def check_run(run_dir: Path, dataset_id: str, dataset_hash: str):
+    """The §10 run checks. Returns the ``RunRecord``, so callers verify against it rather than
+    against a bare id — checkpoint identity and render settings both live there."""
     from minegs.train.runner.base import RunRecord, RunStatus
 
     rpath = run_dir / "run.json"
@@ -227,11 +228,11 @@ def check_run(run_dir: Path, dataset_id: str, dataset_hash: str) -> str:
         raise ContractError(
             f"run {rec.run_id} declares frame_of_outputs={rec.frame_of_outputs}, not LOCAL_METRIC"
         )
-    return rec.run_id
+    return rec
 
 
 def _depth_provenance(
-    depth_dir: Path, run_id: str, dataset_id: str, dataset_hash: str, model
+    depth_dir: Path, run, run_dir: Path, dataset_id: str, dataset_hash: str, model
 ) -> tuple[str, Any]:
     """``(depth_source, DepthManifest | None)`` for the maps in *depth_dir* (§1B §5)."""
     from minegs.eval.surface.models import (
@@ -245,7 +246,7 @@ def _depth_provenance(
         return "external_unverified", None
     rendered = DepthManifest.load(found)
     verify_depth_manifest(
-        rendered, depth_dir, run_id, dataset_id, dataset_hash, model.cameras, model.images
+        rendered, depth_dir, run, run_dir, dataset_id, dataset_hash, model.cameras, model.images
     )
     return "minegs_render", rendered
 
@@ -303,9 +304,10 @@ def build_depth_surface(
         raise ContractError(f"{dataset_dir}/sparse/0: images reference unknown cameras {unknown}")
     require_unique_stems(model.images)
     dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
-    run_id = check_run(run_dir, manifest.dataset_id, dataset_hash)
+    run = check_run(run_dir, manifest.dataset_id, dataset_hash)
+    run_id = run.run_id
     depth_source, rendered = _depth_provenance(
-        depth_dir, run_id, manifest.dataset_id, dataset_hash, model
+        depth_dir, run, run_dir, manifest.dataset_id, dataset_hash, model
     )
 
     pc = depth_to_points(depth_dir, model.cameras, model.images, stride, max_depth, True)

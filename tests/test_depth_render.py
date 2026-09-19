@@ -14,6 +14,7 @@ refuses to run without CUDA, which is the only part of it a CPU machine can hone
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,12 @@ from minegs.eval.surface.models import (
     SURFACE_FILE,
     DepthManifest,
 )
-from minegs.eval.surface.render import DepthRenderer, GsplatDepthRenderer, render_depths
+from minegs.eval.surface.render import (
+    DepthRenderer,
+    GsplatDepthRenderer,
+    check_checkpoint_blob,
+    render_depths,
+)
 from minegs.ingest.common.colmap_io import read_model
 from minegs.train.runner.base import RunStatus
 from typer.testing import CliRunner
@@ -332,3 +338,135 @@ def test_a_rendered_surface_reaches_the_geometry_accuracy_gate(synthetic, tmp_pa
     assert r.exit_code == 0, r.output
     assert json.loads(out.read_text())["claim"] == "geometry_accuracy"
     assert (surface_dir / SURFACE_FILE).is_file()
+
+
+# ---------------------------------------------- render-critical settings this renderer skips
+
+
+@pytest.mark.parametrize(
+    ("witness", "kwargs"),
+    [
+        ("command", {"command": ["python", "simple_trainer.py", "--pose_opt"]}),
+        ("profile", {"profile": {"name": "x", "requests": {"pose_refinement": True}}}),
+        ("command", {"command": ["python", "simple_trainer.py", "--antialiased"]}),
+        ("profile", {"profile": {"name": "x", "requests": {"antialiasing": True}}}),
+    ],
+)
+def test_a_run_this_renderer_cannot_reproduce_is_refused(dataset_small, tmp_path, witness, kwargs):
+    """pose_opt moves the cameras; antialiased changes how opacity composites into depth."""
+    ds = dataset_small.dataset_dir
+    run_dir = tmp_path / "runs" / witness
+    make_run(ds, run_dir, run_id=witness, **kwargs)
+    with pytest.raises(ContractError, match="render-critical"):
+        render_depths(run_dir, ds, tmp_path / "d", renderer=FakeRenderer())
+    assert not (tmp_path / "d").exists()
+
+
+def test_the_trainers_own_config_is_a_witness_too(env, tmp_path):
+    """A record that forgot the flag does not make the run reproducible."""
+    cfg = env.run_dir / "backend_out" / "cfg.yml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("max_steps: 7000\npose_opt: True\nantialiased: False\n")
+    with pytest.raises(ContractError, match=r"cfg\.yml records pose_opt"):
+        render_depths(env.run_dir, env.dataset_dir, tmp_path / "d", renderer=FakeRenderer())
+
+
+def test_a_checkpoint_carrying_pose_adjust_is_refused():
+    """The last witness, read off the weights themselves rather than any record."""
+    ckpt = Path("ckpt_6999_rank0.pt")
+    assert check_checkpoint_blob({"splats": _SPLATS}, ckpt) is _SPLATS
+    with pytest.raises(ContractError, match="pose_adjust"):
+        check_checkpoint_blob({"splats": _SPLATS, "pose_adjust": object()}, ckpt)
+    with pytest.raises(ContractError, match="not a gsplat checkpoint"):
+        check_checkpoint_blob({"step": 6999}, ckpt)
+    with pytest.raises(ContractError, match="missing"):
+        check_checkpoint_blob({"splats": {"means": 1}}, ckpt)
+
+
+_SPLATS = {"means": 1, "quats": 1, "scales": 1, "opacities": 1}
+
+
+def test_a_distorted_camera_model_is_refused(dataset_small, tmp_path):
+    """`rasterization` projects pinhole; distortion would be silently dropped from every ray."""
+    ds = tmp_path / "ds"
+    shutil.copytree(dataset_small.dataset_dir, ds)
+    cams = ds / "sparse" / "0" / "cameras.txt"
+    rows = []
+    for line in cams.read_text().splitlines():
+        tok = line.split()
+        if line.startswith("#") or not tok:
+            rows.append(line)
+            continue
+        f, cx, cy = tok[4], tok[6], tok[7]
+        rows.append(" ".join([tok[0], "SIMPLE_RADIAL", tok[2], tok[3], f, cx, cy, "0.01"]))
+    cams.write_text("\n".join(rows) + "\n")
+
+    run_dir = tmp_path / "runs" / "distorted"
+    make_run(dataset_small.dataset_dir, run_dir, run_id="distorted")
+    with pytest.raises(ContractError, match="distortion"):
+        render_depths(run_dir, ds, tmp_path / "d", renderer=FakeRenderer())
+
+
+# ---------------------------------------------- verified bytes == back-projected bytes
+
+
+def test_the_manifest_cannot_point_the_verifier_at_a_different_file(env, tmp_path):
+    """Hashing one file while back-projecting another would reopen the whole provenance hole."""
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    manifest = DepthManifest.load(depth_dir / DEPTH_MANIFEST_FILE)
+    victim = manifest.depths[0]
+    decoy = depth_dir / "decoy.npy"
+    shutil.copy(depth_dir / victim.file, decoy)
+
+    # the decoy is a byte-identical copy, so its digest is the recorded one...
+    entries = [d.model_dump() for d in manifest.depths]
+    entries[0]["file"] = decoy.name
+    manifest.depths = entries
+    manifest.save(depth_dir / DEPTH_MANIFEST_FILE)
+    # ...and the file the fuser will actually read is now free to be anything
+    tampered = np.load(depth_dir / victim.file)
+    tampered[:] = 9.0
+    np.save(depth_dir / victim.file, tampered)
+
+    with pytest.raises(ContractError, match="not the map that would be back-projected"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert not (tmp_path / "surface").exists()
+
+
+# ---------------------------------------------- checkpoint identity is verified, not just kept
+
+
+def test_the_manifest_checkpoint_must_be_the_one_the_run_ended_on(env, tmp_path):
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    where = depth_dir / DEPTH_MANIFEST_FILE
+
+    def repoint(**over):
+        m = DepthManifest.load(where)
+        m.checkpoint = {**m.checkpoint, **over}
+        m.save(where)
+
+    repoint(file="ckpt/ckpt_3000_rank0.pt")
+    with pytest.raises(ContractError, match="ended on"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "s1")
+
+    repoint(file=CKPT_REL, step=3000)
+    with pytest.raises(ContractError, match="ended at"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "s2")
+
+    # weights replaced after the render: same path, same step, different model
+    repoint(step=6999)
+    (env.run_dir / CKPT_REL).write_bytes(b"different weights entirely")
+    with pytest.raises(ContractError, match="different weights"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "s3")
+
+
+def test_a_backend_with_no_renderer_is_refused(dataset_small, tmp_path):
+    """Phase 1B ships gsplat only; another backend's weights are not renderable here."""
+    ds = dataset_small.dataset_dir
+    run_dir = tmp_path / "runs" / "other_backend"
+    make_run(ds, run_dir, run_id="other_backend", backend={"name": "pgsr", "version": "x"})
+    with pytest.raises(ContractError, match="no metric depth renderer"):
+        render_depths(run_dir, ds, tmp_path / "d1")
+    # and a renderer for the wrong backend cannot be substituted in either
+    with pytest.raises(ContractError, match="renders gsplat models"):
+        render_depths(run_dir, ds, tmp_path / "d2", renderer=FakeRenderer())

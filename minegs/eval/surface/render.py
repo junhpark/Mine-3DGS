@@ -136,15 +136,7 @@ class GsplatDepthRenderer(DepthRenderer):
 
         device = torch.device("cuda")
         blob = torch.load(checkpoint, map_location=device, weights_only=False)
-        if not isinstance(blob, dict) or "splats" not in blob:
-            raise ContractError(
-                f"{checkpoint}: not a gsplat checkpoint (no 'splats' entry). gsplat v1.5.3 "
-                "writes {'step': int, 'splats': state_dict}."
-            )
-        splats = blob["splats"]
-        missing = sorted({"means", "quats", "scales", "opacities"} - set(splats))
-        if missing:
-            raise ContractError(f"{checkpoint}: checkpoint splats are missing {missing}")
+        splats = check_checkpoint_blob(blob, checkpoint)
         means = splats["means"].to(device)
         quats = splats["quats"].to(device)
         # stored as log-scale and logit-opacity, exactly as the trainer's parameterisation
@@ -183,6 +175,35 @@ class GsplatDepthRenderer(DepthRenderer):
             yield im, depth.cpu().numpy().astype(np.float32)
 
 
+def check_checkpoint_blob(blob: object, checkpoint: Path) -> dict:
+    """Contract-check a loaded gsplat checkpoint and return its splats.
+
+    Split out of ``render`` so it is reachable without CUDA: what a checkpoint file contains is
+    a contract question, not a rasterisation one, and the ``pose_adjust`` refusal below is the
+    single most important thing this renderer can get wrong.
+    """
+    if not isinstance(blob, dict) or "splats" not in blob:
+        raise ContractError(
+            f"{checkpoint}: not a gsplat checkpoint (no 'splats' entry). gsplat v1.5.3 writes "
+            "{'step': int, 'splats': state_dict}."
+        )
+    # Direct evidence, independent of what run.json remembers: upstream saves pose_adjust into
+    # the checkpoint when pose_opt was on. If it is here, the dataset poses are not the poses
+    # this model was fitted to, whatever the record says.
+    if "pose_adjust" in blob:
+        raise ContractError(
+            f"{checkpoint}: the checkpoint carries pose_adjust, so this run refined its camera "
+            "poses during training. Rendering from the dataset poses would be rendering from "
+            "the wrong cameras — every ray slightly misplaced, and nothing downstream able to "
+            "tell."
+        )
+    splats = blob["splats"]
+    missing = sorted({"means", "quats", "scales", "opacities"} - set(splats))
+    if missing:
+        raise ContractError(f"{checkpoint}: checkpoint splats are missing {missing}")
+    return splats
+
+
 def get_depth_renderer(backend_name: str, min_alpha: float = DEFAULT_MIN_ALPHA) -> DepthRenderer:
     """The renderer for a backend, or a refusal naming what is supported."""
     if backend_name == "gsplat":
@@ -195,6 +216,77 @@ def get_depth_renderer(backend_name: str, min_alpha: float = DEFAULT_MIN_ALPHA) 
 
 
 # ---------------------------------------------------------------- orchestration
+
+
+#: gsplat options that change what a render *is*, which this renderer does not reproduce.
+#: A run that used one is refused rather than rendered under different settings — the same
+#: argument the project makes about ``normalize_world_space``: a reimplementation whose
+#: equivalence to upstream has never been tested is not evidence, and this path ends in a
+#: geometry_accuracy claim.
+RENDER_CRITICAL_OPTIONS = {
+    "pose_opt": (
+        "camera poses were refined during training, so the dataset poses are no longer the "
+        "poses the model was fitted to. Rendering from the dataset poses would put every ray "
+        "in the wrong place while every other check passed. Restoring the checkpoint's "
+        "pose_adjust, and mapping it back to image indices, is its own piece of work"
+    ),
+    "antialiased": (
+        "the trainer rasterises in antialiased mode, which changes how opacity accumulates and "
+        "therefore what expected depth comes out; this renderer uses the classic mode and their "
+        "equivalence has never been measured"
+    ),
+}
+#: Camera models whose projection ``rasterization`` reproduces. Anything with distortion would
+#: be rendered as if it had none, which is a quiet geometric error in every view.
+RENDERABLE_CAMERA_MODELS = frozenset({"PINHOLE", "SIMPLE_PINHOLE"})
+
+
+def _require_reproducible_render(record, run_dir: Path) -> None:
+    """Refuse a run configured in a way this renderer does not reproduce (§1B).
+
+    Three independent witnesses, because any one of them can be absent: the argv the runner
+    actually executed, the trainer's own ``cfg.yml`` if it is still beside the run, and the
+    profile's capability requests. Agreement is not required — *any* of them naming a
+    render-critical option is enough to refuse.
+    """
+    from minegs.train.backends.gsplat import _trainer_config, canonical_option
+
+    seen: dict[str, str] = {}
+    for token in record.command or []:
+        if token.startswith("-"):
+            opt = canonical_option(token)
+            if opt in RENDER_CRITICAL_OPTIONS:
+                seen[opt] = f"the run command carries {token}"
+    cfg = run_dir / "backend_out" / "cfg.yml"
+    if cfg.is_file():
+        for key, raw in _trainer_config(cfg).items():
+            opt = canonical_option(key)
+            if opt in RENDER_CRITICAL_OPTIONS and str(raw).strip().lower() in ("true", "1", "yes"):
+                seen.setdefault(opt, f"the trainer's own cfg.yml records {key}: {raw}")
+    requests = (record.profile or {}).get("requests") or {}
+    for cap, opt in (("pose_refinement", "pose_opt"), ("antialiasing", "antialiased")):
+        if requests.get(cap):
+            seen.setdefault(opt, f"the profile requires {cap}")
+    if seen:
+        detail = "; ".join(
+            f"{opt} ({why}): {RENDER_CRITICAL_OPTIONS[opt]}" for opt, why in sorted(seen.items())
+        )
+        raise ContractError(
+            f"run {record.run_id} used render-critical training options this renderer does not "
+            f"reproduce, so its depth would not be the depth that model produces — {detail}. "
+            "Depth from such a run is refused rather than approximated."
+        )
+
+
+def _require_renderable_cameras(cameras: dict, dataset_dir: Path) -> None:
+    bad = sorted(
+        f"{c.id}:{c.model}" for c in cameras.values() if c.model not in RENDERABLE_CAMERA_MODELS
+    )
+    if bad:
+        raise ContractError(
+            f"{dataset_dir}/sparse/0: camera model(s) {bad} carry distortion this renderer does "
+            f"not apply; it projects pinhole. Supported: {sorted(RENDERABLE_CAMERA_MODELS)}."
+        )
 
 
 def _require_metric_outputs(record) -> None:
@@ -290,7 +382,7 @@ def render_depths(
     from minegs.core.provenance import make_id, sha256_file, sha256_tree, stamp
     from minegs.eval.surface.depth import check_run
     from minegs.ingest.common.colmap_io import read_model
-    from minegs.train.runner.base import DATASET_HASH_PATTERNS, RunRecord
+    from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
     run_dir, dataset_dir = Path(run_dir), Path(dataset_dir)
     out = Path(out_dir) if out_dir is not None else run_dir / DEPTH_DIRNAME
@@ -312,11 +404,13 @@ def render_depths(
     if unknown:
         raise ContractError(f"{dataset_dir}/sparse/0: images reference unknown cameras {unknown}")
     require_unique_stems(model.images)
+    _require_renderable_cameras(model.cameras, dataset_dir)
     dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
 
-    run_id = check_run(run_dir, manifest_ds.dataset_id, dataset_hash)
-    record = RunRecord.load(run_dir / "run.json")
+    record = check_run(run_dir, manifest_ds.dataset_id, dataset_hash)
+    run_id = record.run_id
     _require_metric_outputs(record)
+    _require_reproducible_render(record, run_dir)
     ckpt = _require_checkpoint(record, run_dir)
 
     backend_name = record.backend.get("name", "")
@@ -407,8 +501,11 @@ def _require_depth_capability(backend_name: str) -> None:
 __all__ = [
     "DEFAULT_MIN_ALPHA",
     "DEPTH_DIRNAME",
+    "RENDERABLE_CAMERA_MODELS",
+    "RENDER_CRITICAL_OPTIONS",
     "DepthRenderer",
     "GsplatDepthRenderer",
+    "check_checkpoint_blob",
     "get_depth_renderer",
     "render_depths",
 ]
