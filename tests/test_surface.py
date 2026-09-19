@@ -36,6 +36,7 @@ from minegs.eval.surface.models import (
     load_surface,
 )
 from minegs.ingest.common.colmap_io import Camera, Image, read_model
+from minegs.train.backends.gsplat import PINNED_GSPLAT
 from minegs.train.runner.base import DATASET_HASH_PATTERNS, RunRecord, RunStatus
 from typer.testing import CliRunner
 
@@ -49,8 +50,8 @@ def write_run(run_dir: Path, dataset_dir: Path, run_id: str = "run_test", **over
         run_id=run_id,
         dataset_id=over.pop("dataset_id", m.dataset_id),
         dataset_hash=over.pop("dataset_hash", sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)),
-        backend={"name": "gsplat", "version": "test"},
-        profile={"name": "light"},
+        backend=over.pop("backend", {"name": "gsplat", "version": PINNED_GSPLAT}),
+        profile=over.pop("profile", {"name": "light"}),
         runner="local",
         status=over.pop("status", RunStatus.SUCCEEDED),
         provenance=ProvenanceRecord(),

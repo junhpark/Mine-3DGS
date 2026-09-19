@@ -101,6 +101,43 @@ def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
     return read_ply(pred), None
 
 
+@app.command("render-depth")
+def render_depth(
+    run_dir: Path = typer.Argument(..., help="a succeeded run to render depth from"),
+    dataset_dir: Path = typer.Argument(...),
+    out: Path | None = typer.Option(
+        None, "--out", help="depth directory (default: <run_dir>/depth)"
+    ),
+    min_alpha: float | None = typer.Option(
+        None,
+        "--min-alpha",
+        help="pixels whose ray accumulates less opacity than this have no range and are "
+        "written NaN (default 0.5)",
+    ),
+) -> None:
+    """Render metric depth per dataset view from a trained run (§1.7 Phase 1B). GPU only.
+
+    Writes ``<image stem>.npy`` plus a ``depth_manifest.json`` naming the run, the dataset, the
+    checkpoint and a digest per map. That manifest is what lets `eval surface-depth` build a
+    claim-capable surface; depth from anywhere else stays diagnostic-only.
+    """
+    from minegs.eval.surface.render import render_depths
+
+    def go() -> None:
+        manifest, depth_dir = render_depths(run_dir, dataset_dir, out, min_alpha)
+        console.print(
+            f"depth [bold]{manifest.manifest_id}[/]: {len(manifest.depths)} views from "
+            f"{manifest.renderer['name']} on run {manifest.run_id}"
+        )
+        cover = sum(d.valid_ratio for d in manifest.depths) / len(manifest.depths)
+        near = min(d.min_m for d in manifest.depths if d.min_m is not None)
+        far = max(d.max_m for d in manifest.depths if d.max_m is not None)
+        console.print(f"  ranges {near:.2f}-{far:.2f} m, mean coverage {cover * 100:.1f}%")
+        console.print(f"  wrote {depth_dir}")
+
+    run_guarded(go)
+
+
 @app.command("surface-depth")
 def surface_depth(
     depth_dir: Path = typer.Argument(
@@ -233,7 +270,7 @@ def geometry(
     """Bidirectional accuracy / completeness / Chamfer against TLS (§11). Refuses claims the manifest cannot support (§5)."""
     import numpy as np
 
-    from minegs.core.errors import ProtocolViolation
+    from minegs.core.errors import ContractError, ProtocolViolation
     from minegs.core.pointcloud import read_ply
     from minegs.eval.geometry import compare_clouds
     from minegs.eval.protocol import Claim, judge
@@ -255,10 +292,35 @@ def geometry(
             # that these points sample the tunnel wall, in the second nothing ties the depth
             # to the run (§18, §1A). _resolve_pred has already refused unless --diagnostic.
             claim = Claim.GEOMETRY_DIAGNOSTIC
+        if claim is Claim.GEOMETRY_ACCURACY and not (holdout_only and j.holdout_ranges_m):
+            # geometry_accuracy is defined as accuracy *on holdout TLS* (Claim docstring), and
+            # the manifest only grants it because those ranges were excluded from
+            # initialisation. Measuring over the whole cloud instead measures the model against
+            # the geometry it was initialised and trained on, which is the leak the protocol
+            # gate exists to prevent -- so --no-holdout-only reports a number, not a claim.
+            console.print(
+                "[yellow]warning: --no-holdout-only measures the training chainage too, so "
+                "these numbers are fit to the data the run saw; reporting as diagnostic[/]"
+            )
+            claim = Claim.GEOMETRY_DIAGNOSTIC
         pred_pc = _to_tls(points, m)
         ref = read_ply(tls_ply)
         if ref.frame != "TLS_GLOBAL":
-            console.print(f"[yellow]TLS reference frame is {ref.frame}; expected TLS_GLOBAL[/]")
+            # The predicted side is refused for exactly this in _to_tls; the reference side used
+            # to get a console line that never reached the JSON. Comparing a LOCAL_METRIC cloud
+            # against a TLS_GLOBAL one measures the distance between two coordinate systems, and
+            # `dataset/init_points.ply` sits one directory from `raw/tls_full.ply`, so the
+            # mix-up is an ordinary one. UNKNOWN counts as wrong: a cloud that never declared
+            # its frame has not been established to be in this one.
+            wrong_frame = (
+                f"{tls_ply}: reference cloud is in frame {ref.frame}, not TLS_GLOBAL. Geometry "
+                "is compared in TLS_GLOBAL, so this would measure the offset between two "
+                "coordinate systems rather than between two surfaces. Re-export it with its "
+                "frame declared, or pass --diagnostic for non-claim numbers."
+            )
+            if not diagnostic:
+                raise ContractError(wrong_frame)
+            console.print(f"[yellow]{wrong_frame}[/]")
         pxyz, rxyz = pred_pc.xyz, ref.xyz
         rng = None
         if holdout_only and j.holdout_ranges_m:
@@ -271,6 +333,18 @@ def geometry(
                 mr |= (sr >= lo) & (sr <= hi)
             pxyz, rxyz = pxyz[mp], rxyz[mr]
             rng = (min(r[0] for r in j.holdout_ranges_m), max(r[1] for r in j.holdout_ranges_m))
+        # An accuracy/completeness pair over an empty cloud is not a number, it is a missing
+        # input: the comparison would come back all-NaN (or, until this check existed, as a
+        # bare KeyError from compare_clouds with no message at all). Name which side emptied
+        # and what emptied it, because the usual cause is a reference that does not cover the
+        # holdout chainage -- a different TLS epoch, or a different chainage origin.
+        empty = [n for n, a in (("prediction", pxyz), ("TLS reference", rxyz)) if len(a) == 0]
+        if empty:
+            where = f" inside the holdout chainage {rng[0]}-{rng[1]} m" if rng else ""
+            raise ContractError(
+                f"nothing to compare: the {' and the '.join(empty)} has no points{where}. "
+                f"Check that {tls_ply} covers this dataset's chainage and shares its origin."
+            )
         rep = compare_clouds(pxyz, rxyz, max_dist_m)
         rep.chainage_range_m = rng
         rep.claim = claim.value

@@ -24,7 +24,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 0B | Real E57 Ingest | **0B.1·0B.2·0B.3 implemented** (inventory·매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2: DEFERRED / NOT VALIDATED** (PO 결정, §0C) |
 | 0D | Local GS Baseline | **0D.1 resume safety contract** 및 **0D.2 local GPU baseline execution contract** implemented + structurally tested. **실제 GPU baseline 미실행**. 0D 전체는 **NOT COMPLETE** (§0D) |
-| 1 | Metric Surface & Evaluation | **1A metric surface artifact + depth fusion: implemented + structurally tested** (§1). 1A depth 는 전부 `external_unverified` 이므로 **`geometry_accuracy` 도달 불가 — diagnostic 전용**. **1B gsplat depth rendering: NOT IMPLEMENTED**, TSDF/mesh: NOT IMPLEMENTED, 실제 GPU·실측 과학적 검증: NOT VALIDATED |
+| 1 | Metric Surface & Evaluation | **1A metric surface artifact + depth fusion** 및 **1B metric depth rendering: implemented + structurally tested** (§1). 검증된 depth manifest 가 있을 때만 `minegs_render` → `geometry_accuracy`; 외부 depth 는 diagnostic 전용. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), TSDF/mesh: NOT IMPLEMENTED, 실측 과학적 검증: NOT VALIDATED |
 | 2 | E57 End-to-End MVP | 미착수 |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
 | 4 | Advanced GS / Heavy Profile | 미착수 — `depth_loss` 는 여기서 설계 |
@@ -472,14 +472,108 @@ Phase 1A metric surface artifact + depth fusion: **implemented + structurally te
   것" 을 보장하지만, 손으로 `depth_source: minegs_render` 를 적고 digest 까지 맞춘 파일을 막지는
   못한다. 이 경계는 사고를 막기 위한 것이고, 서명이 아니다.
 
-#### Phase 1B — trained run → rendered metric depth (미구현)
+#### Phase 1B — trained run → rendered metric depth (구현, 실제 GPU 미실행)
 
-`render_depths(run_dir, dataset_dir, out_dir)` 는 `NotYetImplementedError` 다. 학습된 run 의
-backend(gsplat rasterizer) 로 train/test view 마다 metric depth 를 렌더링하는 경로이며 GPU 가
-필요하다. TSDF(`eval/surface/tsdf.py`) 와 mesh 재구성도 미구현이고, Open3D 는 CI 의존성이 아니다.
+Phase 1B metric depth rendering: **implemented and structurally tested. Real GPU rendering and
+scientific validation remain pending.**
 
-Phase 1A 는 **artifact 경계**를 닫았을 뿐이다. 3DGS 형상이 정확하다거나 surface 가 과학적으로
-검증되었다는 주장은 하지 않는다.
+`minegs eval render-depth <run_dir> <dataset_dir> [--out] [--min-alpha]` →
+`render_depths(run_dir, dataset_dir, out_dir)` 가 `runs/<run_id>/depth/` 에
+`<image stem>.npy` 와 `depth_manifest.json` 을 원자적으로 publish 한다.
+
+* **책임 분리가 신뢰의 근거다.** renderer adapter(`DepthRenderer`)는 rasterizer 와 그 요구사항만
+  갖고 배열을 낸다. 계약 검증(run 상태·dataset identity·metric frame·checkpoint identity·view별
+  해상도·coverage·digest·publication)은 전부 orchestrator(`render_depths`)에 있다. 그래서 GPU 없는
+  머신에서 adapter 를 대체해도 검사는 하나도 우회되지 않는다.
+* **`GsplatDepthRenderer`**: `render_mode="ED"` — alpha 정규화된 expected ray termination depth,
+  카메라 +z 방향으로 `backproject_depth` 가 먹는 것과 같은 양. metric 인 이유는 baseline 이
+  `normalize_world_space` 를 거부해 BACKEND_INTERNAL = LOCAL_METRIC 이기 때문이고, 이는 가정이
+  아니라 run 마다 `T_local_from_internal` 이 항등인지로 확인한다.
+* **NaN 정책**: ray 가 `--min-alpha`(기본 0.5)만큼 불투명도를 쌓지 못하면 거리값이 없으므로 NaN.
+  0 은 렌즈에 표면을 만들고 far plane 은 없는 벽을 만든다.
+* **`DepthManifest`** (`models.py`, schema 1.0): `manifest_id · run_id · dataset_id ·
+  dataset_hash · backend · checkpoint{file, sha256, step} · renderer{name, version, settings} ·
+  frame · unit · depths[{image_id, camera_id, image_name, file, width, height, sha256,
+  valid_ratio, min_m, max_m}] · provenance`.
+* **승격 (§1A 연결)**: `build_depth_surface` 는 depth 디렉터리의 manifest 를 **검증한다** —
+  `verify_depth_manifest` 가 run id, dataset id/hash, checkpoint identity(file·step, 파일이
+  남아 있으면 digest), view 집합, camera 해상도, 파일별 digest 를 모두 대조해야
+  `depth_source = minegs_render` 다. 하나라도 어긋나면 강등이 아니라 거부한다 (어긋났다는 것은
+  무언가 움직였다는 뜻이고, 그때 조용히 계속하는 것이 가장 나쁘다). manifest 가 없으면
+  `external_unverified` — PR #9 에서 남겨 둔 문자열 우회는 production path 에서 닫혔다.
+* **검증한 bytes 와 소비한 bytes 는 같아야 한다**: fuser 는 manifest 의 `file` 을 읽지 않고
+  naming contract(`<image stem>.npy`)로 파일을 찾으므로, verifier 는 `entry.file` 이 그 이름과
+  같은지를 먼저 강제한다. 아니면 한 파일의 digest 를 검사하고 다른 파일을 역투영하게 된다.
+* **renderer 가 재현하지 않는 run 은 거부**: `RENDER_CRITICAL_OPTIONS` = `pose_opt`(학습 중
+  카메라 pose 갱신 → dataset pose 는 모델이 맞춰진 pose 가 아님), `antialiased`(opacity 누적
+  방식이 달라 expected depth 가 달라지고 equivalence 미측정). 증인은 넷 — 실행된 argv,
+  `backend_out/cfg.yml`, profile 의 requests, 그리고 `backend_args` — 이고 **하나라도** 걸리면
+  거부한다. 추가로 checkpoint 에 `pose_adjust` 가 있으면 `check_checkpoint_blob` 이 그것만으로
+  거부한다. `normalize_world_space` 를 재구현 대신 거부한 것과 같은 논리다.
+* **`backend_args` 는 allowlist 로 읽는다** (`RENDER_NEUTRAL_BACKEND_ARGS`). `build_command` 가
+  `backend_args` 를 trainer 에 그대로 전달하므로 나쁜 이름 목록으로는 `camera_model`·`with_ut`·
+  `far_plane` 처럼 boolean 도 아니고 이름도 모르는 옵션을 잡을 수 없다. argv 는 docker 플래그가
+  섞여 있어 이 방식이 불가능하지만 `backend_args` 는 순수한 gsplat 네임스페이스라 가능하다.
+  reasoned about 하지 않은 키는 거부한다.
+* **승격 시 재확인**: manifest 는 metric frame 도 재현 가능 여부도 기록하지 않으므로
+  `build_depth_surface` 가 promotion 직전 `require_metric_outputs` 와
+  `require_reproducible_render` 를 run record 에 대해 다시 돌린다. 가드가 없던 빌드가 만든
+  depth 가 manifest 존재만으로 승격되는 경로를 닫는다.
+* **reference cloud 의 frame 도 거부 대상**: `eval geometry --tls-ply` 가 `TLS_GLOBAL` 이
+  아니면 (`UNKNOWN` 포함) claim 경로에서 거부한다. 예전에는 경고 한 줄이었고 JSON 에는 남지
+  않았다. `dataset/init_points.ply`(LOCAL_METRIC) 는 `raw/tls_full.ply` 바로 옆에 있어서 흔한
+  실수이고, 그 비교는 두 표면이 아니라 두 좌표계의 거리를 잰다. 예측 쪽은 `_to_tls` 가 이미
+  같은 이유로 거부하고 있었다.
+* **checkpoint 는 restricted unpickler 로 읽는다** (`weights_only=True`). run artifact 는 GPU
+  호스트에서 가져오는 것이고, 기존 방식은 `check_checkpoint_blob` 이 보기 *전에* 임의 코드를
+  실행할 수 있었다. upstream 은 tensor·dict·int 만 저장하므로 정상 checkpoint 는 모두 로드된다.
+* **학습에 쓴 view 를 기록하고 검증한다**: depth 는 dataset 의 모든 view 에 대해 렌더되지만
+  `max_images` 프로파일은 일부만 학습한다. manifest 의 `staged` 가 run.json 의 것을 복사해
+  두 artifact 가 구별되게 하고, promotion 때 run 과 다시 대조한다 (렌더가 틀렸다는 뜻은 아니다).
+* **renderer 도 신원을 검증한다**: `render_depths(renderer=...)` 주입 seam 은 GPU 없이 계약을
+  테스트하기 위한 것이므로, manifest 의 `renderer.name` 이 이 빌드가 실제로 제공하는 renderer
+  (`known_renderer_names()`) 가 아니면 승격하지 않는다. 기록만 하고 대조하지 않는 필드를 남기지
+  않는다는 같은 원칙이다.
+* **rasterizer 노브를 기본값에 기대지 않는다**: 거부 논리가 "이 renderer 는 classic mode 이고
+  pinhole 로 투영한다" 를 근거로 삼으므로, 호출이 `rasterize_mode="classic"` 과
+  `camera_model="pinhole"` 을 명시하고 `settings()` 에 기록한다.
+* **`--no-holdout-only` 는 claim 을 내리지 않는다**: `geometry_accuracy` 는 정의상 holdout TLS
+  에 대한 주장(`Claim` docstring)이고, judge 가 그것을 허용한 이유도 그 구간이 초기화에서
+  제외되었기 때문이다. holdout mask 를 끄면 run 이 학습에 쓴 형상을 다시 재게 되므로 경고와
+  함께 `geometry_diagnostic` 으로 강등한다.
+* **camera model**: `RENDERABLE_CAMERA_MODELS = {PINHOLE, SIMPLE_PINHOLE}`. 왜곡 모델은
+  pinhole 로 투영되어 모든 ray 가 조용히 틀어지므로 거부한다.
+* **image 실측 크기 = intrinsics 크기**: `fx,fy,cx,cy` 는 픽셀 단위 값이므로 `sparse/0` 가
+  4096x4096 이라 하는데 `images/` 가 2048x2048 이면 그 intrinsics 는 그 이미지를 기술하지
+  않는다. render-depth 진입 시 헤더만 읽어 대조하고 불일치면 거부한다.
+* **rasteriser 버전도 증거의 일부**: manifest 의 `renderer.version` 이 이 빌드가 pin 한
+  `PINNED_GSPLAT` 과 다르면 (`"not installed"` 포함) 승격하지 않는다. gsplat 의 투영·합성은
+  릴리스 간 고정이 아니고, 그 equivalence 를 측정한 적이 없다 — `antialiased` 를 거부하는 것과
+  같은 논리다.
+* **training backend 버전도 같은 pin 에 묶는다** (`require_pinned_backend`): manifest 의
+  `backend` 가 run 의 것과 일치하는 것만으로는 부족하다. 둘 다 gsplat 1.4 를 가리키고 renderer
+  만 pin 된 1.5.3 이면 나머지 검사는 전부 통과하면서, 이 renderer 가 대응해 쓰이지 않은
+  parameterisation 의 weights 로 claim 에 도달한다. `train` extra 가 `gsplat>=1.4` 이므로
+  native 설치에서 실제로 나올 수 있는 조합이다. render-depth 진입 시 한 번, promotion 에서 다시
+  검사한다.
+* **checkpoint 내부 step**: `check_checkpoint_blob` 이 blob 의 `step` 을 run.json 의
+  `checkpoint_step` 과 대조한다. 둘은 upstream 에서 같은 분기가 쓰므로, 불일치는 그 경로의
+  파일이 run 이 기록한 checkpoint 가 아니라는 뜻이다.
+* **fail closed, CPU fallback 없음**: run != succeeded · dataset id/hash 불일치 · checkpoint
+  미기록/부재 · `T_local_from_internal` 비항등 · backend 가 `depth_render` 미선언 · 지원하지 않는
+  backend · torch/gsplat 부재 · CUDA 부재 · view 누락/중복/유령 · image stem 충돌 · 해상도
+  불일치 · Inf/음수 depth · 전 픽셀 empty · 출력 디렉터리 존재 · render-critical 옵션 ·
+  왜곡 camera model.
+* **실행되지 않은 부분**: `GsplatDepthRenderer.render` 는 gsplat rasterization API 에 맞춰 작성했고
+  이 저장소에서 **한 번도 실행된 적이 없다** — CI 에 CUDA 도 gsplat 도 없다. 주변 계약은 전부
+  테스트되지만 rasterizer 호출은 아니다. `tests/test_depth_render.py` 는 adapter 를 대체하되
+  validation path 를 우회하지 않으며, 실제 adapter 에 대해서는 "GPU 없이는 절대 돌지 않는다" 만
+  단언한다.
+
+TSDF(`eval/surface/tsdf.py`) 와 mesh 재구성은 여전히 미구현이고, Open3D 는 CI 의존성이 아니다.
+
+Phase 1A/1B 는 **artifact 경계와 증거 경로**를 닫았을 뿐이다. 3DGS 형상이 정확하다거나 surface 가
+과학적으로 검증되었다는 주장은 하지 않는다.
 
 **이 Phase 에서 갚을 기술 부채**: 현재 `integrate_sections` 는 invalid section 을 제거한 뒤
 양쪽 valid section 사이를 그대로 사다리꼴 적분한다. 큰 결측 구간을 가로질러 적분하면 체적이
@@ -648,7 +742,22 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `--profile heavy` 실행 | `ContractError` — depth_loss 때문에 | 위와 동일 | Phase 4 |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
-| 학습된 run 에서 depth 렌더(`render_depths`)·TSDF | `NotYetImplementedError` | 미구현 | Phase 1B |
+| TSDF / mesh 추출 | `NotYetImplementedError` | 미구현 | Phase 1 후속 |
+| CUDA·gsplat 없이 `eval render-depth` | `NoGpuError` / `MissingDependencyError` (exit 4) | rasterizer 는 CUDA 전용이고 CPU fallback 은 없다 | 해당 없음 (설계) |
+| `T_local_from_internal` 이 항등이 아닌 run 의 depth 렌더 | `ContractError` (exit 2) | backend 단위가 미터라고 보장할 수 없다 | 해당 없음 (설계) |
+| 검증에 실패하는 depth manifest | `ContractError` (exit 2) | 강등이 아니라 거부 — 무언가 움직였다는 신호다 | 해당 없음 (설계) |
+| `pose_opt`/`antialiased` run 의 depth 렌더 | `ContractError` (exit 2) | renderer 가 재현하지 않는 설정이다 — equivalence 미검증 재현은 증거가 아니다 | pose 복원·mode 재현을 실제로 검증한 뒤 |
+| 왜곡 camera model 의 depth 렌더 | `ContractError` (exit 2) | pinhole 로 투영되어 모든 ray 가 조용히 틀어진다 | 해당 없음 (설계) |
+| intrinsics 와 크기가 다른 image | `ContractError` (exit 2) | intrinsics 가 그 이미지를 기술하지 않는다 | 해당 없음 (설계) |
+| pin 되지 않은 rasteriser 버전의 depth | `ContractError` (exit 2) | 릴리스 간 렌더 semantics 가 보장되지 않는다 | 해당 버전의 equivalence 를 측정한 뒤 |
+| pin 되지 않은 trainer 버전으로 학습한 run 의 depth | `ContractError` (exit 2) | renderer 가 대응해 쓰이지 않은 parameterisation 의 weights 다 | 해당 버전의 equivalence 를 측정한 뒤 |
+| blob 의 step 이 run 의 step 과 다른 checkpoint | `ContractError` (exit 2) | 그 경로의 파일이 run 이 기록한 checkpoint 가 아니다 | 해당 없음 (설계) |
+| 2-D 가 아닌 depth `.npy` | `ContractError` (exit 2) | depth map 은 (H, W) 배열이다 | 해당 없음 (설계) |
+| manifest 의 `file` 이 naming contract 와 다름 | `ContractError` (exit 2) | 검사한 파일과 역투영할 파일이 달라진다 | 해당 없음 (설계) |
+| reasoned about 하지 않은 `backend_args` 키의 depth 렌더 | `ContractError` (exit 2) | trainer 에 그대로 전달되는 옵션이 투영/frustum 을 바꿀 수 있다 | 해당 항목이 neutral 임을 보인 뒤 |
+| `--no-holdout-only` 에 `geometry_accuracy` | claim 을 `geometry_diagnostic` 으로 강등 + 경고 | 학습에 쓴 형상을 다시 재는 수치다 | 해당 없음 (설계) |
+| holdout 구간에 점이 없는 reference/prediction | `ContractError` (exit 2) | 빈 cloud 에 대한 accuracy/completeness 는 수치가 아니라 입력 누락이다 | 해당 없음 (설계) |
+| run 의 최종 checkpoint 가 아닌 manifest | `ContractError` (exit 2) | 다른 모델을 기술하면서 나머지 검사를 통과한다 | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 원시 PLY | `ContractError` (exit 2) | 가우시안 중심은 표면이 아니다 (§1A) | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 `external_unverified` surface | `ContractError` (exit 2) | 외부 depth 는 기록된 run 과 묶여 있지 않다 | Phase 1B (`minegs_render`) |
 | surface.json 과 내용이 다른 `point_file` | `ContractError` (exit 2) | record 는 surface 가 아니다 | 해당 없음 (설계) |

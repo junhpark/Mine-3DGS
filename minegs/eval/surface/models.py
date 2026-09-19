@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import numpy as np
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from minegs.core.config import VersionedModel
 from minegs.core.errors import ContractError
@@ -177,3 +177,263 @@ def check_surface(
     if not np.isfinite(pc.xyz).all():
         raise ContractError(f"surface {rec.surface_id}: {points} holds non-finite coordinates")
     return pc
+
+
+# ---------------------------------------------------------------- Phase 1B: rendered depth
+
+DEPTH_MANIFEST_FILE = "depth_manifest.json"
+
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RenderedDepth(_Strict):
+    """One depth map the renderer produced, and enough to recognise it again."""
+
+    image_id: int
+    camera_id: int
+    image_name: str
+    #: Relative to the directory holding the manifest.
+    file: str
+    width: int
+    height: int
+    sha256: str = Field(min_length=1)
+    #: Fraction of pixels carrying a usable range. The rest are NaN by policy, not by accident:
+    #: a ray that hit nothing has no depth, and writing 0 there would back-project to the camera
+    #: centre and read as a surface.
+    valid_ratio: float = Field(ge=0.0, le=1.0)
+    min_m: float | None = None
+    max_m: float | None = None
+
+    @field_validator("file")
+    @classmethod
+    def _relative_name(cls, v: str) -> str:
+        p = Path(v)
+        if p.is_absolute() or ".." in p.parts:
+            raise ValueError(f"file must be relative to the manifest directory, got {v!r}")
+        return v
+
+
+class DepthManifest(VersionedModel):
+    """``<depth_dir>/depth_manifest.json`` — what makes rendered depth *evidence* (Phase 1B).
+
+    Phase 1A can be handed a directory of ``.npy`` files and has no way to tell whether they
+    came from the run they are attributed to, so the surfaces it builds are diagnostic-only.
+    This manifest is the difference: it is written by minegs' own renderer, in the same pass
+    that produced the maps, and it names the run, the dataset, the checkpoint and a digest per
+    map. A surface built from depth whose manifest still verifies against all four is the one
+    thing allowed to claim ``depth_source="minegs_render"``.
+    """
+
+    SCHEMA_VERSION: ClassVar[str] = "1.0"
+
+    manifest_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    dataset_id: str = Field(min_length=1)
+    dataset_hash: str = Field(min_length=1)
+    #: ``{"name": ..., "version": ...}`` of the training backend whose weights were rendered.
+    backend: dict[str, str]
+    #: ``{"file": run-relative path, "sha256": ..., "step": ...}``. Identity of the weights,
+    #: so two manifests from two checkpoints of the same run are not interchangeable.
+    checkpoint: dict[str, Any]
+    #: ``{"name": ..., "version": ..., "settings": {...}}`` — who rendered, and under what knobs.
+    renderer: dict[str, Any]
+    frame: Literal["LOCAL_METRIC"] = "LOCAL_METRIC"
+    unit: Literal["m"] = "m"
+    depths: list[RenderedDepth] = Field(min_length=1)
+    #: What the run was actually trained on, copied from ``run.json``'s ``staged``. Depth is
+    #: rendered for every dataset view, but a profile with ``max_images`` trains on a subset, so
+    #: some of those views were never supervised. That does not make the render wrong — it makes
+    #: two otherwise identical artifacts distinguishable, which they were not before.
+    staged: dict[str, Any] = Field(default_factory=dict)
+    provenance: ProvenanceRecord
+
+    def by_image_name(self) -> dict[str, RenderedDepth]:
+        return {d.image_name: d for d in self.depths}
+
+
+def find_depth_manifest(depth_dir: str | Path) -> Path | None:
+    """``depth_manifest.json`` in *depth_dir*, or ``None`` for a plain directory of maps."""
+    p = Path(depth_dir) / DEPTH_MANIFEST_FILE
+    return p if p.is_file() else None
+
+
+def verify_depth_manifest(
+    manifest: DepthManifest,
+    depth_dir: Path,
+    run,
+    run_dir: Path,
+    dataset_id: str,
+    dataset_hash: str,
+    cameras: dict,
+    images: dict,
+) -> None:
+    """Everything that has to hold before rendered depth counts as evidence (Phase 1B §5).
+
+    Presence of a manifest proves nothing on its own — that was the whole objection to a
+    ``depth_source`` string. What makes it evidence is that it still agrees with the run it
+    names, the dataset as it is now, the camera model being back-projected against, and the
+    bytes on disk. Any one of those drifting means the maps are no longer describing the thing
+    the surface will be compared to, so this refuses rather than downgrading silently.
+    """
+    from minegs.eval.surface.depth import depth_map_path
+
+    where = depth_dir / DEPTH_MANIFEST_FILE
+    if manifest.run_id != run.run_id:
+        raise ContractError(
+            f"{where}: depth was rendered from run {manifest.run_id!r}, but --run-dir names "
+            f"{run.run_id!r}"
+        )
+    if manifest.dataset_id != dataset_id:
+        raise ContractError(
+            f"{where}: depth was rendered against dataset {manifest.dataset_id!r}, "
+            f"not {dataset_id!r}"
+        )
+    if manifest.dataset_hash != dataset_hash:
+        raise ContractError(
+            f"{where}: depth was rendered against dataset_hash {manifest.dataset_hash[:12]}, "
+            f"but {dataset_id} now hashes to {dataset_hash[:12]}; the cameras these maps were "
+            "rendered for are not the cameras they would be back-projected with"
+        )
+
+    _verify_checkpoint_identity(manifest, where, run, run_dir)
+    _verify_renderer_and_staging(manifest, where, run)
+
+    entries = manifest.by_image_name()
+    if len(entries) != len(manifest.depths):
+        raise ContractError(f"{where}: two entries name the same image")
+    expected = {im.name for im in images.values()}
+    missing = sorted(expected - set(entries))
+    extra = sorted(set(entries) - expected)
+    if missing or extra:
+        raise ContractError(
+            f"{where}: the manifest covers {len(entries)} views, the dataset has "
+            f"{len(expected)}"
+            + (f"; missing {missing[:6]}" if missing else "")
+            + (f"; unknown {extra[:6]}" if extra else "")
+        )
+
+    by_name = {im.name: im for im in images.values()}
+    for name, entry in sorted(entries.items()):
+        im = by_name[name]
+        cam = cameras[im.camera_id]
+        if entry.camera_id != im.camera_id or entry.image_id != im.id:
+            raise ContractError(
+                f"{where}: {name} is recorded against camera {entry.camera_id} / image "
+                f"{entry.image_id}, but the dataset has camera {im.camera_id} / image {im.id}"
+            )
+        if (entry.width, entry.height) != (cam.width, cam.height):
+            raise ContractError(
+                f"{where}: {name} was rendered at {entry.width}x{entry.height}, but camera "
+                f"{cam.id} is {cam.width}x{cam.height}"
+            )
+        # The fuser finds its maps by the naming contract, not by reading this field, so a
+        # manifest naming some *other* file would have its digest checked while a different
+        # file was consumed. Pinning the two together is what keeps "verified bytes" and
+        # "back-projected bytes" the same bytes.
+        expected_file = depth_map_path(depth_dir, name).name
+        if entry.file != expected_file:
+            raise ContractError(
+                f"{where}: {name} is recorded as {entry.file!r}, but the depth naming contract "
+                f"makes it {expected_file!r}. The map that would be verified is not the map that "
+                "would be back-projected."
+            )
+        f = depth_dir / entry.file
+        if not f.is_file():
+            raise ContractError(f"{where}: {entry.file} is listed but missing")
+        digest = sha256_file(f)
+        if digest != entry.sha256:
+            raise ContractError(
+                f"{where}: {entry.file} hashes to {digest[:12]}, the manifest says "
+                f"{entry.sha256[:12]}. This depth map was changed after it was rendered."
+            )
+
+
+def _verify_checkpoint_identity(manifest: DepthManifest, where: Path, run, run_dir: Path) -> None:
+    """The weights named by the manifest must be the weights the run ended on.
+
+    Recording the checkpoint was only half of it: a manifest rendered from an earlier
+    checkpoint of the same run passes every other check — same run id, same dataset, same
+    views, same digests — while describing a different model than the one `run.json` presents
+    as the result. The digest is re-checked when the file is still there, which is the case
+    that matters; a checkpoint deleted after rendering leaves the file and step to agree on.
+    """
+    recorded = manifest.checkpoint or {}
+    file, step = recorded.get("file"), recorded.get("step")
+    if file != run.final_checkpoint:
+        raise ContractError(
+            f"{where}: depth was rendered from checkpoint {file!r}, but run {run.run_id} ended "
+            f"on {run.final_checkpoint!r}"
+        )
+    if step != run.checkpoint_step:
+        raise ContractError(
+            f"{where}: depth was rendered at step {step}, but run {run.run_id} ended at "
+            f"{run.checkpoint_step}"
+        )
+    if not file:
+        raise ContractError(f"{where}: the manifest names no checkpoint")
+    ckpt = Path(run_dir) / file
+    if ckpt.is_file():
+        digest = sha256_file(ckpt)
+        if digest != recorded.get("sha256"):
+            raise ContractError(
+                f"{where}: {file} hashes to {digest[:12]}, but the depth was rendered from "
+                f"{str(recorded.get('sha256'))[:12]}. These are different weights."
+            )
+
+
+def _verify_renderer_and_staging(manifest: DepthManifest, where: Path, run) -> None:
+    """The manifest's own account of who rendered and what was trained, checked against reality.
+
+    Recording a field and never comparing it is how ``checkpoint`` slipped through review, so
+    the two added since get the same treatment. ``renderer.name`` must be a renderer this build
+    can produce — otherwise the manifest was minted through the injection seam that exists for
+    testing, and says nothing about minegs having rendered anything. ``staged`` must still match
+    the run, so a manifest cannot describe a full-dataset run while the record says a subset.
+    """
+    from minegs.eval.surface.render import (
+        known_renderer_names,
+        pinned_renderer_version,
+        require_pinned_backend,
+    )
+
+    name = (manifest.renderer or {}).get("name")
+    known = known_renderer_names()
+    if name not in known:
+        raise ContractError(
+            f"{where}: depth was produced by renderer {name!r}, which this build does not ship "
+            f"(known: {sorted(known)}). A manifest from an unknown renderer is not evidence "
+            "that minegs rendered the depth."
+        )
+    # The rasteriser's own version, not just its name. gsplat's projection and compositing are
+    # not frozen across releases, so depth from an unpinned version was produced by code whose
+    # equivalence to the pinned one nobody here has measured -- the same argument that refuses
+    # `antialiased`. "not installed" lands here too, which is right: a renderer that could not
+    # import its rasteriser did not render this.
+    pinned = pinned_renderer_version(name)
+    version = (manifest.renderer or {}).get("version")
+    if pinned is not None and version != pinned:
+        raise ContractError(
+            f"{where}: depth was rendered by {name} on rasteriser version {version!r}, but this "
+            f"build pins {pinned!r}. Rendering semantics are not guaranteed across versions, so "
+            "depth from another one is not evidence for a claim."
+        )
+    # The training backend the manifest names must be the one the run recorded: a manifest
+    # carrying a different backend or version describes weights produced by other code.
+    if dict(manifest.backend or {}) != dict(run.backend or {}):
+        raise ContractError(
+            f"{where}: depth is attributed to backend {dict(manifest.backend or {})}, but run "
+            f"{run.run_id} was trained by {dict(run.backend or {})}"
+        )
+    # ...and the backend they agree on must itself be the pinned trainer. Agreeing with each
+    # other is not enough: both can name gsplat 1.4 while the renderer names the pinned 1.5.3,
+    # and every other check passes on weights this renderer was not written against.
+    require_pinned_backend(run)
+    recorded = manifest.staged or {}
+    actual = {k: v for k, v in (run.staged or {}).items() if k in recorded}
+    if recorded and actual != recorded:
+        raise ContractError(
+            f"{where}: the manifest records staging {recorded}, but run {run.run_id} now "
+            f"records {actual}; the depth was rendered for a different staging of this run"
+        )

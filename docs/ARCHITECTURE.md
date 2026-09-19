@@ -53,7 +53,7 @@ minegs/
       runner/    base.py, local.py, runpod.py, sync.py(rclone)
       profiles/  light.yaml, heavy.yaml
     eval/        register/ (initial_alignment, sim3, rigid_icp, diagnostics)
-                 surface/  (models=surface artifact 계약 · depth 역투영 · TSDF·mesh 추출)
+                 surface/  (models=surface·depth manifest 계약 · render=gsplat metric depth · depth 역투영 · TSDF·mesh 추출)
                  geometry/ (accuracy, completeness, chamfer, 분위수)
                  sections/ (중심선 기준 단면 A(s))
                  volume/   (∫A(s)ds, 메시 체적, 설계 대비 여굴·미굴)

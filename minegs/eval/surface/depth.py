@@ -21,10 +21,11 @@ import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-from minegs.core.errors import ContractError, NotYetImplementedError
+from minegs.core.errors import ContractError
 from minegs.core.frames import SE3
 from minegs.core.pointcloud import PointCloud
 from minegs.eval.surface.models import (
@@ -67,6 +68,24 @@ def missing_depth_maps(depth_dir: str | Path, images: dict) -> list[str]:
     )
 
 
+def require_unique_stems(images: dict) -> None:
+    """The depth naming contract is per *stem*, so two views sharing one is unresolvable.
+
+    ``a/view.jpg`` and ``b/view.png`` both want ``view.npy``: on the write side the second
+    render silently overwrites the first, on the read side both views back-project the same
+    map. Rare, and worth a sentence rather than a silent wrong surface.
+    """
+    seen: dict[str, str] = {}
+    for im in images.values():
+        stem = Path(im.name).stem
+        if stem in seen:
+            raise ContractError(
+                f"images {seen[stem]!r} and {im.name!r} share the depth-map name "
+                f"{stem}{DEPTH_SUFFIX}; the depth contract is one map per image stem"
+            )
+        seen[stem] = im.name
+
+
 def unexpected_depth_maps(depth_dir: str | Path, images: dict) -> list[str]:
     """Depth maps in *depth_dir* that match no camera view.
 
@@ -87,6 +106,13 @@ def check_depth_shape(depth: np.ndarray, camera, name: str) -> None:
     surface is quietly wrong, and the artifact, the record and the evaluation all succeed. Any
     rescaling has to adjust K, so this refuses rather than guessing which of the two is right.
     """
+    # ndim first, and separately: the message below indexes shape[1], so a 1-D array used to
+    # raise IndexError from inside the refusal itself -- a crash where a contract error belongs.
+    if depth.ndim != 2:
+        raise ContractError(
+            f"{name}: depth map is {depth.ndim}-D with shape {tuple(depth.shape)}; a depth map "
+            "is a 2-D (height, width) array of metres along camera +z"
+        )
     expected = (camera.height, camera.width)
     if depth.shape != expected:
         raise ContractError(
@@ -164,7 +190,7 @@ def depth_to_points(
 
 
 @contextmanager
-def _staged_dir(out: Path) -> Iterator[Path]:
+def staged_dir(out: Path) -> Iterator[Path]:
     """Write into a sibling ``.<name>.minegs-partial`` and rename on success (§15).
 
     Same shape as the ingest and dataset publishes: a surface directory either exists complete
@@ -182,8 +208,9 @@ def _staged_dir(out: Path) -> Iterator[Path]:
     tmp.rename(out)
 
 
-def _check_run(run_dir: Path, dataset_id: str, dataset_hash: str) -> str:
-    """The §10 run checks. Returns the run id."""
+def check_run(run_dir: Path, dataset_id: str, dataset_hash: str):
+    """The §10 run checks. Returns the ``RunRecord``, so callers verify against it rather than
+    against a bare id — checkpoint identity and render settings both live there."""
     from minegs.train.runner.base import RunRecord, RunStatus
 
     rpath = run_dir / "run.json"
@@ -208,7 +235,34 @@ def _check_run(run_dir: Path, dataset_id: str, dataset_hash: str) -> str:
         raise ContractError(
             f"run {rec.run_id} declares frame_of_outputs={rec.frame_of_outputs}, not LOCAL_METRIC"
         )
-    return rec.run_id
+    return rec
+
+
+def _depth_provenance(
+    depth_dir: Path, run, run_dir: Path, dataset_id: str, dataset_hash: str, model
+) -> tuple[str, Any]:
+    """``(depth_source, DepthManifest | None)`` for the maps in *depth_dir* (§1B §5)."""
+    from minegs.eval.surface.models import (
+        DepthManifest,
+        find_depth_manifest,
+        verify_depth_manifest,
+    )
+
+    found = find_depth_manifest(depth_dir)
+    if found is None:
+        return "external_unverified", None
+    from minegs.eval.surface.render import require_metric_outputs, require_reproducible_render
+
+    rendered = DepthManifest.load(found)
+    verify_depth_manifest(
+        rendered, depth_dir, run, run_dir, dataset_id, dataset_hash, model.cameras, model.images
+    )
+    # Re-asserted here rather than trusted from the manifest. The renderer checked both too,
+    # but the manifest records no verdict, so depth written by an older build — or by one whose
+    # guard was weaker — would otherwise promote on the strength of having a manifest at all.
+    require_metric_outputs(run)
+    require_reproducible_render(run, run_dir)
+    return "minegs_render", rendered
 
 
 def build_depth_surface(
@@ -221,10 +275,20 @@ def build_depth_surface(
 ) -> tuple[SurfaceRecord, Path]:
     """Fuse depth maps into a published surface artifact. Returns the record and its directory.
 
-    The run checks establish that the *dataset* and the *run* belong together. They cannot
-    establish that these depth maps came from that run — nothing in a directory of ``.npy``
-    files says so — which is why the record is stamped ``external_unverified`` and why the
-    artifact it publishes is diagnostic-only until Phase 1B renders depth itself.
+    The run checks establish that the *dataset* and the *run* belong together. Whether the
+    depth maps belong to that run is a separate question, and the answer decides what the
+    surface may claim:
+
+    * a directory of bare ``.npy`` files cannot answer it — nothing in it ties the maps to the
+      run — so the record is stamped ``external_unverified`` and the artifact is
+      diagnostic-only;
+    * a directory carrying a ``depth_manifest.json`` that still verifies against this run, this
+      dataset and these bytes was written by ``minegs eval render-depth`` in the same pass that
+      produced the maps, and earns ``minegs_render``.
+
+    A manifest is never taken on its presence. It is checked, and a failed check is a refusal,
+    not a demotion: a manifest that no longer agrees with its inputs is a sign something moved,
+    which is exactly when quietly continuing would be worst.
     """
     from minegs.core.manifest import Manifest
     from minegs.core.pointcloud import write_ply
@@ -252,8 +316,13 @@ def build_depth_surface(
     unknown = sorted({im.camera_id for im in model.images.values()} - set(model.cameras))
     if unknown:
         raise ContractError(f"{dataset_dir}/sparse/0: images reference unknown cameras {unknown}")
+    require_unique_stems(model.images)
     dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
-    run_id = _check_run(run_dir, manifest.dataset_id, dataset_hash)
+    run = check_run(run_dir, manifest.dataset_id, dataset_hash)
+    run_id = run.run_id
+    depth_source, rendered = _depth_provenance(
+        depth_dir, run, run_dir, manifest.dataset_id, dataset_hash, model
+    )
 
     pc = depth_to_points(depth_dir, model.cameras, model.images, stride, max_depth, True)
     # §14 sanity. Neither is reachable from finite depth maps and a rigid pose, which is the
@@ -275,7 +344,11 @@ def build_depth_surface(
         "max_depth_m": None if max_depth is None else float(max_depth),
         "expected_views": len(model.images),
     }
-    with _staged_dir(out_dir) as tmp:
+    if rendered is not None:
+        parameters["depth_manifest_id"] = rendered.manifest_id
+        parameters["renderer"] = rendered.renderer.get("name")
+        parameters["checkpoint"] = rendered.checkpoint.get("file")
+    with staged_dir(out_dir) as tmp:
         ply = write_ply(pc, tmp / SURFACE_POINTS_FILE)
         rec = SurfaceRecord(
             surface_id=make_id("surface"),
@@ -283,9 +356,9 @@ def build_depth_surface(
             dataset_hash=dataset_hash,
             run_id=run_id,
             method="depth_backprojection",
-            # Hardcoded, never a parameter: this function is the external-depth path by
-            # definition. The claim-capable value belongs to the Phase 1B renderer.
-            depth_source="external_unverified",
+            # Derived from the evidence on disk, never passed in by a caller: the only way to
+            # reach the claim-capable value is to have rendered the depth with minegs.
+            depth_source=depth_source,
             point_file=SURFACE_POINTS_FILE,
             point_sha256=sha256_file(ply),
             point_count=len(pc),
@@ -299,8 +372,3 @@ def build_depth_surface(
         )
         rec.save(tmp / SURFACE_FILE)
     return rec, out_dir
-
-
-def render_depths(run_dir: str | Path, dataset_dir: str | Path, out_dir: str | Path) -> Path:
-    """Render depth per training/test view with the run's backend. GPU only (Phase 1B)."""
-    raise NotYetImplementedError("depth rendering from a trained run", "1B")
