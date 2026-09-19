@@ -166,6 +166,15 @@ def compare_to_design(
             continue
         r = np.array([v if v is not None else np.nan for v in sec.radii_m])
         good = ~np.isnan(r)
+        if len(r) != n or not good.any():
+            # np.interp with no sample points raises a bare ValueError from inside a claim
+            # path. A section that reports an area while carrying no wall radii, or radii for a
+            # different bin count, is a malformed series, and it should say so.
+            raise ContractError(
+                f"section at {sec.chainage_m:g} m has an area but {int(good.sum())} of "
+                f"{len(r)} wall radii ({n} bins expected); over/underbreak is computed per "
+                "angle bin and cannot be derived from that"
+            )
         r = np.interp(centers, centers[good], r[good], period=2 * np.pi)
         # sector-wise area difference: 1/2 (r_a^2 - r_d^2) dθ
         diff = 0.5 * (r**2 - design**2) * dtheta

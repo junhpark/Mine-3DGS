@@ -765,3 +765,13 @@ def test_the_headline_numbers_are_self_consistent_across_a_gap():
     assert rep.coverage.covered_length_m == pytest.approx(2.0)  # what was integrated
     assert rep.mean_area_m2 * rep.coverage.covered_length_m == pytest.approx(rep.volume_m3)
     assert rep.mean_area_m2 * (rep.end_chainage_m - rep.start_chainage_m) > rep.volume_m3
+
+
+def test_a_section_with_an_area_but_no_radii_is_named_not_a_traceback():
+    """np.interp with no sample points raises a bare ValueError from inside the claim path."""
+    ser = _series([10.0, 10.0, 10.0])
+    ser.sections[1].radii_m = [None] * ser.angle_bins
+    with pytest.raises(ContractError, match="wall radii"):
+        compare_to_design(ser, 1.0)
+    # the area integral does not need the radii, so it is unaffected
+    assert integrate_sections(ser, "x").volume_m3 == pytest.approx(20.0)
