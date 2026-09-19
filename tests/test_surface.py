@@ -11,6 +11,7 @@ real survey. `render_depths` stays unimplemented (Phase 1B).
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,9 +21,14 @@ from minegs.cli.main import app
 from minegs.core.errors import ContractError
 from minegs.core.frames import SE3
 from minegs.core.manifest import Manifest
-from minegs.core.pointcloud import read_ply, write_ply
-from minegs.core.provenance import ProvenanceRecord, sha256_tree, stamp
-from minegs.eval.surface.depth import build_depth_surface, depth_to_points
+from minegs.core.pointcloud import read_ply
+from minegs.core.provenance import ProvenanceRecord, sha256_file, sha256_tree, stamp
+from minegs.eval.surface.depth import (
+    build_depth_surface,
+    depth_digest,
+    depth_map_path,
+    depth_to_points,
+)
 from minegs.eval.surface.models import (
     SURFACE_FILE,
     SURFACE_POINTS_FILE,
@@ -177,6 +183,11 @@ def test_t4_surface_artifact_is_published_with_its_provenance(env):
     assert rec.frame == "LOCAL_METRIC"
     assert rec.unit == "m"
     assert rec.parameters["stride"] == 4
+    # the record is a statement about *these* bytes, and about depth nobody vouched for
+    assert rec.point_sha256 == sha256_file(surface_dir / SURFACE_POINTS_FILE)
+    assert rec.depth_sha256 == depth_digest(env.depth_dir, env.model.images)
+    assert rec.depth_source == "external_unverified"
+    assert rec.supports_accuracy_claim is False
 
     reloaded, points = load_surface(surface_dir)
     assert reloaded.surface_id == rec.surface_id
@@ -209,31 +220,30 @@ def test_t5_a_run_from_another_dataset_cannot_source_a_surface(env, tmp_path):
     assert not env.out.exists()
 
 
-# ---------------------------------------------------------------- T6-T8: the geometry guard
+# ------------------------------------------------- T6-T10: the geometry guard
 
 
-def synthetic_surface(synthetic, out: Path, run_id: str = "run_synth") -> Path:
-    """A surface artifact for the synthetic dataset, made from its LOCAL_METRIC init points.
+def build_synthetic_surface(synthetic, tmp_path, run_id: str = "run_synth", depth_m: float = 4.0):
+    """A real surface artifact for the synthetic dataset, through the production builder.
 
-    Stands in for a depth-fused surface: Phase 1A is about the artifact boundary, and rendering
-    depth from a trained run is Phase 1B.
+    Constant-depth maps, so the points are planes in front of each camera rather than a tunnel
+    wall — this exercises the artifact boundary, not reconstruction quality. Built by
+    ``build_depth_surface`` rather than hand-written on purpose: a test that manufactures its
+    own ``SurfaceRecord`` proves the evaluator accepts records, not that it accepts surfaces.
     """
     ds = synthetic.dataset_dir
-    pc = read_ply(ds / "init_points.ply")
-    out.mkdir(parents=True, exist_ok=True)
-    write_ply(pc, out / SURFACE_POINTS_FILE)
-    SurfaceRecord(
-        surface_id="surface_test_0001",
-        dataset_id=synthetic.manifest.dataset_id,
-        dataset_hash=sha256_tree(ds, DATASET_HASH_PATTERNS),
-        run_id=run_id,
-        method="depth_backprojection",
-        point_count=len(pc),
-        depth_map_count=len(synthetic.manifest.all_images()),
-        parameters={"stride": 1},
-        provenance=stamp(None),
-    ).save(out / SURFACE_FILE)
-    return out
+    model = read_model(ds / "sparse" / "0")
+    depth_dir = tmp_path / "depth"
+    depth_dir.mkdir(exist_ok=True)
+    for im in model.images.values():
+        cam = model.cameras[im.camera_id]
+        np.save(
+            depth_map_path(depth_dir, im.name),
+            np.full((cam.height, cam.width), depth_m, np.float32),
+        )
+    run_dir = tmp_path / "runs" / run_id
+    write_run(run_dir, ds, run_id=run_id)
+    return build_depth_surface(depth_dir, ds, run_dir, tmp_path / "surface" / "depth_v001")
 
 
 def geometry_argv(pred: Path, synthetic, out: Path | None = None, diagnostic: bool = False):
@@ -271,31 +281,93 @@ def test_t7_diagnostic_still_accepts_a_raw_ply(synthetic, tmp_path):
     assert json.loads(out.read_text())["claim"] == "geometry_diagnostic"
 
 
-def test_t8_a_surface_artifact_reaches_the_geometry_evaluator(synthetic, tmp_path):
-    surface_dir = synthetic_surface(synthetic, tmp_path / "surface" / "depth_v001")
-    claimed, diag = tmp_path / "claim.json", tmp_path / "diag.json"
+def test_t8_a_surface_artifact_reaches_the_evaluator_but_external_depth_is_diagnostic(
+    synthetic, tmp_path
+):
+    """A real artifact runs; the accuracy claim waits on depth minegs rendered itself (§1A)."""
+    rec, surface_dir = build_synthetic_surface(synthetic, tmp_path)
+    assert rec.depth_source == "external_unverified"
 
-    r = runner.invoke(app, geometry_argv(surface_dir, synthetic, claimed))
+    # claim-bearing: refused, and the refusal says why and what would lift it
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic))
+    assert r.exit_code == 2, r.output
+    assert "depth_source=external_unverified" in r.output
+    assert "geometry_accuracy" in r.output and "Phase 1B" in r.output
+
+    # diagnostic: runs, and is labelled for what it is
+    diag = tmp_path / "diag.json"
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic, diag, diagnostic=True))
     assert r.exit_code == 0, r.output
-    rep = json.loads(claimed.read_text())
-    assert rep["claim"] == "geometry_accuracy"
+    rep = json.loads(diag.read_text())
+    assert rep["claim"] == "geometry_diagnostic"
 
     # the surface path changed the gate, not the geometry: the same points passed raw under
     # --diagnostic produce the same numbers through the same LOCAL_METRIC -> TLS_GLOBAL hop.
+    raw = tmp_path / "raw.json"
     r = runner.invoke(
         app,
-        geometry_argv(surface_dir / SURFACE_POINTS_FILE, synthetic, diag, diagnostic=True),
+        geometry_argv(surface_dir / SURFACE_POINTS_FILE, synthetic, raw, diagnostic=True),
     )
     assert r.exit_code == 0, r.output
-    same = json.loads(diag.read_text())
-    assert same["claim"] == "geometry_diagnostic"
+    same = json.loads(raw.read_text())
     assert same["accuracy"] == rep["accuracy"] and same["completeness"] == rep["completeness"]
 
-    # an artifact built from a different dataset is refused even though it is a valid artifact
-    alien = tmp_path / "alien"
-    synthetic_surface(synthetic, alien)
-    rec = SurfaceRecord.load(alien / SURFACE_FILE)
-    rec.dataset_id = "another_dataset"
-    rec.save(alien / SURFACE_FILE)
-    r = runner.invoke(app, geometry_argv(alien, synthetic))
-    assert r.exit_code == 2 and "another_dataset" in r.output
+    # and the gate really is the depth provenance: the identical artifact, declared as depth
+    # this project rendered, reaches the accuracy claim. That value is Phase 1B's to write.
+    rendered = SurfaceRecord.load(surface_dir / SURFACE_FILE)
+    rendered.depth_source = "minegs_render"
+    rendered.save(surface_dir / SURFACE_FILE)
+    claimed = tmp_path / "claim.json"
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic, claimed))
+    assert r.exit_code == 0, r.output
+    assert json.loads(claimed.read_text())["claim"] == "geometry_accuracy"
+
+
+def test_t9_a_record_is_not_a_surface(synthetic, tmp_path):
+    """The points are verified against the record, not vouched for by it (§19)."""
+    rec, surface_dir = build_synthetic_surface(synthetic, tmp_path)
+    # promote it, so what follows is refused by the integrity check rather than by the claim gate
+    rec.depth_source = "minegs_render"
+    rec.save(surface_dir / SURFACE_FILE)
+
+    # swap the surface samples for Gaussian-centre-like raw points, keeping the record
+    shutil.copy(synthetic.dataset_dir / "init_points.ply", surface_dir / SURFACE_POINTS_FILE)
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic))
+    assert r.exit_code == 2, r.output
+    assert "hashes to" in r.output and "not the points this surface was built from" in r.output
+
+    # and a raw PLY with a surface.json written beside it is not an artifact either
+    wrapped = tmp_path / "wrapped"
+    wrapped.mkdir()
+    shutil.copy(synthetic.dataset_dir / "init_points.ply", wrapped / SURFACE_POINTS_FILE)
+    pc = read_ply(wrapped / SURFACE_POINTS_FILE)
+    SurfaceRecord(
+        surface_id="surface_hand_written",
+        dataset_id=synthetic.manifest.dataset_id,
+        dataset_hash=sha256_tree(synthetic.dataset_dir, DATASET_HASH_PATTERNS),
+        run_id="run_synth",
+        method="depth_backprojection",
+        depth_source="minegs_render",
+        point_sha256="0" * 64,
+        point_count=len(pc),
+        depth_map_count=1,
+        depth_sha256="0" * 64,
+        provenance=stamp(None),
+    ).save(wrapped / SURFACE_FILE)
+    r = runner.invoke(app, geometry_argv(wrapped, synthetic))
+    assert r.exit_code == 2 and "hashes to" in r.output
+
+
+def test_t10_depth_resolution_must_match_the_camera(env):
+    """Half-resolution depth with full-resolution intrinsics bends every ray, silently."""
+    im = next(iter(env.model.images.values()))
+    cam = env.model.cameras[im.camera_id]
+    np.save(
+        depth_map_path(env.depth_dir, im.name),
+        np.full((cam.height // 2, cam.width // 2), 5.0, np.float32),
+    )
+
+    with pytest.raises(ContractError, match="intrinsics"):
+        build_depth_surface(env.depth_dir, env.dataset_dir, env.run_dir, env.out)
+
+    assert not env.out.exists()

@@ -8,12 +8,15 @@ Two halves, deliberately split by phase:
 * **Phase 1B.** ``render_depths`` — ask a trained run's backend for those depth maps. That needs
   the gsplat rasteriser and a GPU, and is not implemented.
 
-The split matters because the artifact contract is what stops Gaussian centres being evaluated
-as if they were a surface, and that guard should not wait on a rasteriser integration.
+The split matters twice over. It lets the artifact contract land without waiting on a
+rasteriser integration — and it is the reason a Phase 1A surface cannot carry a geometry
+accuracy claim: depth maps this code was handed are not evidence about the run they are
+attributed to (``DepthSource`` in ``models.py``).
 """
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -64,6 +67,48 @@ def missing_depth_maps(depth_dir: str | Path, images: dict) -> list[str]:
     )
 
 
+def unexpected_depth_maps(depth_dir: str | Path, images: dict) -> list[str]:
+    """Depth maps in *depth_dir* that match no camera view.
+
+    The mirror of a missing map, and the louder symptom: a directory holding maps for views
+    this dataset does not have is usually a directory belonging to another run or another
+    dataset, which is exactly the mix-up the run checks exist to catch.
+    """
+    wanted = {depth_map_path(depth_dir, im.name).name for im in images.values()}
+    return sorted(p.name for p in Path(depth_dir).glob(f"*{DEPTH_SUFFIX}") if p.name not in wanted)
+
+
+def check_depth_shape(depth: np.ndarray, camera, name: str) -> None:
+    """A depth map must be the resolution its intrinsics describe.
+
+    Nothing downstream notices if it is not. ``backproject_depth`` walks whatever grid it is
+    given and applies ``fx, fy, cx, cy`` from the camera, so a half-resolution map is
+    back-projected with full-resolution intrinsics: every ray comes out at the wrong angle, the
+    surface is quietly wrong, and the artifact, the record and the evaluation all succeed. Any
+    rescaling has to adjust K, so this refuses rather than guessing which of the two is right.
+    """
+    expected = (camera.height, camera.width)
+    if depth.shape != expected:
+        raise ContractError(
+            f"{name}: depth map is {depth.shape[1]}x{depth.shape[0]} but camera "
+            f"{camera.id} is {camera.width}x{camera.height}. Back-projecting one resolution "
+            "with another's intrinsics silently bends every ray; re-render at the camera's "
+            "resolution, or add a camera whose intrinsics match the depth."
+        )
+
+
+def depth_digest(depth_dir: str | Path, images: dict) -> str:
+    """Order-independent sha256 over the depth maps *images* consumes."""
+    from minegs.core.provenance import sha256_file
+
+    h = hashlib.sha256()
+    for name in sorted(im.name for im in images.values()):
+        f = depth_map_path(depth_dir, name)
+        h.update(f.name.encode())
+        h.update(sha256_file(f).encode())
+    return h.hexdigest()
+
+
 def depth_to_points(
     depth_dir: str | Path,
     cameras: dict,
@@ -82,23 +127,34 @@ def depth_to_points(
     depth_dir = Path(depth_dir)
     if require_all:
         missing = missing_depth_maps(depth_dir, images)
-        if missing:
+        extra = unexpected_depth_maps(depth_dir, images)
+        if missing or extra:
             raise ContractError(
                 f"{depth_dir}: expected {len(images)} depth maps, found "
-                f"{len(images) - len(missing)}; missing {missing[:6]}"
-                f"{' ...' if len(missing) > 6 else ''}. Every camera view needs one: a skipped "
-                "view is a hole in the surface that reads as missing geometry downstream."
+                f"{len(images) - len(missing)} of them"
+                + (
+                    f"; missing {missing[:6]}{' ...' if len(missing) > 6 else ''}"
+                    if missing
+                    else ""
+                )
+                + (
+                    f"; {len(extra)} map(s) match no camera view {extra[:6]}"
+                    f"{' ...' if len(extra) > 6 else ''}"
+                    if extra
+                    else ""
+                )
+                + ". Every camera view needs exactly one: a skipped view is a hole in the "
+                "surface that reads as missing geometry downstream."
             )
     pts = []
     for im in images.values():
         f = depth_map_path(depth_dir, im.name)
         if not f.exists():
             continue
-        pts.append(
-            backproject_depth(
-                np.load(f), cameras[im.camera_id].K(), im.world_from_cam, stride, max_depth
-            )
-        )
+        depth = np.load(f)
+        cam = cameras[im.camera_id]
+        check_depth_shape(depth, cam, f.name)
+        pts.append(backproject_depth(depth, cam.K(), im.world_from_cam, stride, max_depth))
     if not pts:
         raise FileNotFoundError(f"no depth maps in {depth_dir}")
     return PointCloud(np.concatenate(pts), frame="LOCAL_METRIC")
@@ -163,10 +219,16 @@ def build_depth_surface(
     stride: int = 2,
     max_depth: float | None = None,
 ) -> tuple[SurfaceRecord, Path]:
-    """Fuse depth maps into a published surface artifact. Returns the record and its directory."""
+    """Fuse depth maps into a published surface artifact. Returns the record and its directory.
+
+    The run checks establish that the *dataset* and the *run* belong together. They cannot
+    establish that these depth maps came from that run — nothing in a directory of ``.npy``
+    files says so — which is why the record is stamped ``external_unverified`` and why the
+    artifact it publishes is diagnostic-only until Phase 1B renders depth itself.
+    """
     from minegs.core.manifest import Manifest
     from minegs.core.pointcloud import write_ply
-    from minegs.core.provenance import make_id, sha256_tree, stamp
+    from minegs.core.provenance import make_id, sha256_file, sha256_tree, stamp
     from minegs.ingest.common.colmap_io import read_model
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
@@ -213,23 +275,28 @@ def build_depth_surface(
         "max_depth_m": None if max_depth is None else float(max_depth),
         "expected_views": len(model.images),
     }
-    rec = SurfaceRecord(
-        surface_id=make_id("surface"),
-        dataset_id=manifest.dataset_id,
-        dataset_hash=dataset_hash,
-        run_id=run_id,
-        method="depth_backprojection",
-        point_file=SURFACE_POINTS_FILE,
-        point_count=len(pc),
-        depth_map_count=len(model.images),
-        parameters=parameters,
-        bounds_min_m=[float(v) for v in lo],
-        bounds_max_m=[float(v) for v in hi],
-        span_m=[float(v) for v in (hi - lo)],
-        provenance=stamp(parameters, parents=[manifest.dataset_id, run_id]),
-    )
     with _staged_dir(out_dir) as tmp:
-        write_ply(pc, tmp / SURFACE_POINTS_FILE)
+        ply = write_ply(pc, tmp / SURFACE_POINTS_FILE)
+        rec = SurfaceRecord(
+            surface_id=make_id("surface"),
+            dataset_id=manifest.dataset_id,
+            dataset_hash=dataset_hash,
+            run_id=run_id,
+            method="depth_backprojection",
+            # Hardcoded, never a parameter: this function is the external-depth path by
+            # definition. The claim-capable value belongs to the Phase 1B renderer.
+            depth_source="external_unverified",
+            point_file=SURFACE_POINTS_FILE,
+            point_sha256=sha256_file(ply),
+            point_count=len(pc),
+            depth_map_count=len(model.images),
+            depth_sha256=depth_digest(depth_dir, model.images),
+            parameters=parameters,
+            bounds_min_m=[float(v) for v in lo],
+            bounds_max_m=[float(v) for v in hi],
+            span_m=[float(v) for v in (hi - lo)],
+            provenance=stamp(parameters, parents=[manifest.dataset_id, run_id]),
+        )
         rec.save(tmp / SURFACE_FILE)
     return rec, out_dir
 

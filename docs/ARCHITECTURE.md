@@ -20,7 +20,10 @@
 7. **가우시안 중심은 표면이 아니다.** 형상 평가는 항상
    GS → 깊이/메시/표면 표현 → TLS 비교 순서를 따른다. 이 경계는 계약으로 강제된다:
    surface 는 `SurfaceRecord` 를 남기는 명시적 artifact 이고 (`eval/surface/models.py`),
-   claim 을 담는 `eval geometry` 는 그 artifact 없이는 실행되지 않는다 (Phase 1A).
+   claim 을 담는 `eval geometry` 는 그 artifact 없이는 실행되지 않는다. 그리고 record 를
+   믿는 것이 아니라 점들을 다시 읽어 digest 로 대조하며, artifact 라는 것만으로는 부족하다 —
+   `depth_source` 가 이 프로젝트가 렌더한 depth 를 가리킬 때만 accuracy claim 이 열린다
+   (Phase 1A 의 외부 depth 는 diagnostic 전용).
 8. **모든 산출물에 계보.** raw → dataset → run → eval → export 각 단계가
    입력 해시·설정 해시·git SHA·도구 버전·부모 ID 를 기록한다 (§9).
 

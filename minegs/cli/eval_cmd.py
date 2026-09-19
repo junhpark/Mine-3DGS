@@ -47,26 +47,49 @@ SURFACE_REQUIRED = (
 )
 
 
+def _unverified_depth(rec) -> str:
+    return (
+        f"surface {rec.surface_id} was built from depth maps minegs did not render "
+        f"(depth_source={rec.depth_source}), so it cannot carry a geometry_accuracy claim. "
+        f"Nothing ties those maps to run {rec.run_id}: the same directory paired with any "
+        "succeeded run of this dataset would produce the same artifact. Rendering metric depth "
+        "from a trained run is Phase 1B (docs/ROADMAP.md). Pass --diagnostic for non-claim "
+        "numbers."
+    )
+
+
 def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
-    """Resolve the geometry input to (points PLY, SurfaceRecord | None).
+    """Resolve the geometry input to (points, SurfaceRecord | None).
 
     A surface artifact is what separates "these points came off a reconstruction" from "these
-    points are where the optimiser put its Gaussians" (§16). The claim-bearing path needs the
-    former; ``--diagnostic`` still takes a bare PLY, and says so out loud.
+    points are where the optimiser put its Gaussians" (§16) — and ``check_surface`` verifies
+    the points against the record rather than taking the record's word for them, so wrapping a
+    Gaussian PLY in a hand-written surface.json does not get past this. Being a surface is
+    still not sufficient: a claim also needs depth this project rendered (§1A).
     """
     from minegs.core.errors import ContractError
+    from minegs.core.pointcloud import read_ply
     from minegs.core.provenance import sha256_tree
     from minegs.eval.surface.models import check_surface, find_surface, load_surface
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
     if find_surface(pred) is not None:
         rec, points = load_surface(pred)
-        check_surface(rec, points, m.dataset_id, sha256_tree(dataset_dir, DATASET_HASH_PATTERNS))
-        console.print(
-            f"surface [bold]{rec.surface_id}[/] ({rec.method}, {rec.point_count} points "
-            f"from {rec.depth_map_count} depth maps, run {rec.run_id})"
+        pc = check_surface(
+            rec, points, m.dataset_id, sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
         )
-        return points, rec
+        console.print(
+            f"surface [bold]{rec.surface_id}[/] ({rec.method}, depth {rec.depth_source}, "
+            f"{rec.point_count} points from {rec.depth_map_count} depth maps, run {rec.run_id})"
+        )
+        if not rec.supports_accuracy_claim:
+            if not diagnostic:
+                raise ContractError(_unverified_depth(rec))
+            console.print(
+                "[yellow]warning: this surface's depth maps are unverified external input; "
+                "these numbers are diagnostic, not a validated geometry claim[/]"
+            )
+        return pc, rec
     if not diagnostic:
         raise ContractError(SURFACE_REQUIRED)
     if not pred.is_file():
@@ -75,7 +98,7 @@ def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
         "[yellow]warning: raw PLY accepted only as diagnostic; this is not a validated "
         "surface artifact[/]"
     )
-    return pred, None
+    return read_ply(pred), None
 
 
 @app.command("surface-depth")
@@ -226,11 +249,13 @@ def geometry(
                 )
             claim = Claim.GEOMETRY_DIAGNOSTIC
         points, surface = _resolve_pred(pred, dataset_dir, m, diagnostic)
-        if surface is None:
-            # A raw PLY never carries an accuracy claim, whatever the manifest would allow:
-            # nothing has established that these points sample the tunnel wall (§18).
+        if surface is None or not surface.supports_accuracy_claim:
+            # Neither a raw PLY nor a surface fused from external depth carries an accuracy
+            # claim, whatever the manifest would allow: in the first case nothing establishes
+            # that these points sample the tunnel wall, in the second nothing ties the depth
+            # to the run (§18, §1A). _resolve_pred has already refused unless --diagnostic.
             claim = Claim.GEOMETRY_DIAGNOSTIC
-        pred_pc = _to_tls(read_ply(points), m)
+        pred_pc = _to_tls(points, m)
         ref = read_ply(tls_ply)
         if ref.frame != "TLS_GLOBAL":
             console.print(f"[yellow]TLS reference frame is {ref.frame}; expected TLS_GLOBAL[/]")
