@@ -261,7 +261,7 @@ LOCAL_METRIC 으로 역변환**해 `runs/<id>/` 규약으로 정규화.
 Runner.submit(run_config) -> RunHandle
 RunHandle.status() / .logs() / .fetch_artifacts()
 ```
-* `LocalRunner` — `docker run --gpus all minegs:gpu@sha256:...`. CUDA 없으면 거부하고
+* `LocalRunner` — `docker run --gpus device=<n> minegs:gpu@sha256:...`. CUDA 없으면 거부하고
   RunPod 저가 GPU 라우팅 제안.
 * `RunPodRunner` — 파드 생성(네트워크 볼륨) → `sync.push`(dataset 만) → 엔트리 →
   폴링 → `sync.pull`(ply·로그) → 종료.
