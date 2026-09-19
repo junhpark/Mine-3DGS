@@ -21,7 +21,7 @@ app.add_typer(train.app, name="train", help="submit and inspect training runs (l
 app.add_typer(
     eval_cmd.app,
     name="eval",
-    help="protocol / register / surface-depth / geometry / sections / volume / change / render",
+    help="protocol / register / render-depth / surface-depth / geometry / sections / volume / change / render",
 )
 app.add_typer(viz.app, name="viz", help="viewer / overlay / export")
 app.add_typer(sync.app, name="sync", help="rclone push (dataset only) / pull (runs)")

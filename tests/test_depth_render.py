@@ -1,0 +1,334 @@
+"""Phase 1B — rendering metric depth from a trained run (§1.7).
+
+Phase 1A closed the surface boundary but could only ever build diagnostic surfaces: handed a
+directory of ``.npy`` files, nothing tells it which run they came from. This is the other half.
+The question here is not "does the rasteriser look right" — it cannot run without a GPU — but
+"can a depth map be turned into evidence, and is every way of faking that evidence refused".
+
+So the renderer adapter is substituted and *nothing else is*: run status, dataset identity,
+metric frame, checkpoint identity, per-view resolution, coverage, digests and publication all
+run exactly as in production. The one test that touches the real gsplat adapter checks that it
+refuses to run without CUDA, which is the only part of it a CPU machine can honestly assert.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+from minegs.cli.main import app
+from minegs.core.errors import ContractError, MissingDependencyError, NoGpuError
+from minegs.core.provenance import sha256_file
+from minegs.eval.surface.depth import build_depth_surface
+from minegs.eval.surface.models import (
+    DEPTH_MANIFEST_FILE,
+    SURFACE_FILE,
+    DepthManifest,
+)
+from minegs.eval.surface.render import DepthRenderer, GsplatDepthRenderer, render_depths
+from minegs.ingest.common.colmap_io import read_model
+from minegs.train.runner.base import RunStatus
+from typer.testing import CliRunner
+
+from test_surface import geometry_argv, write_run
+
+runner = CliRunner()
+
+CKPT_REL = "ckpt/ckpt_6999_rank0.pt"
+
+
+class FakeRenderer(DepthRenderer):
+    """Stands in for the rasteriser. Produces arrays; makes no contract decisions."""
+
+    name = "fake-ed"
+    backend = "gsplat"
+
+    def __init__(
+        self,
+        depth_m: float = 4.0,
+        skip: tuple[str, ...] = (),
+        half_size: tuple[str, ...] = (),
+        infinite: tuple[str, ...] = (),
+        empty: tuple[str, ...] = (),
+        duplicate: str | None = None,
+        phantom: str | None = None,
+    ) -> None:
+        self.depth_m = depth_m
+        self.skip, self.half_size = skip, half_size
+        self.infinite, self.empty = infinite, empty
+        self.duplicate, self.phantom = duplicate, phantom
+        self.checkpoint: Path | None = None
+
+    def version(self) -> str:
+        return "test"
+
+    def require_available(self) -> None:
+        return None
+
+    def settings(self) -> dict:
+        return {"render_mode": "ED", "min_alpha": 0.5}
+
+    def render(self, checkpoint, cameras, images):
+        self.checkpoint = checkpoint
+        for im in images.values():
+            if im.name in self.skip:
+                continue
+            cam = cameras[im.camera_id]
+            h, w = cam.height, cam.width
+            if im.name in self.half_size:
+                h, w = h // 2, w // 2
+            arr = np.full((h, w), self.depth_m, np.float32)
+            if im.name in self.empty:
+                arr[:] = np.nan
+            else:
+                arr[0, 0] = np.nan  # an honest "this ray hit nothing" pixel in every view
+            if im.name in self.infinite:
+                arr[0, 1] = np.inf
+            yield im, arr
+            if self.duplicate == im.name:
+                yield im, arr
+        if self.phantom is not None:
+            im = next(iter(images.values()))
+            ghost = SimpleNamespace(
+                id=9999, camera_id=im.camera_id, name=self.phantom, world_from_cam=im.world_from_cam
+            )
+            cam = cameras[im.camera_id]
+            yield ghost, np.full((cam.height, cam.width), self.depth_m, np.float32)
+
+
+def make_run(dataset_dir: Path, run_dir: Path, run_id: str = "run_1b", **over):
+    """A succeeded gsplat run with a checkpoint on disk and identity backend->metric frame."""
+    over.setdefault("T_local_from_internal", np.eye(4).tolist())
+    over.setdefault("final_checkpoint", CKPT_REL)
+    over.setdefault("checkpoint_step", 6999)
+    rec = write_run(run_dir, dataset_dir, run_id=run_id, **over)
+    if rec.final_checkpoint:
+        ckpt = run_dir / rec.final_checkpoint
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        ckpt.write_bytes(b"weights would live here; the renderer is substituted")
+    return rec
+
+
+@pytest.fixture
+def env(dataset_small, tmp_path):
+    ds = dataset_small.dataset_dir
+    run_dir = tmp_path / "runs" / "run_1b"
+    make_run(ds, run_dir)
+    return SimpleNamespace(
+        dataset_dir=ds,
+        model=read_model(ds / "sparse" / "0"),
+        run_dir=run_dir,
+        out=tmp_path / "depth",
+    )
+
+
+# ---------------------------------------------------------------- the run must be renderable
+
+
+def test_a_run_from_another_dataset_is_refused(dataset_small, tmp_path):
+    ds = dataset_small.dataset_dir
+    foreign = tmp_path / "runs" / "foreign"
+    make_run(ds, foreign, run_id="foreign", dataset_id="some_other_dataset")
+    with pytest.raises(ContractError, match="some_other_dataset"):
+        render_depths(foreign, ds, tmp_path / "d1", renderer=FakeRenderer())
+
+    stale = tmp_path / "runs" / "stale"
+    make_run(ds, stale, run_id="stale", dataset_hash="0" * 64)
+    with pytest.raises(ContractError, match="dataset_hash"):
+        render_depths(stale, ds, tmp_path / "d2", renderer=FakeRenderer())
+    assert not (tmp_path / "d1").exists() and not (tmp_path / "d2").exists()
+
+
+def test_an_unfinished_run_is_refused(dataset_small, tmp_path):
+    ds = dataset_small.dataset_dir
+    failed = tmp_path / "runs" / "failed"
+    make_run(ds, failed, run_id="failed", status=RunStatus.FAILED)
+    with pytest.raises(ContractError, match="not succeeded"):
+        render_depths(failed, ds, tmp_path / "d", renderer=FakeRenderer())
+
+
+def test_a_run_without_a_checkpoint_has_nothing_to_render(dataset_small, tmp_path):
+    ds = dataset_small.dataset_dir
+    none = tmp_path / "runs" / "nockpt"
+    make_run(ds, none, run_id="nockpt", final_checkpoint=None)
+    with pytest.raises(ContractError, match="no final checkpoint"):
+        render_depths(none, ds, tmp_path / "d1", renderer=FakeRenderer())
+
+    gone = tmp_path / "runs" / "gone"
+    make_run(ds, gone, run_id="gone")
+    (gone / CKPT_REL).unlink()
+    with pytest.raises(ContractError, match="missing"):
+        render_depths(gone, ds, tmp_path / "d2", renderer=FakeRenderer())
+
+
+def test_depth_from_a_non_metric_run_cannot_be_shown_to_be_metric(dataset_small, tmp_path):
+    """A backend frame that is not LOCAL_METRIC one-to-one makes every range a backend unit."""
+    ds = dataset_small.dataset_dir
+    scaled = np.eye(4)
+    scaled[:3, :3] *= 3.0
+    run_dir = tmp_path / "runs" / "scaled"
+    make_run(ds, run_dir, run_id="scaled", T_local_from_internal=scaled.tolist())
+    with pytest.raises(ContractError, match="cannot be shown to be metric"):
+        render_depths(run_dir, ds, tmp_path / "d", renderer=FakeRenderer())
+
+
+def test_the_real_gsplat_renderer_never_runs_without_a_gpu(monkeypatch):
+    """There is no CPU path, and nothing about the refusal depends on what CI has installed.
+
+    On a runner without torch/gsplat the missing dependency is named first; on one that has
+    them the absent CUDA device is. Either way ``require_available`` raises, which is the
+    property that matters: the adapter has no branch that renders anything on a CPU.
+    """
+    monkeypatch.setattr("minegs.train.runner.base.cuda_available", lambda: False)
+    installed = all(_importable(m) for m in ("torch", "gsplat"))
+    with pytest.raises(NoGpuError if installed else MissingDependencyError) as e:
+        GsplatDepthRenderer().require_available()
+    assert "CUDA" in str(e.value) or "pip install" in str(e.value)
+
+
+def _importable(name: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):  # pragma: no cover - a broken install, not an absent one
+        return False
+
+
+# ---------------------------------------------------------------- what the renderer returns
+
+
+def test_a_view_the_renderer_skipped_or_invented_is_refused(env, tmp_path):
+    dropped = next(iter(env.model.images.values())).name
+    with pytest.raises(ContractError, match="missing"):
+        render_depths(
+            env.run_dir, env.dataset_dir, tmp_path / "d1", renderer=FakeRenderer(skip=(dropped,))
+        )
+    with pytest.raises(ContractError, match="does not have"):
+        render_depths(
+            env.run_dir,
+            env.dataset_dir,
+            tmp_path / "d2",
+            renderer=FakeRenderer(phantom="not_in_this_dataset.jpg"),
+        )
+    with pytest.raises(ContractError, match="twice"):
+        render_depths(
+            env.run_dir, env.dataset_dir, tmp_path / "d3", renderer=FakeRenderer(duplicate=dropped)
+        )
+    assert not any((tmp_path / n).exists() for n in ("d1", "d2", "d3"))
+
+
+def test_depth_at_the_wrong_resolution_is_refused(env, tmp_path):
+    bad = next(iter(env.model.images.values())).name
+    with pytest.raises(ContractError, match="intrinsics"):
+        render_depths(
+            env.run_dir, env.dataset_dir, tmp_path / "d", renderer=FakeRenderer(half_size=(bad,))
+        )
+    assert not (tmp_path / "d").exists()
+
+
+def test_infinite_or_wholly_empty_depth_is_refused(env, tmp_path):
+    bad = next(iter(env.model.images.values())).name
+    with pytest.raises(ContractError, match="infinit"):
+        render_depths(
+            env.run_dir, env.dataset_dir, tmp_path / "d1", renderer=FakeRenderer(infinite=(bad,))
+        )
+    with pytest.raises(ContractError, match="rendered empty"):
+        render_depths(
+            env.run_dir, env.dataset_dir, tmp_path / "d2", renderer=FakeRenderer(empty=(bad,))
+        )
+
+
+# ---------------------------------------------------------------- the manifest
+
+
+def test_the_manifest_records_a_digest_per_depth_map(env):
+    manifest, depth_dir = render_depths(
+        env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer()
+    )
+    assert (depth_dir / DEPTH_MANIFEST_FILE).is_file()
+    assert not list(depth_dir.parent.glob(".*minegs-partial"))
+    assert len(manifest.depths) == len(env.model.images)
+    assert manifest.run_id == "run_1b" and manifest.frame == "LOCAL_METRIC"
+    assert manifest.unit == "m"
+    assert manifest.checkpoint["sha256"] == sha256_file(env.run_dir / CKPT_REL)
+    assert manifest.renderer["name"] == "fake-ed"
+
+    on_disk = DepthManifest.load(depth_dir / DEPTH_MANIFEST_FILE)
+    for entry in on_disk.depths:
+        f = depth_dir / entry.file
+        assert entry.sha256 == sha256_file(f)
+        arr = np.load(f)
+        assert arr.dtype == np.float32
+        cam = env.model.cameras[entry.camera_id]
+        assert arr.shape == (cam.height, cam.width) == (entry.height, entry.width)
+        # the one NaN per view is the documented "this ray hit nothing"
+        assert 0.0 < entry.valid_ratio < 1.0
+        assert entry.min_m == pytest.approx(4.0)
+
+
+def test_a_tampered_depth_map_is_refused(env, tmp_path):
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    victim = sorted(depth_dir.glob("*.npy"))[0]
+    arr = np.load(victim)
+    arr[:] = 9.0
+    np.save(victim, arr)
+
+    with pytest.raises(ContractError, match="changed after it was rendered"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert not (tmp_path / "surface").exists()
+
+
+def test_a_manifest_from_another_run_does_not_promote(env, tmp_path):
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    other = tmp_path / "runs" / "other"
+    make_run(env.dataset_dir, other, run_id="other")
+    with pytest.raises(ContractError, match="--run-dir names"):
+        build_depth_surface(depth_dir, env.dataset_dir, other, tmp_path / "surface")
+
+
+# ---------------------------------------------------------------- promotion
+
+
+def test_external_depth_stays_diagnostic_only(env, tmp_path):
+    """The Phase 1A path is unchanged: no manifest, no claim."""
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    (depth_dir / DEPTH_MANIFEST_FILE).unlink()
+
+    rec, _ = build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert rec.depth_source == "external_unverified"
+    assert rec.supports_accuracy_claim is False
+
+
+def test_rendered_depth_promotes_the_surface(env, tmp_path):
+    manifest, depth_dir = render_depths(
+        env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer()
+    )
+    rec, _ = build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert rec.depth_source == "minegs_render"
+    assert rec.supports_accuracy_claim is True
+    assert rec.parameters["depth_manifest_id"] == manifest.manifest_id
+    assert rec.parameters["renderer"] == "fake-ed"
+    assert rec.parameters["checkpoint"] == CKPT_REL
+
+
+def test_a_rendered_surface_reaches_the_geometry_accuracy_gate(synthetic, tmp_path):
+    """The whole chain: run -> rendered depth -> verified manifest -> claim-bearing geometry."""
+    ds = synthetic.dataset_dir
+    run_dir = tmp_path / "runs" / "run_chain"
+    make_run(ds, run_dir, run_id="run_chain")
+
+    _, depth_dir = render_depths(run_dir, ds, renderer=FakeRenderer(depth_m=3.0))
+    assert depth_dir == run_dir / "depth"
+
+    rec, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
+    assert rec.depth_source == "minegs_render"
+
+    out = tmp_path / "geo.json"
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic, out))
+    assert r.exit_code == 0, r.output
+    assert json.loads(out.read_text())["claim"] == "geometry_accuracy"
+    assert (surface_dir / SURFACE_FILE).is_file()

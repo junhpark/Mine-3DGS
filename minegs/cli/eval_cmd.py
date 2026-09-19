@@ -101,6 +101,43 @@ def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
     return read_ply(pred), None
 
 
+@app.command("render-depth")
+def render_depth(
+    run_dir: Path = typer.Argument(..., help="a succeeded run to render depth from"),
+    dataset_dir: Path = typer.Argument(...),
+    out: Path | None = typer.Option(
+        None, "--out", help="depth directory (default: <run_dir>/depth)"
+    ),
+    min_alpha: float | None = typer.Option(
+        None,
+        "--min-alpha",
+        help="pixels whose ray accumulates less opacity than this have no range and are "
+        "written NaN (default 0.5)",
+    ),
+) -> None:
+    """Render metric depth per dataset view from a trained run (§1.7 Phase 1B). GPU only.
+
+    Writes ``<image stem>.npy`` plus a ``depth_manifest.json`` naming the run, the dataset, the
+    checkpoint and a digest per map. That manifest is what lets `eval surface-depth` build a
+    claim-capable surface; depth from anywhere else stays diagnostic-only.
+    """
+    from minegs.eval.surface.render import render_depths
+
+    def go() -> None:
+        manifest, depth_dir = render_depths(run_dir, dataset_dir, out, min_alpha)
+        console.print(
+            f"depth [bold]{manifest.manifest_id}[/]: {len(manifest.depths)} views from "
+            f"{manifest.renderer['name']} on run {manifest.run_id}"
+        )
+        cover = sum(d.valid_ratio for d in manifest.depths) / len(manifest.depths)
+        near = min(d.min_m for d in manifest.depths if d.min_m is not None)
+        far = max(d.max_m for d in manifest.depths if d.max_m is not None)
+        console.print(f"  ranges {near:.2f}-{far:.2f} m, mean coverage {cover * 100:.1f}%")
+        console.print(f"  wrote {depth_dir}")
+
+    run_guarded(go)
+
+
 @app.command("surface-depth")
 def surface_depth(
     depth_dir: Path = typer.Argument(

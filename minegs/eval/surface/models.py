@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import numpy as np
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from minegs.core.config import VersionedModel
 from minegs.core.errors import ContractError
@@ -177,3 +177,152 @@ def check_surface(
     if not np.isfinite(pc.xyz).all():
         raise ContractError(f"surface {rec.surface_id}: {points} holds non-finite coordinates")
     return pc
+
+
+# ---------------------------------------------------------------- Phase 1B: rendered depth
+
+DEPTH_MANIFEST_FILE = "depth_manifest.json"
+
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RenderedDepth(_Strict):
+    """One depth map the renderer produced, and enough to recognise it again."""
+
+    image_id: int
+    camera_id: int
+    image_name: str
+    #: Relative to the directory holding the manifest.
+    file: str
+    width: int
+    height: int
+    sha256: str = Field(min_length=1)
+    #: Fraction of pixels carrying a usable range. The rest are NaN by policy, not by accident:
+    #: a ray that hit nothing has no depth, and writing 0 there would back-project to the camera
+    #: centre and read as a surface.
+    valid_ratio: float = Field(ge=0.0, le=1.0)
+    min_m: float | None = None
+    max_m: float | None = None
+
+    @field_validator("file")
+    @classmethod
+    def _relative_name(cls, v: str) -> str:
+        p = Path(v)
+        if p.is_absolute() or ".." in p.parts:
+            raise ValueError(f"file must be relative to the manifest directory, got {v!r}")
+        return v
+
+
+class DepthManifest(VersionedModel):
+    """``<depth_dir>/depth_manifest.json`` — what makes rendered depth *evidence* (Phase 1B).
+
+    Phase 1A can be handed a directory of ``.npy`` files and has no way to tell whether they
+    came from the run they are attributed to, so the surfaces it builds are diagnostic-only.
+    This manifest is the difference: it is written by minegs' own renderer, in the same pass
+    that produced the maps, and it names the run, the dataset, the checkpoint and a digest per
+    map. A surface built from depth whose manifest still verifies against all four is the one
+    thing allowed to claim ``depth_source="minegs_render"``.
+    """
+
+    SCHEMA_VERSION: ClassVar[str] = "1.0"
+
+    manifest_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    dataset_id: str = Field(min_length=1)
+    dataset_hash: str = Field(min_length=1)
+    #: ``{"name": ..., "version": ...}`` of the training backend whose weights were rendered.
+    backend: dict[str, str]
+    #: ``{"file": run-relative path, "sha256": ..., "step": ...}``. Identity of the weights,
+    #: so two manifests from two checkpoints of the same run are not interchangeable.
+    checkpoint: dict[str, Any]
+    #: ``{"name": ..., "version": ..., "settings": {...}}`` — who rendered, and under what knobs.
+    renderer: dict[str, Any]
+    frame: Literal["LOCAL_METRIC"] = "LOCAL_METRIC"
+    unit: Literal["m"] = "m"
+    depths: list[RenderedDepth] = Field(min_length=1)
+    provenance: ProvenanceRecord
+
+    def by_image_name(self) -> dict[str, RenderedDepth]:
+        return {d.image_name: d for d in self.depths}
+
+
+def find_depth_manifest(depth_dir: str | Path) -> Path | None:
+    """``depth_manifest.json`` in *depth_dir*, or ``None`` for a plain directory of maps."""
+    p = Path(depth_dir) / DEPTH_MANIFEST_FILE
+    return p if p.is_file() else None
+
+
+def verify_depth_manifest(
+    manifest: DepthManifest,
+    depth_dir: Path,
+    run_id: str,
+    dataset_id: str,
+    dataset_hash: str,
+    cameras: dict,
+    images: dict,
+) -> None:
+    """Everything that has to hold before rendered depth counts as evidence (Phase 1B §5).
+
+    Presence of a manifest proves nothing on its own — that was the whole objection to a
+    ``depth_source`` string. What makes it evidence is that it still agrees with the run it
+    names, the dataset as it is now, the camera model being back-projected against, and the
+    bytes on disk. Any one of those drifting means the maps are no longer describing the thing
+    the surface will be compared to, so this refuses rather than downgrading silently.
+    """
+    where = depth_dir / DEPTH_MANIFEST_FILE
+    if manifest.run_id != run_id:
+        raise ContractError(
+            f"{where}: depth was rendered from run {manifest.run_id!r}, but --run-dir names "
+            f"{run_id!r}"
+        )
+    if manifest.dataset_id != dataset_id:
+        raise ContractError(
+            f"{where}: depth was rendered against dataset {manifest.dataset_id!r}, "
+            f"not {dataset_id!r}"
+        )
+    if manifest.dataset_hash != dataset_hash:
+        raise ContractError(
+            f"{where}: depth was rendered against dataset_hash {manifest.dataset_hash[:12]}, "
+            f"but {dataset_id} now hashes to {dataset_hash[:12]}; the cameras these maps were "
+            "rendered for are not the cameras they would be back-projected with"
+        )
+
+    entries = manifest.by_image_name()
+    if len(entries) != len(manifest.depths):
+        raise ContractError(f"{where}: two entries name the same image")
+    expected = {im.name for im in images.values()}
+    missing = sorted(expected - set(entries))
+    extra = sorted(set(entries) - expected)
+    if missing or extra:
+        raise ContractError(
+            f"{where}: the manifest covers {len(entries)} views, the dataset has "
+            f"{len(expected)}"
+            + (f"; missing {missing[:6]}" if missing else "")
+            + (f"; unknown {extra[:6]}" if extra else "")
+        )
+
+    by_name = {im.name: im for im in images.values()}
+    for name, entry in sorted(entries.items()):
+        im = by_name[name]
+        cam = cameras[im.camera_id]
+        if entry.camera_id != im.camera_id or entry.image_id != im.id:
+            raise ContractError(
+                f"{where}: {name} is recorded against camera {entry.camera_id} / image "
+                f"{entry.image_id}, but the dataset has camera {im.camera_id} / image {im.id}"
+            )
+        if (entry.width, entry.height) != (cam.width, cam.height):
+            raise ContractError(
+                f"{where}: {name} was rendered at {entry.width}x{entry.height}, but camera "
+                f"{cam.id} is {cam.width}x{cam.height}"
+            )
+        f = depth_dir / entry.file
+        if not f.is_file():
+            raise ContractError(f"{where}: {entry.file} is listed but missing")
+        digest = sha256_file(f)
+        if digest != entry.sha256:
+            raise ContractError(
+                f"{where}: {entry.file} hashes to {digest[:12]}, the manifest says "
+                f"{entry.sha256[:12]}. This depth map was changed after it was rendered."
+            )
