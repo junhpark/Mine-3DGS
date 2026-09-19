@@ -126,7 +126,13 @@ class GsplatDepthRenderer(DepthRenderer):
             )
 
     def settings(self) -> dict[str, Any]:
-        return {"render_mode": "ED", "min_alpha": self.min_alpha, "near_plane": 0.01}
+        return {
+            "render_mode": "ED",
+            "rasterize_mode": "classic",
+            "camera_model": "pinhole",
+            "min_alpha": self.min_alpha,
+            "near_plane": 0.01,
+        }
 
     def render(
         self, checkpoint: Path, cameras: dict, images: dict
@@ -169,6 +175,11 @@ class GsplatDepthRenderer(DepthRenderer):
                     width=cam.width,
                     height=cam.height,
                     render_mode="ED",
+                    # Passed rather than inherited: the refusals above assert that this render
+                    # is classic-mode and pinhole, so the call must say so even though gsplat
+                    # defaults to both. A default is not a guarantee across versions.
+                    rasterize_mode="classic",
+                    camera_model="pinhole",
                     near_plane=0.01,
                 )
             depth = rendered[0, ..., 0].float()
@@ -206,6 +217,17 @@ def check_checkpoint_blob(blob: object, checkpoint: Path) -> dict:
     if missing:
         raise ContractError(f"{checkpoint}: checkpoint splats are missing {missing}")
     return splats
+
+
+def known_renderer_names() -> frozenset[str]:
+    """Renderer names this build can produce.
+
+    A manifest naming anything else was not written by a renderer this install has, so it is
+    not evidence that minegs rendered the depth. ``render_depths`` takes a ``renderer``
+    argument — that seam is what lets the contract be tested without a GPU — and this is what
+    stops a manifest minted through it from promoting to a claim.
+    """
+    return frozenset({GsplatDepthRenderer.name})
 
 
 def get_depth_renderer(backend_name: str, min_alpha: float = DEFAULT_MIN_ALPHA) -> DepthRenderer:
@@ -399,7 +421,7 @@ def _validate_depth(depth: np.ndarray, camera, image) -> np.ndarray:
             "which is the documented 'nothing here' value; Inf is a renderer fault."
         )
     finite = np.isfinite(arr)
-    if False:
+    if (arr[finite] <= 0).any():
         raise ContractError(
             f"{image.name}: depth contains non-positive ranges; depth is metres along camera +z"
         )
@@ -434,6 +456,11 @@ def render_depths(
 
     run_dir, dataset_dir = Path(run_dir), Path(dataset_dir)
     out = Path(out_dir) if out_dir is not None else run_dir / DEPTH_DIRNAME
+    if min_alpha is not None and renderer is not None:
+        raise ContractError(
+            "min_alpha configures the renderer, so passing it alongside an explicit renderer "
+            "would silently discard one of the two; set it on the renderer you pass"
+        )
     min_alpha = DEFAULT_MIN_ALPHA if min_alpha is None else float(min_alpha)
     if not 0.0 < min_alpha <= 1.0:
         raise ContractError(f"--min-alpha must be in (0, 1], got {min_alpha}")
@@ -561,6 +588,7 @@ __all__ = [
     "GsplatDepthRenderer",
     "check_checkpoint_blob",
     "get_depth_renderer",
+    "known_renderer_names",
     "render_depths",
     "require_metric_outputs",
     "require_reproducible_render",

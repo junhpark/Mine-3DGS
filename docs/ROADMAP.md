@@ -527,9 +527,16 @@ scientific validation remain pending.**
 * **checkpoint 는 restricted unpickler 로 읽는다** (`weights_only=True`). run artifact 는 GPU
   호스트에서 가져오는 것이고, 기존 방식은 `check_checkpoint_blob` 이 보기 *전에* 임의 코드를
   실행할 수 있었다. upstream 은 tensor·dict·int 만 저장하므로 정상 checkpoint 는 모두 로드된다.
-* **학습에 쓴 view 를 기록한다**: depth 는 dataset 의 모든 view 에 대해 렌더되지만
+* **학습에 쓴 view 를 기록하고 검증한다**: depth 는 dataset 의 모든 view 에 대해 렌더되지만
   `max_images` 프로파일은 일부만 학습한다. manifest 의 `staged` 가 run.json 의 것을 복사해
-  두 artifact 가 구별되게 한다 (렌더가 틀렸다는 뜻은 아니다).
+  두 artifact 가 구별되게 하고, promotion 때 run 과 다시 대조한다 (렌더가 틀렸다는 뜻은 아니다).
+* **renderer 도 신원을 검증한다**: `render_depths(renderer=...)` 주입 seam 은 GPU 없이 계약을
+  테스트하기 위한 것이므로, manifest 의 `renderer.name` 이 이 빌드가 실제로 제공하는 renderer
+  (`known_renderer_names()`) 가 아니면 승격하지 않는다. 기록만 하고 대조하지 않는 필드를 남기지
+  않는다는 같은 원칙이다.
+* **rasterizer 노브를 기본값에 기대지 않는다**: 거부 논리가 "이 renderer 는 classic mode 이고
+  pinhole 로 투영한다" 를 근거로 삼으므로, 호출이 `rasterize_mode="classic"` 과
+  `camera_model="pinhole"` 을 명시하고 `settings()` 에 기록한다.
 * **`--no-holdout-only` 는 claim 을 내리지 않는다**: `geometry_accuracy` 는 정의상 holdout TLS
   에 대한 주장(`Claim` docstring)이고, judge 가 그것을 허용한 이유도 그 구간이 초기화에서
   제외되었기 때문이다. holdout mask 를 끄면 run 이 학습에 쓴 형상을 다시 재게 되므로 경고와

@@ -106,6 +106,18 @@ class FakeRenderer(DepthRenderer):
             yield ghost, np.full((cam.height, cam.width), self.depth_m, np.float32)
 
 
+class StandInRenderer(FakeRenderer):
+    """``FakeRenderer`` presenting as the renderer this build ships.
+
+    Promotion requires a manifest naming a registered renderer — that is what stops the
+    ``renderer=`` seam from minting evidence. A test that needs to exercise everything *after*
+    the render therefore stands in for the real one explicitly, and the negative case (an
+    unregistered renderer does not promote) is asserted on its own.
+    """
+
+    name = GsplatDepthRenderer.name
+
+
 def make_run(dataset_dir: Path, run_dir: Path, run_id: str = "run_1b", **over):
     """A succeeded gsplat run with a checkpoint on disk and identity backend->metric frame."""
     over.setdefault("T_local_from_internal", np.eye(4).tolist())
@@ -278,7 +290,7 @@ def test_the_manifest_records_a_digest_per_depth_map(env):
 
 
 def test_a_tampered_depth_map_is_refused(env, tmp_path):
-    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
     victim = sorted(depth_dir.glob("*.npy"))[0]
     arr = np.load(victim)
     arr[:] = 9.0
@@ -312,13 +324,13 @@ def test_external_depth_stays_diagnostic_only(env, tmp_path):
 
 def test_rendered_depth_promotes_the_surface(env, tmp_path):
     manifest, depth_dir = render_depths(
-        env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer()
+        env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer()
     )
     rec, _ = build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
     assert rec.depth_source == "minegs_render"
     assert rec.supports_accuracy_claim is True
     assert rec.parameters["depth_manifest_id"] == manifest.manifest_id
-    assert rec.parameters["renderer"] == "fake-ed"
+    assert rec.parameters["renderer"] == GsplatDepthRenderer.name
     assert rec.parameters["checkpoint"] == CKPT_REL
 
 
@@ -328,7 +340,7 @@ def test_a_rendered_surface_reaches_the_geometry_accuracy_gate(synthetic, tmp_pa
     run_dir = tmp_path / "runs" / "run_chain"
     make_run(ds, run_dir, run_id="run_chain")
 
-    _, depth_dir = render_depths(run_dir, ds, renderer=FakeRenderer(depth_m=3.0))
+    _, depth_dir = render_depths(run_dir, ds, renderer=StandInRenderer(depth_m=3.0))
     assert depth_dir == run_dir / "depth"
 
     rec, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
@@ -413,7 +425,7 @@ def test_a_distorted_camera_model_is_refused(dataset_small, tmp_path):
 
 def test_the_manifest_cannot_point_the_verifier_at_a_different_file(env, tmp_path):
     """Hashing one file while back-projecting another would reopen the whole provenance hole."""
-    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
     manifest = DepthManifest.load(depth_dir / DEPTH_MANIFEST_FILE)
     victim = manifest.depths[0]
     decoy = depth_dir / "decoy.npy"
@@ -500,7 +512,7 @@ def test_unreasoned_backend_args_are_refused_but_the_light_profile_is_not(datase
 
 def test_promotion_re_checks_reproducibility_it_does_not_trust_the_manifest(env, tmp_path):
     """Depth written by a build without the render guard must not promote on its manifest."""
-    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
 
     record = RunRecord.load(env.run_dir / "run.json")
     record.command = ["python", "simple_trainer.py", "--pose_opt"]
@@ -516,7 +528,7 @@ def test_accuracy_is_a_claim_about_the_holdout_only(synthetic, tmp_path):
     ds = synthetic.dataset_dir
     run_dir = tmp_path / "runs" / "holdout"
     make_run(ds, run_dir, run_id="holdout")
-    _, depth_dir = render_depths(run_dir, ds, renderer=FakeRenderer(depth_m=3.0))
+    _, depth_dir = render_depths(run_dir, ds, renderer=StandInRenderer(depth_m=3.0))
     rec, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
     assert rec.depth_source == "minegs_render"
 
@@ -538,7 +550,7 @@ def test_a_reference_cloud_in_the_wrong_frame_is_refused(synthetic, tmp_path):
     ds = synthetic.dataset_dir
     run_dir = tmp_path / "runs" / "frame"
     make_run(ds, run_dir, run_id="frame")
-    _, depth_dir = render_depths(run_dir, ds, renderer=FakeRenderer(depth_m=3.0))
+    _, depth_dir = render_depths(run_dir, ds, renderer=StandInRenderer(depth_m=3.0))
     _, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
 
     argv = [
@@ -575,3 +587,35 @@ def test_the_manifest_records_what_the_run_was_trained_on(env):
     assert manifest.staged["n_images"] == 12
     # depth is still rendered for every dataset view; the point is that the gap is visible
     assert len(manifest.depths) == len(env.model.images)
+
+
+def test_a_manifest_from_an_unregistered_renderer_does_not_promote(env, tmp_path):
+    """The `renderer=` seam exists so the contract can be tested; it must not mint evidence."""
+    manifest, depth_dir = render_depths(
+        env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer()
+    )
+    assert manifest.renderer["name"] == "fake-ed"
+    with pytest.raises(ContractError, match="does not ship"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert not (tmp_path / "surface").exists()
+
+
+def test_min_alpha_and_an_explicit_renderer_cannot_disagree(env, tmp_path):
+    """One of the two would have been silently discarded, and the manifest would record the other."""
+    with pytest.raises(ContractError, match="min_alpha configures the renderer"):
+        render_depths(
+            env.run_dir, env.dataset_dir, tmp_path / "d", min_alpha=0.9, renderer=StandInRenderer()
+        )
+
+
+def test_the_manifest_staging_must_still_match_the_run(env, tmp_path):
+    record = RunRecord.load(env.run_dir / "run.json")
+    record.staged = {"n_images": 12, "subset": True}
+    record.save(env.run_dir / "run.json")
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
+
+    record = RunRecord.load(env.run_dir / "run.json")
+    record.staged = {"n_images": 40, "subset": False}
+    record.save(env.run_dir / "run.json")
+    with pytest.raises(ContractError, match="different staging"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")

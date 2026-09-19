@@ -298,6 +298,7 @@ def verify_depth_manifest(
         )
 
     _verify_checkpoint_identity(manifest, where, run, run_dir)
+    _verify_renderer_and_staging(manifest, where, run)
 
     entries = manifest.by_image_name()
     if len(entries) != len(manifest.depths):
@@ -380,3 +381,31 @@ def _verify_checkpoint_identity(manifest: DepthManifest, where: Path, run, run_d
                 f"{where}: {file} hashes to {digest[:12]}, but the depth was rendered from "
                 f"{str(recorded.get('sha256'))[:12]}. These are different weights."
             )
+
+
+def _verify_renderer_and_staging(manifest: DepthManifest, where: Path, run) -> None:
+    """The manifest's own account of who rendered and what was trained, checked against reality.
+
+    Recording a field and never comparing it is how ``checkpoint`` slipped through review, so
+    the two added since get the same treatment. ``renderer.name`` must be a renderer this build
+    can produce — otherwise the manifest was minted through the injection seam that exists for
+    testing, and says nothing about minegs having rendered anything. ``staged`` must still match
+    the run, so a manifest cannot describe a full-dataset run while the record says a subset.
+    """
+    from minegs.eval.surface.render import known_renderer_names
+
+    name = (manifest.renderer or {}).get("name")
+    known = known_renderer_names()
+    if name not in known:
+        raise ContractError(
+            f"{where}: depth was produced by renderer {name!r}, which this build does not ship "
+            f"(known: {sorted(known)}). A manifest from an unknown renderer is not evidence "
+            "that minegs rendered the depth."
+        )
+    recorded = manifest.staged or {}
+    actual = {k: v for k, v in (run.staged or {}).items() if k in recorded}
+    if recorded and actual != recorded:
+        raise ContractError(
+            f"{where}: the manifest records staging {recorded}, but run {run.run_id} now "
+            f"records {actual}; the depth was rendered for a different staging of this run"
+        )
