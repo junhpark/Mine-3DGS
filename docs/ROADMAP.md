@@ -549,7 +549,13 @@ scientific validation remain pending.**
 * **rasteriser 버전도 증거의 일부**: manifest 의 `renderer.version` 이 이 빌드가 pin 한
   `PINNED_GSPLAT` 과 다르면 (`"not installed"` 포함) 승격하지 않는다. gsplat 의 투영·합성은
   릴리스 간 고정이 아니고, 그 equivalence 를 측정한 적이 없다 — `antialiased` 를 거부하는 것과
-  같은 논리다. manifest 의 `backend` 도 run 의 것과 일치해야 한다.
+  같은 논리다.
+* **training backend 버전도 같은 pin 에 묶는다** (`require_pinned_backend`): manifest 의
+  `backend` 가 run 의 것과 일치하는 것만으로는 부족하다. 둘 다 gsplat 1.4 를 가리키고 renderer
+  만 pin 된 1.5.3 이면 나머지 검사는 전부 통과하면서, 이 renderer 가 대응해 쓰이지 않은
+  parameterisation 의 weights 로 claim 에 도달한다. `train` extra 가 `gsplat>=1.4` 이므로
+  native 설치에서 실제로 나올 수 있는 조합이다. render-depth 진입 시 한 번, promotion 에서 다시
+  검사한다.
 * **checkpoint 내부 step**: `check_checkpoint_blob` 이 blob 의 `step` 을 run.json 의
   `checkpoint_step` 과 대조한다. 둘은 upstream 에서 같은 분기가 쓰므로, 불일치는 그 경로의
   파일이 run 이 기록한 checkpoint 가 아니라는 뜻이다.
@@ -744,6 +750,7 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | 왜곡 camera model 의 depth 렌더 | `ContractError` (exit 2) | pinhole 로 투영되어 모든 ray 가 조용히 틀어진다 | 해당 없음 (설계) |
 | intrinsics 와 크기가 다른 image | `ContractError` (exit 2) | intrinsics 가 그 이미지를 기술하지 않는다 | 해당 없음 (설계) |
 | pin 되지 않은 rasteriser 버전의 depth | `ContractError` (exit 2) | 릴리스 간 렌더 semantics 가 보장되지 않는다 | 해당 버전의 equivalence 를 측정한 뒤 |
+| pin 되지 않은 trainer 버전으로 학습한 run 의 depth | `ContractError` (exit 2) | renderer 가 대응해 쓰이지 않은 parameterisation 의 weights 다 | 해당 버전의 equivalence 를 측정한 뒤 |
 | blob 의 step 이 run 의 step 과 다른 checkpoint | `ContractError` (exit 2) | 그 경로의 파일이 run 이 기록한 checkpoint 가 아니다 | 해당 없음 (설계) |
 | 2-D 가 아닌 depth `.npy` | `ContractError` (exit 2) | depth map 은 (H, W) 배열이다 | 해당 없음 (설계) |
 | manifest 의 `file` 이 naming contract 와 다름 | `ContractError` (exit 2) | 검사한 파일과 역투영할 파일이 달라진다 | 해당 없음 (설계) |

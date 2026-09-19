@@ -741,3 +741,32 @@ def test_a_one_dimensional_depth_map_is_refused_cleanly(env, tmp_path):
 
     with pytest.raises(ContractError, match="1-D with shape"):
         build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+
+
+def test_weights_from_an_unpinned_trainer_version_do_not_promote(env, tmp_path):
+    """Manifest and run agreeing with each other is not enough — they must agree with the pin.
+
+    A run trained on gsplat 1.4 and rendered by the pinned 1.5.3 renderer passes every other
+    check: manifest.backend == run.backend, renderer.version == PINNED_GSPLAT. The weights are
+    still from a parameterisation this renderer was not written against. `train` is
+    `gsplat>=1.4`, so a native install can produce exactly this run.
+    """
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
+
+    unpinned = {"name": "gsplat", "version": "1.4.0"}
+    record = RunRecord.load(env.run_dir / "run.json")
+    record.backend = unpinned
+    record.save(env.run_dir / "run.json")
+    where = depth_dir / DEPTH_MANIFEST_FILE
+    manifest = DepthManifest.load(where)
+    manifest.backend = dict(unpinned)  # self-consistent: the manifest agrees with the run
+    manifest.save(where)
+
+    with pytest.raises(ContractError, match="this build pins"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+    assert not (tmp_path / "surface").exists()
+
+    # and rendering such a run is refused at the door too
+    with pytest.raises(ContractError, match="this build pins"):
+        render_depths(env.run_dir, env.dataset_dir, tmp_path / "d", renderer=StandInRenderer())
+    assert not (tmp_path / "d").exists()

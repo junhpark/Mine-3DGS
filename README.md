@@ -365,6 +365,10 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
   `sparse/0` 와 `images/` 의 해상도가 다르면 그 intrinsics 는 그 이미지를 기술하지 않는다.
 * **rasteriser 버전도 증거다**: manifest 의 `renderer.version` 이 `PINNED_GSPLAT` 과 다르면
   (`"not installed"` 포함) 승격하지 않는다. manifest 의 `backend` 도 run 의 것과 대조한다.
+* **training backend 버전도 같은 pin 에 묶는다**: manifest 와 run 이 서로 일치하는 것만으로는
+  부족하다 — 둘 다 gsplat 1.4 이고 renderer 만 1.5.3 이면 나머지 검사를 전부 통과한다.
+  `train` extra 가 `gsplat>=1.4` 라 실제로 가능한 조합이므로, render 진입과 promotion 양쪽에서
+  `run.backend["version"] == PINNED_GSPLAT` 을 확인한다.
 * **checkpoint 내부 `step`** 도 run.json 의 `checkpoint_step` 과 대조한다.
 * **fail closed**: run != succeeded · dataset id/hash 불일치 · checkpoint 없음/경로 깨짐 ·
   `T_local_from_internal` 이 항등이 아님(= backend 단위가 미터라고 보장 못 함) · backend 가

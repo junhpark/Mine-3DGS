@@ -238,6 +238,37 @@ def pinned_renderer_version(name: str) -> str | None:
     return {GsplatDepthRenderer.name: GsplatDepthRenderer.pinned_version}.get(name)
 
 
+def pinned_backend_version(backend_name: str) -> str | None:
+    """The *trainer* version whose weights this build's renderer was written against."""
+    return {GsplatDepthRenderer.backend: GsplatDepthRenderer.pinned_version}.get(backend_name)
+
+
+def require_pinned_backend(record) -> None:
+    """The weights must come from the trainer version the renderer was written against.
+
+    Pinning the renderer alone leaves a gap: a run trained on gsplat 1.4 and rendered by a
+    pinned 1.5.3 renderer is self-consistent at every other check — the manifest's backend
+    matches the run's, the renderer's version matches the pin — and still reaches a claim on
+    weights produced by a version whose parameterisation nobody here has compared. This is not
+    hypothetical: the ``train`` extra is ``gsplat>=1.4``, so a native install can train on 1.4
+    and record it faithfully.
+    """
+    backend = record.backend or {}
+    name, version = backend.get("name"), backend.get("version")
+    pinned = pinned_backend_version(name)
+    if pinned is None:
+        raise ContractError(
+            f"run {record.run_id} was trained by backend {name!r}, which this build has no "
+            "metric depth renderer for; its weights cannot be rendered here"
+        )
+    if version != pinned:
+        raise ContractError(
+            f"run {record.run_id} was trained by {name} {version!r}, but this build pins "
+            f"{pinned!r}. The renderer was written against that version's parameterisation, so "
+            "depth from weights another version produced is not evidence for a claim."
+        )
+
+
 def known_renderer_names() -> frozenset[str]:
     """Renderer names this build can produce.
 
@@ -552,6 +583,7 @@ def render_depths(
             f"trained with {backend_name!r}"
         )
     _require_depth_capability(backend_name)
+    require_pinned_backend(record)
     renderer.require_available()
 
     expected = {im.name for im in model.images.values()}
@@ -646,9 +678,11 @@ __all__ = [
     "check_checkpoint_blob",
     "get_depth_renderer",
     "known_renderer_names",
+    "pinned_backend_version",
     "pinned_renderer_version",
     "render_depths",
     "require_images_match_cameras",
     "require_metric_outputs",
+    "require_pinned_backend",
     "require_reproducible_render",
 ]

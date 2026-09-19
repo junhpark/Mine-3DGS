@@ -392,7 +392,11 @@ def _verify_renderer_and_staging(manifest: DepthManifest, where: Path, run) -> N
     testing, and says nothing about minegs having rendered anything. ``staged`` must still match
     the run, so a manifest cannot describe a full-dataset run while the record says a subset.
     """
-    from minegs.eval.surface.render import known_renderer_names, pinned_renderer_version
+    from minegs.eval.surface.render import (
+        known_renderer_names,
+        pinned_renderer_version,
+        require_pinned_backend,
+    )
 
     name = (manifest.renderer or {}).get("name")
     known = known_renderer_names()
@@ -422,6 +426,10 @@ def _verify_renderer_and_staging(manifest: DepthManifest, where: Path, run) -> N
             f"{where}: depth is attributed to backend {dict(manifest.backend or {})}, but run "
             f"{run.run_id} was trained by {dict(run.backend or {})}"
         )
+    # ...and the backend they agree on must itself be the pinned trainer. Agreeing with each
+    # other is not enough: both can name gsplat 1.4 while the renderer names the pinned 1.5.3,
+    # and every other check passes on weights this renderer was not written against.
+    require_pinned_backend(run)
     recorded = manifest.staged or {}
     actual = {k: v for k, v in (run.staged or {}).items() if k in recorded}
     if recorded and actual != recorded:
