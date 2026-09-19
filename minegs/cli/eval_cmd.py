@@ -452,8 +452,7 @@ def sections(
     run_guarded(go)
 
 
-def _incomplete_coverage(rep, ranges) -> str:
-    cov = rep.coverage
+def _incomplete_coverage(cov, ranges) -> str:
     asked = ", ".join(f"{lo:g}-{hi:g} m" for lo, hi in ranges)
     return (
         f"volume_accuracy is a claim about the whole declared holdout {asked}, and "
@@ -492,7 +491,7 @@ def volume(
     from minegs.core.provenance import sha256_tree
     from minegs.eval.protocol import Claim, judge
     from minegs.eval.sections import check_section_record, load_section_input, reference_axis_of
-    from minegs.eval.volume import compare_to_design, integrate_sections
+    from minegs.eval.volume import compare_to_design, integrate_sections, plan_integration
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
     def go() -> None:
@@ -564,18 +563,22 @@ def volume(
         # from initialisation. Mixing the training chainage in would measure the run against the
         # geometry it was fitted to.
         ranges = list(j.holdout_ranges_m) if claim is Claim.VOLUME_ACCURACY else None
+        if claim is Claim.VOLUME_ACCURACY:
+            # Decided before integrating, not after: a holdout with no two consecutive observed
+            # sections has no volume to report at all, and it should reach the coverage refusal
+            # (which says what is missing) rather than a bare "nothing to integrate".
+            coverage = plan_integration(ser, ranges)[1]
+            if not coverage.complete:
+                if not diagnostic:
+                    raise ContractError(_incomplete_coverage(coverage, ranges))
+                console.print(f"[yellow]diagnostic: {_incomplete_coverage(coverage, ranges)}[/]")
+                claim, ranges = Claim.GEOMETRY_DIAGNOSTIC, None
         rep = integrate_sections(ser, axis, ranges=ranges)
-        if claim is Claim.VOLUME_ACCURACY and not rep.coverage.complete:
-            if not diagnostic:
-                raise ContractError(_incomplete_coverage(rep, ranges))
-            console.print(f"[yellow]diagnostic: {_incomplete_coverage(rep, ranges)}[/]")
-            claim = Claim.GEOMETRY_DIAGNOSTIC
-            ranges = None
-            rep = integrate_sections(ser, axis, ranges=ranges)
         rep.claim = claim.value
         if rec is not None:
             rep.section_id = rec.section_id
-            rep.source = rec.source.model_dump(mode="json")
+            rep.source = rec.source
+            rep.section_parameters = dict(rec.parameters)
         cov = rep.coverage
         console.print(
             f"\\[{claim.value}] V = {rep.volume_m3:.2f} m³ over "

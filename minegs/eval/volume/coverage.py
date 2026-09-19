@@ -38,6 +38,7 @@ __all__ = [
     "finite_runs",
     "integration_segments",
     "merge_intervals",
+    "plan_integration",
     "segmented_integral",
     "subtract_intervals",
     "summarise_coverage",
@@ -128,8 +129,12 @@ class CoverageReport(_Strict):
 
     @property
     def complete(self) -> bool:
-        """No unintegrated length anywhere in the requested span."""
-        return not self.missing_intervals_m
+        """Something was asked for, and all of it was integrated.
+
+        The first half matters: with nothing requested there is nothing missing either, and
+        "complete coverage of no tunnel" would read as a satisfied condition on a claim path.
+        """
+        return bool(self.requested_intervals_m) and not self.missing_intervals_m
 
     def describe_gaps(self) -> str:
         return ", ".join(f"{lo:g}-{hi:g} m" for lo, hi in self.missing_intervals_m) or "none"
@@ -157,6 +162,31 @@ def _stations(series) -> tuple[np.ndarray, np.ndarray]:
     return s, a
 
 
+def _requested(s: np.ndarray, ranges: list[Interval] | None) -> list[Interval]:
+    """The spans a caller asked about: explicit ranges, or the series' own extent."""
+    if ranges is None:
+        return _series_span(s)
+    bad = [(lo, hi) for lo, hi in ranges if not (float(hi) - float(lo) > EPS_M)]
+    if bad:
+        # merge_intervals would drop these, and a dropped range asks for nothing, which then
+        # reports as nothing missing. A malformed span is a caller error, not empty coverage.
+        raise ContractError(f"integration range must be [lo, hi] with hi > lo, got {bad}")
+    return merge_intervals(ranges)
+
+
+def plan_integration(
+    series, ranges: list[Interval] | None = None
+) -> tuple[list[IntegrationSegment], CoverageReport]:
+    """What would be integrated, and what would be left out — without integrating anything.
+
+    The claim gate needs the coverage verdict *before* it decides whether a volume may be
+    computed at all, and a series with no two consecutive observations in the holdout must
+    reach that verdict rather than a bare "nothing to integrate".
+    """
+    segments = integration_segments(series, ranges)
+    return segments, summarise_coverage(series, segments, ranges)
+
+
 def integration_segments(series, ranges: list[Interval] | None = None) -> list[IntegrationSegment]:
     """The contiguous runs of observed stations that may be integrated.
 
@@ -166,9 +196,8 @@ def integration_segments(series, ranges: list[Interval] | None = None) -> list[I
     it, which is the same mistake as integrating across a gap.
     """
     s, a = _stations(series)
-    spans = merge_intervals(ranges) if ranges is not None else _series_span(s)
     out: list[IntegrationSegment] = []
-    for lo, hi in spans:
+    for lo, hi in _requested(s, ranges):
         inside = np.flatnonzero((s >= lo - EPS_M) & (s <= hi + EPS_M))
         out += _segments_within(s, a, inside)
     return out
@@ -240,8 +269,15 @@ def summarise_coverage(
 ) -> CoverageReport:
     """Coverage of *segments* against what was requested (the holdout ranges, or the series)."""
     s, a = _stations(series)
-    requested = merge_intervals(ranges) if ranges is not None else _series_span(s)
-    covered = merge_intervals([(g.start_chainage_m, g.end_chainage_m) for g in segments])
+    requested = _requested(s, ranges)
+    # Clipped to what was requested, so covered and missing partition it exactly. A station may
+    # sit an epsilon outside a range and still be picked up; that must not make coverage > 1.
+    covered = subtract_intervals(
+        requested,
+        subtract_intervals(
+            requested, merge_intervals([(g.start_chainage_m, g.end_chainage_m) for g in segments])
+        ),
+    )
     missing = subtract_intervals(requested, covered)
     req_len, cov_len = total_length(requested), total_length(covered)
     inside = np.zeros(len(s), bool)

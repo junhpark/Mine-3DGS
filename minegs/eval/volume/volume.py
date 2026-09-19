@@ -13,13 +13,13 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from minegs.core.errors import ContractError
+from minegs.eval.sections.models import SectionSource
 from minegs.eval.sections.sections import SectionSeries, polygon_area
 from minegs.eval.volume.coverage import (
     CoverageReport,
     IntegrationSegment,
     Interval,
-    integration_segments,
-    summarise_coverage,
+    plan_integration,
     trapezoid,
 )
 
@@ -50,14 +50,18 @@ class VolumeReport(BaseModel):
     #: rather than a bare series (``minegs/eval/sections/models.py``). Filled by the caller that
     #: holds the record; a volume whose source is unknown says so by leaving it null.
     section_id: str | None = None
-    source: dict | None = None
+    source: SectionSource | None = None
+    #: How the sections were cut. ``section_interval_m`` alone does not say it: a 3 m slab and a
+    #: 180-bin polygon are as much part of "what this number measured" as the interval, and a
+    #: reader of volume.json should not have to open sections.json to see at what resolution the
+    #: claim was made.
+    section_parameters: dict | None = None
 
 
 def _integrate(
     series: SectionSeries, ranges: list[Interval] | None
 ) -> tuple[list[IntegrationSegment], CoverageReport]:
-    segments = integration_segments(series, ranges)
-    coverage = summarise_coverage(series, segments, ranges)
+    segments, coverage = plan_integration(series, ranges)
     if not segments:
         where = ", ".join(f"{lo:g}-{hi:g} m" for lo, hi in coverage.requested_intervals_m) or "the"
         raise ContractError(

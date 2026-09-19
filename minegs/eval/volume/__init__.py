@@ -2,6 +2,7 @@ from minegs.eval.volume.coverage import (
     CoverageReport,
     IntegrationSegment,
     integration_segments,
+    plan_integration,
     summarise_coverage,
 )
 from minegs.eval.volume.volume import (
@@ -19,5 +20,6 @@ __all__ = [
     "compare_to_design",
     "integrate_sections",
     "integration_segments",
+    "plan_integration",
     "summarise_coverage",
 ]

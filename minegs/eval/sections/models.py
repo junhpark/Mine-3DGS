@@ -183,9 +183,30 @@ def check_section_record(
             f"sections {rec.section_id}: the record declares frame {rec.frame}, the series says "
             f"{rec.series.frame}"
         )
+    _check_parameters(rec)
     _check_axis(rec, dataset_dir, manifest)
     _check_station_grid(rec, centerline)
     _check_surface_still_agrees(rec, dataset_id, dataset_hash)
+
+
+def _check_parameters(rec: SectionRecord) -> None:
+    """The parameters block and the series must describe the same cut.
+
+    The grid below is re-derived from ``parameters``, so a record whose ``interval_m`` says one
+    thing and whose series says another would be checked against the wrong grid — and the two
+    are written from the same call, so disagreeing means one of them was edited.
+    """
+    for key, got in (
+        ("interval_m", rec.series.interval_m),
+        ("thickness_m", rec.series.thickness_m),
+        ("angle_bins", rec.series.angle_bins),
+    ):
+        want = rec.parameters.get(key)
+        if want is not None and want != got:
+            raise ContractError(
+                f"sections {rec.section_id}: parameters say {key}={want!r}, the series says "
+                f"{got!r}; one of the two was edited after the sections were cut"
+            )
 
 
 def _check_axis(rec: SectionRecord, dataset_dir: Path, manifest) -> None:

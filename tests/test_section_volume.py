@@ -33,7 +33,13 @@ from minegs.eval.sections.sections import Section, SectionSeries
 from minegs.eval.surface.depth import build_depth_surface
 from minegs.eval.surface.render import render_depths
 from minegs.eval.volume import compare_to_design, integrate_sections
-from minegs.eval.volume.coverage import integration_segments, summarise_coverage
+from minegs.eval.volume.coverage import (
+    CoverageReport,
+    integration_segments,
+    merge_intervals,
+    plan_integration,
+    summarise_coverage,
+)
 from minegs.ingest.common.colmap_io import read_model
 from typer.testing import CliRunner
 
@@ -632,3 +638,72 @@ def test_extract_sections_is_unchanged_by_the_artifact(chain):
     pc = read_ply(chain.full / "surface_points.ply").transformed(m.T_tls_from_local, "TLS_GLOBAL")
     direct = extract_sections(pc.xyz, cl, 2.0, 0.5, 72)
     assert direct.valid_count() > 0 and direct.frame == "TLS_GLOBAL"
+
+
+def test_edited_parameters_no_longer_describe_the_series(chain, tmp_path):
+    """The station grid is re-derived from `parameters`, so the two must agree."""
+    sec = tmp_path / "s.json"
+    cut(chain.raw_ply, chain.dataset_dir, sec, interval_m=2, thickness_m=0.5, angle_bins=72)
+    raw = json.loads(sec.read_text())
+    raw["parameters"]["interval_m"] = 1.0
+    sec.write_text(json.dumps(raw))
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, diagnostic=True))
+    assert r.exit_code == 2, r.output
+    assert "one of the two was edited" in flat(r)
+
+
+def test_a_malformed_integration_range_is_refused_not_silently_empty():
+    """merge_intervals would drop it, and a dropped range asks for nothing — which reports as
+    nothing missing, i.e. as complete coverage."""
+    with pytest.raises(ContractError, match=r"hi > lo"):
+        integration_segments(_series([10.0] * 5), [(4.0, 2.0)])
+
+
+def test_complete_coverage_of_nothing_is_not_complete():
+    assert not CoverageReport().complete
+    ser = _series([10.0] * 5)
+    cov = summarise_coverage(ser, integration_segments(ser), None)
+    assert cov.complete and cov.requested_intervals_m == [(0.0, 4.0)]
+
+
+def test_covered_and_missing_partition_the_request_exactly():
+    ser = _series([10.0, 10.0, None, 10.0, 10.0, 10.0, None])
+    for ranges in (None, [(0.5, 5.5)], [(0.0, 1.0), (3.0, 6.0)], [(1.5, 2.5)]):
+        segs, cov = plan_integration(ser, ranges)
+        got = sorted(cov.integrated_intervals_m + cov.missing_intervals_m)
+        assert merge_intervals(got) == cov.requested_intervals_m, ranges
+        assert cov.covered_length_m + sum(
+            hi - lo for lo, hi in cov.missing_intervals_m
+        ) == pytest.approx(cov.requested_length_m)
+        assert 0.0 <= cov.coverage_fraction <= 1.0
+        if segs:
+            rep = integrate_sections(ser, "x", ranges=ranges)
+            assert rep.volume_m3 == pytest.approx(sum(g.volume_m3 for g in rep.segments))
+
+
+def test_the_volume_report_says_at_what_resolution_the_claim_was_made(chain, tmp_path):
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert runner.invoke(app, volume_argv(sec, chain.dataset_dir, out)).exit_code == 0
+    vol = volume_json(out)
+    assert vol["section_parameters"]["thickness_m"] == 0.5
+    assert vol["section_parameters"]["angle_bins"] == 72
+    assert vol["section_interval_m"] == 1.0
+
+
+def test_a_holdout_with_no_two_consecutive_sections_reaches_the_coverage_refusal(chain, tmp_path):
+    """Not a bare "nothing to integrate": the refusal has to say what is missing."""
+    sec = tmp_path / "s.json"
+    rec = cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    raw = json.loads(sec.read_text())
+    for s in raw["series"]["sections"]:
+        if HOLDOUT[0] < s["chainage_m"] < HOLDOUT[1]:
+            s["valid"], s["area_m2"] = False, None
+    sec.write_text(json.dumps(raw))
+    assert SectionRecord.load(sec).section_id == rec.section_id
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output
+    assert "volume_accuracy is a claim about the whole declared holdout" in flat(r)
+    assert "20-26 m" in flat(r)
