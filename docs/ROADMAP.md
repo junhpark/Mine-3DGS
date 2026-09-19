@@ -735,6 +735,7 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | manifest 의 `file` 이 naming contract 와 다름 | `ContractError` (exit 2) | 검사한 파일과 역투영할 파일이 달라진다 | 해당 없음 (설계) |
 | reasoned about 하지 않은 `backend_args` 키의 depth 렌더 | `ContractError` (exit 2) | trainer 에 그대로 전달되는 옵션이 투영/frustum 을 바꿀 수 있다 | 해당 항목이 neutral 임을 보인 뒤 |
 | `--no-holdout-only` 에 `geometry_accuracy` | claim 을 `geometry_diagnostic` 으로 강등 + 경고 | 학습에 쓴 형상을 다시 재는 수치다 | 해당 없음 (설계) |
+| holdout 구간에 점이 없는 reference/prediction | `ContractError` (exit 2) | 빈 cloud 에 대한 accuracy/completeness 는 수치가 아니라 입력 누락이다 | 해당 없음 (설계) |
 | run 의 최종 checkpoint 가 아닌 manifest | `ContractError` (exit 2) | 다른 모델을 기술하면서 나머지 검사를 통과한다 | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 원시 PLY | `ContractError` (exit 2) | 가우시안 중심은 표면이 아니다 (§1A) | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 `external_unverified` surface | `ContractError` (exit 2) | 외부 depth 는 기록된 run 과 묶여 있지 않다 | Phase 1B (`minegs_render`) |

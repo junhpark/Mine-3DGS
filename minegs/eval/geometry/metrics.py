@@ -58,6 +58,12 @@ def stats(
             p90_m=float("nan"),
             p95_m=float("nan"),
             max_m=float("nan"),
+            # Populated rather than left empty: `compare_clouds` indexes every tau, so an empty
+            # side used to surface as `KeyError: '0.01'` two frames up. NaN says "no samples",
+            # which is what an empty cloud has. Callers must still refuse an empty side -- NaN
+            # metrics under a claim would be worse than a crash -- but no caller should have to
+            # learn that from a KeyError.
+            ratio_within_tau={f"{t:g}": float("nan") for t in taus},
             clipped_ratio=0.0,
         )
     return DistanceStats(

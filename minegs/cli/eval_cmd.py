@@ -333,6 +333,18 @@ def geometry(
                 mr |= (sr >= lo) & (sr <= hi)
             pxyz, rxyz = pxyz[mp], rxyz[mr]
             rng = (min(r[0] for r in j.holdout_ranges_m), max(r[1] for r in j.holdout_ranges_m))
+        # An accuracy/completeness pair over an empty cloud is not a number, it is a missing
+        # input: the comparison would come back all-NaN (or, until this check existed, as a
+        # bare KeyError from compare_clouds with no message at all). Name which side emptied
+        # and what emptied it, because the usual cause is a reference that does not cover the
+        # holdout chainage -- a different TLS epoch, or a different chainage origin.
+        empty = [n for n, a in (("prediction", pxyz), ("TLS reference", rxyz)) if len(a) == 0]
+        if empty:
+            where = f" inside the holdout chainage {rng[0]}-{rng[1]} m" if rng else ""
+            raise ContractError(
+                f"nothing to compare: the {' and the '.join(empty)} has no points{where}. "
+                f"Check that {tls_ply} covers this dataset's chainage and shares its origin."
+            )
         rep = compare_clouds(pxyz, rxyz, max_dist_m)
         rep.chainage_range_m = rng
         rep.claim = claim.value

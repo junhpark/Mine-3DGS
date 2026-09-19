@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 from minegs.cli.main import app
 from minegs.core.errors import ContractError, MissingDependencyError, NoGpuError
+from minegs.core.pointcloud import read_ply, write_ply
 from minegs.core.provenance import sha256_file
 from minegs.eval.surface.depth import build_depth_surface
 from minegs.eval.surface.models import (
@@ -565,9 +566,9 @@ def test_a_reference_cloud_in_the_wrong_frame_is_refused(synthetic, tmp_path):
     assert r.exit_code == 2, r.output
     assert "LOCAL_METRIC" in r.output and "TLS_GLOBAL" in r.output
 
-    # --diagnostic still accepts it, with the same sentence as a warning. (--no-holdout-only
-    # because init_points.ply has the holdout chainage removed by construction, so restricting
-    # to it would leave the reference side empty.)
+    # --diagnostic still accepts it, with the same sentence as a warning. --no-holdout-only
+    # because init_points.ply has the holdout chainage removed by construction; restricting to
+    # it leaves the reference side empty, which is its own refusal (tested just below).
     out = tmp_path / "diag.json"
     r = runner.invoke(app, [*argv, "--diagnostic", "--no-holdout-only", "--out", str(out)])
     assert r.exit_code == 0, r.output
@@ -619,3 +620,43 @@ def test_the_manifest_staging_must_still_match_the_run(env, tmp_path):
     record.save(env.run_dir / "run.json")
     with pytest.raises(ContractError, match="different staging"):
         build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+
+
+def test_a_reference_that_misses_the_holdout_is_refused_not_a_traceback(synthetic, tmp_path):
+    """A TLS reference that does not cover the holdout chainage has nothing to compare.
+
+    It used to reach `compare_clouds` with an empty side and surface as `KeyError: '0.01'` --
+    exit 1, no message -- on the claim-bearing path with a perfectly well-formed TLS_GLOBAL
+    reference. The cause is mundane (a different epoch, a different chainage origin) and the
+    fix has to name it.
+    """
+    ds = synthetic.dataset_dir
+    run_dir = tmp_path / "runs" / "empty"
+    make_run(ds, run_dir, run_id="empty")
+    _, depth_dir = render_depths(run_dir, ds, renderer=StandInRenderer(depth_m=3.0))
+    _, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
+
+    # a genuine TLS_GLOBAL reference, trimmed to hold nothing inside the holdout range
+    lo, hi = synthetic.manifest.split.geometry_holdout.chainage_ranges_m[0]
+    ref = read_ply(synthetic.root / "raw" / "tls_full.ply")
+    chainage, _ = synthetic.centerline_tls.project(ref.xyz)
+    keep = (chainage < lo - 1.0) | (chainage > hi + 1.0)
+    trimmed = tmp_path / "trimmed_tls.ply"
+    write_ply(ref.select(np.flatnonzero(keep)), trimmed, xyz_dtype="f8")
+    assert read_ply(trimmed).frame == "TLS_GLOBAL"
+
+    argv = ["eval", "geometry", str(surface_dir), str(ds), "--tls-ply", str(trimmed)]
+    for extra in ([], ["--diagnostic"]):
+        r = runner.invoke(app, [*argv, *extra])
+        assert r.exit_code == 2, r.output
+        assert "nothing to compare" in r.output and "TLS reference" in r.output
+        assert f"{lo}-{hi}" in r.output
+
+
+def test_compare_clouds_reports_no_samples_rather_than_raising(rng):
+    """Defence in depth for every other caller; the gate above is what protects the claim."""
+    from minegs.eval.geometry import compare_clouds
+
+    rep = compare_clouds(rng.random((32, 3)), np.empty((0, 3)), 1.0)
+    assert rep.completeness.n == 0
+    assert all(v != v for v in rep.completeness.ratio_within_tau.values())  # NaN
