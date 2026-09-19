@@ -75,6 +75,8 @@ def test_cli_phase0a_gate(tmp_path):
     assert r.exit_code == 0, r.output
     vol = json.loads((tmp_path / "vol.json").read_text())["volume"]
     assert vol["claim"] == "volume_accuracy" and vol["valid_section_count"] > 20
+    # A bare PLY is a diagnostic input since Phase 1A: claim-bearing geometry needs a surface
+    # artifact (§1.7), and init_points.ply is TLS initialisation, not reconstructed surface.
     r = runner.invoke(
         app,
         [
@@ -84,6 +86,7 @@ def test_cli_phase0a_gate(tmp_path):
             str(ds),
             "--tls-ply",
             str(root / "raw" / "tls_full.ply"),
+            "--diagnostic",
             "--out",
             str(tmp_path / "geo.json"),
         ],
@@ -91,7 +94,7 @@ def test_cli_phase0a_gate(tmp_path):
     assert r.exit_code == 0, r.output
     geo = json.loads((tmp_path / "geo.json").read_text())
     assert (
-        geo["claim"] == "geometry_accuracy" and geo["completeness"]["clipped_ratio"] > 0.5
+        geo["claim"] == "geometry_diagnostic" and geo["completeness"]["clipped_ratio"] > 0.5
     )  # init has a hole in the holdout
     r = runner.invoke(app, ["dataset", "chunks", str(ds), "--length-m", "40", "--overlap-m", "10"])
     assert r.exit_code == 0 and "C02" in r.output
@@ -218,9 +221,10 @@ def test_cli_prints_the_claim_label(tmp_path):
             str(ds),
             "--tls-ply",
             str(root / "raw" / "tls_full.ply"),
+            "--diagnostic",
         ],
     )
-    assert r.exit_code == 0 and "[geometry_accuracy]" in r.output
+    assert r.exit_code == 0 and "[geometry_diagnostic]" in r.output
 
 
 def test_cli_heavy_profile_fails_closed(tmp_path):
