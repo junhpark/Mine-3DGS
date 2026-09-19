@@ -244,15 +244,16 @@ def _depth_provenance(
     found = find_depth_manifest(depth_dir)
     if found is None:
         return "external_unverified", None
-    from minegs.eval.surface.render import require_reproducible_render
+    from minegs.eval.surface.render import require_metric_outputs, require_reproducible_render
 
     rendered = DepthManifest.load(found)
     verify_depth_manifest(
         rendered, depth_dir, run, run_dir, dataset_id, dataset_hash, model.cameras, model.images
     )
-    # Re-asserted here rather than trusted from the manifest. The renderer checked it too, but
-    # the manifest records no verdict, so depth written by an older build — or by one whose
+    # Re-asserted here rather than trusted from the manifest. The renderer checked both too,
+    # but the manifest records no verdict, so depth written by an older build — or by one whose
     # guard was weaker — would otherwise promote on the strength of having a manifest at all.
+    require_metric_outputs(run)
     require_reproducible_render(run, run_dir)
     return "minegs_render", rendered
 

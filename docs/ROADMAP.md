@@ -515,9 +515,21 @@ scientific validation remain pending.**
   `far_plane` 처럼 boolean 도 아니고 이름도 모르는 옵션을 잡을 수 없다. argv 는 docker 플래그가
   섞여 있어 이 방식이 불가능하지만 `backend_args` 는 순수한 gsplat 네임스페이스라 가능하다.
   reasoned about 하지 않은 키는 거부한다.
-* **승격 시 재확인**: manifest 는 재현 가능 여부를 기록하지 않으므로 `build_depth_surface` 가
-  promotion 직전 `require_reproducible_render` 를 run record 에 대해 다시 돌린다. 가드가 없던
-  빌드가 만든 depth 가 manifest 존재만으로 승격되는 경로를 닫는다.
+* **승격 시 재확인**: manifest 는 metric frame 도 재현 가능 여부도 기록하지 않으므로
+  `build_depth_surface` 가 promotion 직전 `require_metric_outputs` 와
+  `require_reproducible_render` 를 run record 에 대해 다시 돌린다. 가드가 없던 빌드가 만든
+  depth 가 manifest 존재만으로 승격되는 경로를 닫는다.
+* **reference cloud 의 frame 도 거부 대상**: `eval geometry --tls-ply` 가 `TLS_GLOBAL` 이
+  아니면 (`UNKNOWN` 포함) claim 경로에서 거부한다. 예전에는 경고 한 줄이었고 JSON 에는 남지
+  않았다. `dataset/init_points.ply`(LOCAL_METRIC) 는 `raw/tls_full.ply` 바로 옆에 있어서 흔한
+  실수이고, 그 비교는 두 표면이 아니라 두 좌표계의 거리를 잰다. 예측 쪽은 `_to_tls` 가 이미
+  같은 이유로 거부하고 있었다.
+* **checkpoint 는 restricted unpickler 로 읽는다** (`weights_only=True`). run artifact 는 GPU
+  호스트에서 가져오는 것이고, 기존 방식은 `check_checkpoint_blob` 이 보기 *전에* 임의 코드를
+  실행할 수 있었다. upstream 은 tensor·dict·int 만 저장하므로 정상 checkpoint 는 모두 로드된다.
+* **학습에 쓴 view 를 기록한다**: depth 는 dataset 의 모든 view 에 대해 렌더되지만
+  `max_images` 프로파일은 일부만 학습한다. manifest 의 `staged` 가 run.json 의 것을 복사해
+  두 artifact 가 구별되게 한다 (렌더가 틀렸다는 뜻은 아니다).
 * **`--no-holdout-only` 는 claim 을 내리지 않는다**: `geometry_accuracy` 는 정의상 holdout TLS
   에 대한 주장(`Claim` docstring)이고, judge 가 그것을 허용한 이유도 그 구간이 초기화에서
   제외되었기 때문이다. holdout mask 를 끄면 run 이 학습에 쓴 형상을 다시 재게 되므로 경고와

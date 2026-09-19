@@ -242,6 +242,11 @@ class DepthManifest(VersionedModel):
     frame: Literal["LOCAL_METRIC"] = "LOCAL_METRIC"
     unit: Literal["m"] = "m"
     depths: list[RenderedDepth] = Field(min_length=1)
+    #: What the run was actually trained on, copied from ``run.json``'s ``staged``. Depth is
+    #: rendered for every dataset view, but a profile with ``max_images`` trains on a subset, so
+    #: some of those views were never supervised. That does not make the render wrong — it makes
+    #: two otherwise identical artifacts distinguishable, which they were not before.
+    staged: dict[str, Any] = Field(default_factory=dict)
     provenance: ProvenanceRecord
 
     def by_image_name(self) -> dict[str, RenderedDepth]:

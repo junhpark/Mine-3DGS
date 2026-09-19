@@ -270,7 +270,7 @@ def geometry(
     """Bidirectional accuracy / completeness / Chamfer against TLS (§11). Refuses claims the manifest cannot support (§5)."""
     import numpy as np
 
-    from minegs.core.errors import ProtocolViolation
+    from minegs.core.errors import ContractError, ProtocolViolation
     from minegs.core.pointcloud import read_ply
     from minegs.eval.geometry import compare_clouds
     from minegs.eval.protocol import Claim, judge
@@ -306,7 +306,21 @@ def geometry(
         pred_pc = _to_tls(points, m)
         ref = read_ply(tls_ply)
         if ref.frame != "TLS_GLOBAL":
-            console.print(f"[yellow]TLS reference frame is {ref.frame}; expected TLS_GLOBAL[/]")
+            # The predicted side is refused for exactly this in _to_tls; the reference side used
+            # to get a console line that never reached the JSON. Comparing a LOCAL_METRIC cloud
+            # against a TLS_GLOBAL one measures the distance between two coordinate systems, and
+            # `dataset/init_points.ply` sits one directory from `raw/tls_full.ply`, so the
+            # mix-up is an ordinary one. UNKNOWN counts as wrong: a cloud that never declared
+            # its frame has not been established to be in this one.
+            wrong_frame = (
+                f"{tls_ply}: reference cloud is in frame {ref.frame}, not TLS_GLOBAL. Geometry "
+                "is compared in TLS_GLOBAL, so this would measure the offset between two "
+                "coordinate systems rather than between two surfaces. Re-export it with its "
+                "frame declared, or pass --diagnostic for non-claim numbers."
+            )
+            if not diagnostic:
+                raise ContractError(wrong_frame)
+            console.print(f"[yellow]{wrong_frame}[/]")
         pxyz, rxyz = pred_pc.xyz, ref.xyz
         rng = None
         if holdout_only and j.holdout_ranges_m:

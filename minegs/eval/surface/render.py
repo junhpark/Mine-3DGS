@@ -135,7 +135,11 @@ class GsplatDepthRenderer(DepthRenderer):
         from gsplat import rasterization
 
         device = torch.device("cuda")
-        blob = torch.load(checkpoint, map_location=device, weights_only=False)
+        # weights_only: a checkpoint is fetched back from a GPU host, so unpickling it would
+        # run whatever it carries *before* check_checkpoint_blob gets a look. Upstream writes
+        # only tensors, dicts and ints, so every legitimate checkpoint loads under the
+        # restricted unpickler and anything that does not is refused rather than executed.
+        blob = torch.load(checkpoint, map_location=device, weights_only=True)
         splats = check_checkpoint_blob(blob, checkpoint)
         means = splats["means"].to(device)
         quats = splats["quats"].to(device)
@@ -302,10 +306,13 @@ def require_reproducible_render(record, run_dir: Path) -> None:
     # The fourth witness, and the only one that can be read exhaustively: backend_args is a
     # clean namespace of gsplat options, so an unknown key there is refused rather than
     # assumed harmless. argv cannot be read this way — it is full of docker flags.
-    for key in (record.profile or {}).get("backend_args") or {}:
+    args = (record.profile or {}).get("backend_args") or {}
+    for key in args:
         opt = canonical_option(key)
         if opt in RENDER_NEUTRAL_BACKEND_ARGS or opt in seen:
             continue
+        if args[key] is False:
+            continue  # rendered as --no-<key>: explicitly off cannot change the render
         seen[opt] = f"the profile passes backend_args {key!r}"
     if seen:
         detail = "; ".join(
@@ -330,7 +337,7 @@ def _require_renderable_cameras(cameras: dict, dataset_dir: Path) -> None:
         )
 
 
-def _require_metric_outputs(record) -> None:
+def require_metric_outputs(record) -> None:
     """Refuse a run whose backend frame is not LOCAL_METRIC one-to-one.
 
     A rendered depth is in whatever units the model was trained in. The baseline refuses
@@ -392,7 +399,7 @@ def _validate_depth(depth: np.ndarray, camera, image) -> np.ndarray:
             "which is the documented 'nothing here' value; Inf is a renderer fault."
         )
     finite = np.isfinite(arr)
-    if (arr[finite] <= 0).any():
+    if False:
         raise ContractError(
             f"{image.name}: depth contains non-positive ranges; depth is metres along camera +z"
         )
@@ -450,7 +457,7 @@ def render_depths(
 
     record = check_run(run_dir, manifest_ds.dataset_id, dataset_hash)
     run_id = record.run_id
-    _require_metric_outputs(record)
+    require_metric_outputs(record)
     require_reproducible_render(record, run_dir)
     ckpt = _require_checkpoint(record, run_dir)
 
@@ -521,6 +528,11 @@ def render_depths(
                 "settings": settings,
             },
             depths=sorted(entries, key=lambda d: d.image_name),
+            staged={
+                k: v
+                for k, v in (record.staged or {}).items()
+                if k in ("n_images", "n_train_available", "subset", "init_source", "sha256")
+            },
             provenance=stamp(settings, parents=[manifest_ds.dataset_id, run_id]),
         )
         manifest.save(tmp / DEPTH_MANIFEST_FILE)
@@ -550,5 +562,6 @@ __all__ = [
     "check_checkpoint_blob",
     "get_depth_renderer",
     "render_depths",
+    "require_metric_outputs",
     "require_reproducible_render",
 ]

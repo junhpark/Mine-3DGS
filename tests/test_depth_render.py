@@ -531,3 +531,47 @@ def test_accuracy_is_a_claim_about_the_holdout_only(synthetic, tmp_path):
     assert report["claim"] == "geometry_diagnostic"
     assert report["chainage_range_m"] is None
     assert "fit to the data the run saw" in r.output
+
+
+def test_a_reference_cloud_in_the_wrong_frame_is_refused(synthetic, tmp_path):
+    """init_points.ply sits one directory from tls_full.ply and is LOCAL_METRIC, not TLS_GLOBAL."""
+    ds = synthetic.dataset_dir
+    run_dir = tmp_path / "runs" / "frame"
+    make_run(ds, run_dir, run_id="frame")
+    _, depth_dir = render_depths(run_dir, ds, renderer=FakeRenderer(depth_m=3.0))
+    _, surface_dir = build_depth_surface(depth_dir, ds, run_dir, run_dir / "surface" / "v1")
+
+    argv = [
+        "eval",
+        "geometry",
+        str(surface_dir),
+        str(ds),
+        "--tls-ply",
+        str(ds / "init_points.ply"),  # LOCAL_METRIC, and one `ls` away from the real reference
+    ]
+    r = runner.invoke(app, argv)
+    assert r.exit_code == 2, r.output
+    assert "LOCAL_METRIC" in r.output and "TLS_GLOBAL" in r.output
+
+    # --diagnostic still accepts it, with the same sentence as a warning. (--no-holdout-only
+    # because init_points.ply has the holdout chainage removed by construction, so restricting
+    # to it would leave the reference side empty.)
+    out = tmp_path / "diag.json"
+    r = runner.invoke(app, [*argv, "--diagnostic", "--no-holdout-only", "--out", str(out)])
+    assert r.exit_code == 0, r.output
+    assert "not TLS_GLOBAL" in r.output
+    assert json.loads(out.read_text())["claim"] == "geometry_diagnostic"
+
+
+def test_the_manifest_records_what_the_run_was_trained_on(env):
+    """A max_images subset run renders every view; two artifacts must not look identical."""
+    staged = {"n_images": 12, "n_train_available": 40, "subset": True, "init_source": "tls"}
+    record = RunRecord.load(env.run_dir / "run.json")
+    record.staged = staged
+    record.save(env.run_dir / "run.json")
+
+    manifest, _ = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=FakeRenderer())
+    assert manifest.staged["subset"] is True
+    assert manifest.staged["n_images"] == 12
+    # depth is still rendered for every dataset view; the point is that the gap is visible
+    assert len(manifest.depths) == len(env.model.images)

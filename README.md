@@ -351,9 +351,14 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
   전달되므로(`build_command`), 알려진 나쁜 이름 목록으로는 `camera_model`·`with_ut`·`far_plane`
   같은 것을 놓친다. 그래서 *reasoned about 하지 않은 키는 거부*한다
   (`RENDER_NEUTRAL_BACKEND_ARGS`). light profile 은 전부 neutral 이라 그대로 렌더된다.
-* **승격 시 재확인한다**: manifest 에는 재현 가능 여부가 기록되지 않으므로,
-  `build_depth_surface` 가 promotion 직전에 같은 검사를 run record 에 대해 다시 돌린다.
+* **승격 시 재확인한다**: manifest 에는 metric frame 도 재현 가능 여부도 기록되지 않으므로,
+  `build_depth_surface` 가 promotion 직전에 두 검사를 run record 에 대해 다시 돌린다.
   가드가 없던 빌드가 만든 depth 가 manifest 만으로 승격되지 않는다.
+* **reference cloud 의 frame 도 검사한다**: `--tls-ply` 가 `TLS_GLOBAL` 이 아니면
+  (`UNKNOWN` 포함) claim 경로에서 거부한다. `dataset/init_points.ply` 는 LOCAL_METRIC 이고
+  `raw/tls_full.ply` 바로 옆에 있다 — 그 비교는 두 표면이 아니라 두 좌표계의 거리를 잰다.
+* **checkpoint 는 `weights_only=True` 로 읽는다**: run artifact 는 GPU 호스트에서 가져오므로,
+  계약 검사 *전에* pickle 이 코드를 실행하게 두지 않는다.
 * **왜곡 있는 camera model 도 거부한다**: rasterizer 는 pinhole 로 투영하므로 `SIMPLE_RADIAL`
   등은 왜곡이 조용히 빠진 채 모든 ray 가 틀어진다. `PINHOLE`/`SIMPLE_PINHOLE` 만 지원.
 * **fail closed**: run != succeeded · dataset id/hash 불일치 · checkpoint 없음/경로 깨짐 ·
