@@ -39,6 +39,109 @@ def _to_tls(pc, m):
     )
 
 
+SURFACE_REQUIRED = (
+    "Geometry accuracy requires a surface artifact. Gaussian centres are not surfaces. "
+    "Build one with `minegs eval surface-depth <depth_dir> <dataset_dir> --run-dir <run_dir> "
+    "--out <surface_dir>` and pass <surface_dir> here, or pass --diagnostic for non-claim "
+    "numbers from a raw PLY."
+)
+
+
+def _unverified_depth(rec) -> str:
+    return (
+        f"surface {rec.surface_id} was built from depth maps minegs did not render "
+        f"(depth_source={rec.depth_source}), so it cannot carry a geometry_accuracy claim. "
+        f"Nothing ties those maps to run {rec.run_id}: the same directory paired with any "
+        "succeeded run of this dataset would produce the same artifact. Rendering metric depth "
+        "from a trained run is Phase 1B (docs/ROADMAP.md). Pass --diagnostic for non-claim "
+        "numbers."
+    )
+
+
+def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
+    """Resolve the geometry input to (points, SurfaceRecord | None).
+
+    A surface artifact is what separates "these points came off a reconstruction" from "these
+    points are where the optimiser put its Gaussians" (§16) — and ``check_surface`` verifies
+    the points against the record rather than taking the record's word for them, so wrapping a
+    Gaussian PLY in a hand-written surface.json does not get past this. Being a surface is
+    still not sufficient: a claim also needs depth this project rendered (§1A).
+    """
+    from minegs.core.errors import ContractError
+    from minegs.core.pointcloud import read_ply
+    from minegs.core.provenance import sha256_tree
+    from minegs.eval.surface.models import check_surface, find_surface, load_surface
+    from minegs.train.runner.base import DATASET_HASH_PATTERNS
+
+    if find_surface(pred) is not None:
+        rec, points = load_surface(pred)
+        pc = check_surface(
+            rec, points, m.dataset_id, sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
+        )
+        console.print(
+            f"surface [bold]{rec.surface_id}[/] ({rec.method}, depth {rec.depth_source}, "
+            f"{rec.point_count} points from {rec.depth_map_count} depth maps, run {rec.run_id})"
+        )
+        if not rec.supports_accuracy_claim:
+            if not diagnostic:
+                raise ContractError(_unverified_depth(rec))
+            console.print(
+                "[yellow]warning: this surface's depth maps are unverified external input; "
+                "these numbers are diagnostic, not a validated geometry claim[/]"
+            )
+        return pc, rec
+    if not diagnostic:
+        raise ContractError(SURFACE_REQUIRED)
+    if not pred.is_file():
+        raise ContractError(f"{pred}: not a surface artifact (no surface.json) and not a PLY file")
+    console.print(
+        "[yellow]warning: raw PLY accepted only as diagnostic; this is not a validated "
+        "surface artifact[/]"
+    )
+    return read_ply(pred), None
+
+
+@app.command("surface-depth")
+def surface_depth(
+    depth_dir: Path = typer.Argument(
+        ..., help="<image stem>.npy depth maps, metres along camera z"
+    ),
+    dataset_dir: Path = typer.Argument(...),
+    run_dir: Path = typer.Option(
+        ..., "--run-dir", help="the succeeded run these depth maps were rendered from"
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", help="surface directory (default: <run_dir>/surface/depth_v001)"
+    ),
+    stride: int = typer.Option(2, help="pixel stride when sampling each depth map"),
+    max_depth: float | None = typer.Option(
+        None, "--max-depth", help="drop samples further than this from the camera (m)"
+    ),
+) -> None:
+    """Fuse depth maps into a LOCAL_METRIC surface artifact (§1.7).
+
+    The artifact records which run and dataset the samples came from; it claims no accuracy.
+    Depth maps themselves are rendered elsewhere — `render_depths` is Phase 1B.
+    """
+    from minegs.eval.surface.depth import build_depth_surface
+
+    def go() -> None:
+        target = out or (run_dir / "surface" / "depth_v001")
+        rec, surface_dir = build_depth_surface(
+            depth_dir, dataset_dir, run_dir, target, stride, max_depth
+        )
+        span = rec.span_m or []
+        console.print(
+            f"surface [bold]{rec.surface_id}[/]: {rec.point_count} points from "
+            f"{rec.depth_map_count} depth maps (stride {stride})"
+        )
+        if span:
+            console.print(f"  LOCAL_METRIC span {span[0]:.2f} x {span[1]:.2f} x {span[2]:.2f} m")
+        console.print(f"  wrote {surface_dir}")
+
+    run_guarded(go)
+
+
 @app.command()
 def protocol(
     dataset_dir: Path = typer.Argument(...), as_json: bool = typer.Option(False, "--json")
@@ -111,7 +214,11 @@ def register(
 
 @app.command()
 def geometry(
-    pred_ply: Path = typer.Argument(..., help="surface samples from the run (LOCAL_METRIC)"),
+    pred: Path = typer.Argument(
+        ...,
+        help="surface artifact directory from `eval surface-depth`; a raw PLY only "
+        "with --diagnostic",
+    ),
     dataset_dir: Path = typer.Argument(...),
     tls_ply: Path = typer.Option(..., help="reference TLS cloud (TLS_GLOBAL, raw/)"),
     holdout_only: bool = typer.Option(
@@ -141,11 +248,18 @@ def geometry(
                     f"{m.dataset_id}: protocol {j.primary.value} cannot claim geometry_accuracy ({'; '.join(j.refusals) or 'no holdout'}); pass --diagnostic for non-claim numbers"
                 )
             claim = Claim.GEOMETRY_DIAGNOSTIC
-        pred = _to_tls(read_ply(pred_ply), m)
+        points, surface = _resolve_pred(pred, dataset_dir, m, diagnostic)
+        if surface is None or not surface.supports_accuracy_claim:
+            # Neither a raw PLY nor a surface fused from external depth carries an accuracy
+            # claim, whatever the manifest would allow: in the first case nothing establishes
+            # that these points sample the tunnel wall, in the second nothing ties the depth
+            # to the run (§18, §1A). _resolve_pred has already refused unless --diagnostic.
+            claim = Claim.GEOMETRY_DIAGNOSTIC
+        pred_pc = _to_tls(points, m)
         ref = read_ply(tls_ply)
         if ref.frame != "TLS_GLOBAL":
             console.print(f"[yellow]TLS reference frame is {ref.frame}; expected TLS_GLOBAL[/]")
-        pxyz, rxyz = pred.xyz, ref.xyz
+        pxyz, rxyz = pred_pc.xyz, ref.xyz
         rng = None
         if holdout_only and j.holdout_ranges_m:
             sp, _ = cl.project(pxyz)

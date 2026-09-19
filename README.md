@@ -41,7 +41,8 @@ minegs eval    protocol  data/synthetic_tunnel/dataset
 minegs eval sections data/synthetic_tunnel/raw/tls_full.ply data/synthetic_tunnel/dataset \
        --interval-m 2 --thickness-m 0.5 --angle-bins 72 --out sections.json
 minegs eval volume   sections.json data/synthetic_tunnel/dataset --design-radius-m 2.4
-minegs eval geometry <pred.ply> data/synthetic_tunnel/dataset --tls-ply data/synthetic_tunnel/raw/tls_full.ply
+# claim 을 담는 geometry 는 surface artifact 를 요구한다 (§1.7). 원시 PLY 는 --diagnostic 전용
+minegs eval geometry <surface_dir> data/synthetic_tunnel/dataset --tls-ply data/synthetic_tunnel/raw/tls_full.ply
 minegs train command data/synthetic_tunnel/dataset --profile light     # 실행할 gsplat 커맨드 확인
 pytest                                                                 # CI 와 동일
 ```
@@ -64,7 +65,7 @@ minegs/
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
     runner/    base · local(docker) · runpod(Phase 6, fail-closed) · sync(rclone)
     profiles/  light.yaml · heavy.yaml
-  eval/      protocol · register(Sim3 → ICP → diagnostics) · surface · geometry(양방향) · sections(A(s)) · volume(∫A ds, 설계대비) · change · render(PSNR/SSIM/LPIPS)
+  eval/      protocol · register(Sim3 → ICP → diagnostics) · surface(depth 역투영 → surface artifact) · geometry(양방향) · sections(A(s)) · volume(∫A ds, 설계대비) · change · render(PSNR/SSIM/LPIPS)
   viz/       viewer(Viser) · overlay(규약 캘리브레이션 = 골든 게이트) · compare · export(.spz/.splat)
   cli/       ingest / dataset / train / eval / viz / sync
 docker/      Dockerfile.gpu · Dockerfile.cpu · entrypoint.sh
@@ -267,6 +268,52 @@ minegs train status  data/<id>/runs/<run_id>             # run.json: backend, di
 light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, `--depth_loss` 없음,
 `T_local_from_internal` 은 항등이다.
 
+## Metric surface artifact (Phase 1A)
+
+**가우시안 중심은 표면이 아니다** (원칙 7). `runs/<run_id>/point_cloud/*.ply` 는 볼류메트릭 방사장의
+파라미터이지 갱도 벽면의 샘플이 아니므로, 그것을 TLS 와 비교하면 "복원이 얼마나 정확한가" 가 아니라
+"옵티마이저가 프리미티브를 어디에 두었는가" 를 재게 된다. 그래서 surface 는 **유도**하고, 유도 사실을
+artifact 로 남긴다.
+
+```bash
+minegs eval surface-depth <depth_dir> data/<id>/dataset \
+       --run-dir data/<id>/runs/<run_id> --stride 2 --max-depth 30
+# → runs/<run_id>/surface/depth_v001/{surface.json, surface_points.ply}
+
+# Phase 1A surface 는 외부에서 받은 depth 로 만들어지므로 diagnostic 전용이다 (아래 claim 규칙)
+minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/dataset \
+       --tls-ply data/<id>/raw/tls_full.ply --diagnostic
+```
+
+* **depth map 계약**: `<depth_dir>/<image stem>.npy`, 값은 **카메라 z 방향 미터**. PNG/EXR 는 후속 작업.
+* **누락은 실패**: 카메라 view 수와 depth map 수가 다르면 `ContractError`. 조용히 빠진 view 는
+  completeness·단면·체적에서 미복원 형상과 구별되지 않는다.
+* **필터**: NaN·Inf·`z <= 0`·`> --max-depth` 는 제외. 결과는 항상 `LOCAL_METRIC`, 단위 m.
+* **publish 는 원자적**: `.<name>.minegs-partial` 에 쓰고 성공 후 rename. 중단된 fusion 이 더 얇은
+  surface 로 읽히지 않는다.
+* **surface.json 은 정확도를 주장하지 않는다.** 어느 run·어느 dataset(`dataset_hash`)·어떤 depth
+  (`depth_source`, `depth_sha256`)·어느 method 로 만들었고 어떤 점들(`point_sha256`)인지만 기록한다.
+* **record 는 surface 가 아니다.** claim 경로는 `point_file` 을 다시 읽어 `point_sha256`·point
+  count·frame·유한성을 확인한다. 이게 없으면 "surface 인가?" 는 "옆에 surface.json 이라는 파일이
+  있는가?" 로 퇴화하고, Gaussian PLY 에 JSON 만 씌우면 claim 경로로 들어온다.
+* **surface 라는 것만으로는 accuracy claim 이 안 된다.** `depth_source` 가 판단 기준이다.
+  Phase 1A 가 받을 수 있는 것은 전부 `external_unverified` — 디렉터리에 놓인 `.npy` 는 그것이
+  기록된 run 에서 나왔다는 증거를 하나도 갖고 있지 않고, 같은 depth 를 아무 성공한 run 에 붙여도
+  동일한 artifact 가 나온다. 따라서 **Phase 1A surface 로는 `geometry_accuracy` 를 만들 수 없다.**
+  `minegs_render` 는 Phase 1B renderer 가 run 과 묶인 depth 를 낼 때 쓰는 값이고, gate 는 지금
+  써 둔다. 나중에 검사를 추가하는 게 아니라 증거를 만들어서 여는 구조다.
+* **geometry gate 정리**
+
+  | 입력 | `--diagnostic` 없이 | `--diagnostic` |
+  |---|---|---|
+  | 원시 PLY | `ContractError` — "Gaussian centres are not surfaces" | 경고 + `geometry_diagnostic` |
+  | surface artifact, `external_unverified` | `ContractError` — depth 가 run 과 묶여 있지 않음 (Phase 1B) | 경고 + `geometry_diagnostic` |
+  | surface artifact, `minegs_render` (Phase 1B) | `geometry_accuracy` | `geometry_accuracy` |
+
+**미구현 (범위 밖)**: `render_depths()` — 학습된 run 에서 metric depth 를 렌더링하는 경로는 gsplat
+rasterizer 와 GPU 가 필요한 **Phase 1B** 다. TSDF(`eval/surface/tsdf.py`)·mesh 재구성도 미구현이다.
+이 단계는 artifact 경계와 역투영 경로를 **구조적으로만** 검증한다 (`tests/test_surface.py` T1–T8).
+
 ## 평가 주장 게이트 (§5)
 
 `minegs eval protocol <dataset>` 이 manifest 의 `split`/`initialization` 만 보고 주장 가능 범위를 판정한다.
@@ -288,7 +335,7 @@ light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, 
 | 0B Real E57 ingest | **0B.1–0B.3 implemented** (inventory·증거 기반 매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C Metric dataset golden gate | **implementation complete, G1 structurally tested** — 합성 staging → `from-e57` → 재투영 Golden Gate 가 CI 에서 돈다. **G2: DEFERRED / NOT VALIDATED** (실제 E57 미실행) |
 | 0D Local GS baseline | **0D.1 resume safety contract** + **0D.2 local GPU baseline execution contract: implemented + structurally tested** — gsplat v1.5.3 training resume 은 unsupported 이고 fail closed; 성공한 run 은 checkpoint·PLY·step 진행·frame invariant 를 모두 통과한 것만 기록된다. **실제 GPU baseline 미실행** → 0D 전체 **NOT COMPLETE** (ROADMAP §Phase 0D) |
-| 1 Metric surface & evaluation | 부분 — 양방향 지표·단면·체적 구현, surface 추출(depth/TSDF) 미구현 |
+| 1 Metric surface & evaluation | **1A metric surface artifact + depth fusion: implemented + structurally tested** — depth map → LOCAL_METRIC surface artifact, claim 을 담는 geometry 는 무결성이 검증된 artifact 를 요구한다. 1A 의 depth 는 전부 `external_unverified` 이므로 **`geometry_accuracy` 는 아직 도달 불가 (diagnostic 전용)**. **gsplat depth rendering (1B): NOT IMPLEMENTED**, **TSDF/mesh: NOT IMPLEMENTED**, 실제 GPU·실측 데이터 과학적 검증: **NOT VALIDATED** |
 | 2 E57 end-to-end MVP (v0.1) | 미착수 |
 | 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |
 | 4 Advanced GS / heavy | 미착수 — `depth_loss`·`normalize_world_space` 를 여기서 설계 |

@@ -18,7 +18,12 @@
 6. **평가 누수는 계약 수준에서 차단.** 어떤 TLS 데이터가 초기화·학습에 들어갔는지
    manifest 가 선언하고, 평가 모듈은 그 선언에 맞지 않는 주장을 거부한다 (§5).
 7. **가우시안 중심은 표면이 아니다.** 형상 평가는 항상
-   GS → 깊이/메시/표면 표현 → TLS 비교 순서를 따른다.
+   GS → 깊이/메시/표면 표현 → TLS 비교 순서를 따른다. 이 경계는 계약으로 강제된다:
+   surface 는 `SurfaceRecord` 를 남기는 명시적 artifact 이고 (`eval/surface/models.py`),
+   claim 을 담는 `eval geometry` 는 그 artifact 없이는 실행되지 않는다. 그리고 record 를
+   믿는 것이 아니라 점들을 다시 읽어 digest 로 대조하며, artifact 라는 것만으로는 부족하다 —
+   `depth_source` 가 이 프로젝트가 렌더한 depth 를 가리킬 때만 accuracy claim 이 열린다
+   (Phase 1A 의 외부 depth 는 diagnostic 전용).
 8. **모든 산출물에 계보.** raw → dataset → run → eval → export 각 단계가
    입력 해시·설정 해시·git SHA·도구 버전·부모 ID 를 기록한다 (§9).
 
@@ -48,7 +53,7 @@ minegs/
       runner/    base.py, local.py, runpod.py, sync.py(rclone)
       profiles/  light.yaml, heavy.yaml
     eval/        register/ (initial_alignment, sim3, rigid_icp, diagnostics)
-                 surface/  (depth·TSDF·mesh 추출)
+                 surface/  (models=surface artifact 계약 · depth 역투영 · TSDF·mesh 추출)
                  geometry/ (accuracy, completeness, chamfer, 분위수)
                  sections/ (중심선 기준 단면 A(s))
                  volume/   (∫A(s)ds, 메시 체적, 설계 대비 여굴·미굴)

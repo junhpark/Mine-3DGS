@@ -24,7 +24,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 0B | Real E57 Ingest | **0B.1·0B.2·0B.3 implemented** (inventory·매핑·추출), **not validated** — 실제 E57 필요 |
 | 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2: DEFERRED / NOT VALIDATED** (PO 결정, §0C) |
 | 0D | Local GS Baseline | **0D.1 resume safety contract** 및 **0D.2 local GPU baseline execution contract** implemented + structurally tested. **실제 GPU baseline 미실행**. 0D 전체는 **NOT COMPLETE** (§0D) |
-| 1 | Metric Surface & Evaluation | 부분 implemented (지표·단면·체적), surface 추출 미구현 |
+| 1 | Metric Surface & Evaluation | **1A metric surface artifact + depth fusion: implemented + structurally tested** (§1). 1A depth 는 전부 `external_unverified` 이므로 **`geometry_accuracy` 도달 불가 — diagnostic 전용**. **1B gsplat depth rendering: NOT IMPLEMENTED**, TSDF/mesh: NOT IMPLEMENTED, 실제 GPU·실측 과학적 검증: NOT VALIDATED |
 | 2 | E57 End-to-End MVP | 미착수 |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
 | 4 | Advanced GS / Heavy Profile | 미착수 — `depth_loss` 는 여기서 설계 |
@@ -422,6 +422,65 @@ Cross-version checkpoint migration 은 명시적으로 설계되기 전까지 �
 
 **원칙**: 가우시안 중심을 TLS 와 직접 비교하지 않는다. 항상 GS → depth/mesh/surface → 평가.
 
+#### Phase 1A — metric surface artifact & depth fusion (완료)
+
+Phase 1A metric surface artifact + depth fusion: **implemented + structurally tested.**
+
+경계 하나만 닫는다: surface 는 **유도된 artifact** 이고, claim 을 담는 geometry 평가는 그 artifact
+를 요구한다.
+
+* `minegs eval surface-depth <depth_dir> <dataset_dir> --run-dir <run_dir> [--out] [--stride]
+  [--max-depth]` — depth map(`<image stem>.npy`, 카메라 z 미터) 을 dataset 의 `sparse/0` pose 로
+  역투영해 `runs/<run_id>/surface/depth_v001/{surface.json, surface_points.ply}` 를 publish 한다.
+  Gaussian PLY(`point_cloud/`) 와 디렉터리를 섞지 않는다.
+* `SurfaceRecord` (`minegs/eval/surface/models.py`, schema 1.0) — `surface_id · dataset_id ·
+  dataset_hash · run_id · method · depth_source · frame · unit · point_file · point_sha256 ·
+  point_count · depth_map_count · depth_sha256 · parameters · provenance`.
+  `frame == LOCAL_METRIC`, `unit == m` 은 모델 수준 invariant 이고, `method` 는
+  `depth_backprojection` 하나다. **surface.json 은 정확도를 주장하지 않는다.**
+* **record 는 surface 가 아니다.** `check_surface` 는 `point_file` 을 다시 읽어
+  `point_sha256`·point count·frame·유한성을 확인한다. 이 검증이 없으면 경계가 "surface 인가"
+  가 아니라 "surface.json 이라는 파일이 옆에 있는가" 를 묻게 되고, Gaussian PLY 에 손으로 쓴
+  record 를 붙이면 claim 경로로 그대로 들어온다.
+* **surface 라는 것과 accuracy claim 을 할 수 있다는 것은 다르다.** `depth_source` 가 그 경계다.
+  Phase 1A 가 받을 수 있는 depth 는 전부 `external_unverified`: 디렉터리의 `.npy` 는 기록된 run
+  에서 나왔다는 증거를 갖고 있지 않고, 같은 depth 를 이 dataset 의 아무 성공한 run 에 붙여도
+  같은 artifact 가 나온다. 따라서 **Phase 1A 에서는 `geometry_accuracy` 에 도달할 수 없고**
+  `--diagnostic` 로만 수치를 낸다. `minegs_render` 는 Phase 1B renderer 가 run id·dataset hash·
+  depth 별 digest 를 함께 낼 때 쓰는 값이며, gate 는 지금 써 둔다 — 나중에 검사를 추가해서가
+  아니라 증거를 만들어서 여는 구조다.
+* **Fail closed**: run 이 `succeeded` 가 아니거나 `dataset_id`/`dataset_hash` 가 다르거나
+  `frame_of_outputs != LOCAL_METRIC` 이면 거부. 카메라 view 수 ≠ depth map 수 이면 거부
+  (조용히 빠진 view = completeness·단면·체적의 계통 구멍). camera view 에 해당하지 않는
+  depth map 이 섞여 있어도 거부한다. depth 해상도가 camera intrinsics 해상도와 다르면 거부한다 —
+  full-resolution `fx,fy,cx,cy` 로 half-resolution grid 를 역투영하면 모든 ray 가 조용히 휘고,
+  surface·record·평가가 전부 성공한 채로 기하만 틀린다. publish 는
+  `.<name>.minegs-partial` → rename 으로 원자적이다.
+* **Geometry gate**
+
+  | 입력 | `--diagnostic` 없이 | `--diagnostic` |
+  |---|---|---|
+  | 원시 PLY | `ContractError` (exit 2) — "Gaussian centres are not surfaces" | 경고 + `geometry_diagnostic` |
+  | surface artifact, `external_unverified` | `ContractError` (exit 2) — depth 가 run 과 묶여 있지 않음 | 경고 + `geometry_diagnostic` |
+  | surface artifact, `minegs_render` | `geometry_accuracy` | `geometry_accuracy` |
+
+* **구조적 검증만**: `tests/test_surface.py` T1–T10 (평면 역투영 · 무효 depth 필터 · 누락 실패 ·
+  artifact publication · dataset/run mismatch · claim 경로의 원시 PLY 거부 · diagnostic 유지 ·
+  실제 builder artifact 의 evaluator 도달과 claim demotion · record ≠ surface (digest 검증) ·
+  depth 해상도 불일치). GPU 도, 렌더된 depth 도, 실측 데이터도 쓰지 않는다.
+* **알려진 한계**: record 는 생산자의 선언이다. `point_sha256` 은 "이 record 는 저 바이트에 대한
+  것" 을 보장하지만, 손으로 `depth_source: minegs_render` 를 적고 digest 까지 맞춘 파일을 막지는
+  못한다. 이 경계는 사고를 막기 위한 것이고, 서명이 아니다.
+
+#### Phase 1B — trained run → rendered metric depth (미구현)
+
+`render_depths(run_dir, dataset_dir, out_dir)` 는 `NotYetImplementedError` 다. 학습된 run 의
+backend(gsplat rasterizer) 로 train/test view 마다 metric depth 를 렌더링하는 경로이며 GPU 가
+필요하다. TSDF(`eval/surface/tsdf.py`) 와 mesh 재구성도 미구현이고, Open3D 는 CI 의존성이 아니다.
+
+Phase 1A 는 **artifact 경계**를 닫았을 뿐이다. 3DGS 형상이 정확하다거나 surface 가 과학적으로
+검증되었다는 주장은 하지 않는다.
+
 **이 Phase 에서 갚을 기술 부채**: 현재 `integrate_sections` 는 invalid section 을 제거한 뒤
 양쪽 valid section 사이를 그대로 사다리꼴 적분한다. 큰 결측 구간을 가로질러 적분하면 체적이
 과대·과소 평가된다. 수정 방향 — 연속된 valid segment 별로만 적분, coverage fraction 기록,
@@ -589,7 +648,12 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | `--profile heavy` 실행 | `ContractError` — depth_loss 때문에 | 위와 동일 | Phase 4 |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
-| surface 추출(depth 렌더·TSDF) | `NotYetImplementedError` | 미구현 | Phase 1 |
+| 학습된 run 에서 depth 렌더(`render_depths`)·TSDF | `NotYetImplementedError` | 미구현 | Phase 1B |
+| claim 을 담는 `eval geometry` 에 원시 PLY | `ContractError` (exit 2) | 가우시안 중심은 표면이 아니다 (§1A) | 해당 없음 (설계) |
+| claim 을 담는 `eval geometry` 에 `external_unverified` surface | `ContractError` (exit 2) | 외부 depth 는 기록된 run 과 묶여 있지 않다 | Phase 1B (`minegs_render`) |
+| surface.json 과 내용이 다른 `point_file` | `ContractError` (exit 2) | record 는 surface 가 아니다 | 해당 없음 (설계) |
+| camera 해상도와 다른 depth map | `ContractError` (exit 2) | intrinsics 불일치는 조용히 기하를 틀리게 한다 | 해당 없음 (설계) |
+| 카메라 view 보다 적은 depth map 으로 surface 생성 | `ContractError` (exit 2) | 조용한 구멍은 미복원 형상과 구별되지 않는다 | 해당 없음 (설계) |
 | 매핑 없는 `E57Embedded` 파노라마 | `ContractError` | station↔panorama 추론은 증거가 필요하다 | 해당 없음 (설계) |
 | index/개수/파일명/유사도 기반 station↔image 매핑 | 매핑을 만들지 않음 — `unmapped` | 틀린 매핑은 학습·수렴까지 되고 결과만 무의미하다 | 해당 없음 (설계) |
 | 하나의 GUID 를 두 scan 이 선언 | `ambiguous` (first match 아님) | 근거가 target 을 특정하지 못한다 | 해당 없음 (설계) |
