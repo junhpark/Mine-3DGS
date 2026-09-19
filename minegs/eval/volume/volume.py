@@ -27,6 +27,9 @@ from minegs.eval.volume.coverage import (
 class VolumeReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     method: str = "integrate_sections"
+    #: The *envelope* of the integrated segments, not the integrated span: with two holdout
+    #: ranges or a gap, ``end - start`` is longer than what was measured. The integrated length
+    #: is ``coverage.covered_length_m``; the spans are ``coverage.integrated_intervals_m``.
     start_chainage_m: float
     end_chainage_m: float
     section_interval_m: float
@@ -34,6 +37,10 @@ class VolumeReport(BaseModel):
     missing_section_count: int
     reference_axis: str  # e.g. "centerline:design:raw/centerline.csv"
     volume_m3: float
+    #: Length-weighted over the integrated span, so ``mean_area_m2 * coverage.covered_length_m``
+    #: is ``volume_m3`` exactly. The unweighted mean of the station areas does not reproduce the
+    #: volume, and a reader who multiplies it by the chainage envelope gets a number for tunnel
+    #: that was never integrated.
     mean_area_m2: float
     missing_chainages_m: list[float] = Field(default_factory=list)
     frame: str = "TLS_GLOBAL"
@@ -85,8 +92,7 @@ def integrate_sections(
     path. Passing ``None`` integrates the series' own span, which is the diagnostic case.
     """
     segments, coverage = _integrate(series, ranges)
-    n = sum(g.section_count for g in segments)
-    area_sum = sum(g.mean_area_m2 * g.section_count for g in segments)
+    volume = float(sum(g.volume_m3 for g in segments))
     return VolumeReport(
         start_chainage_m=segments[0].start_chainage_m,
         end_chainage_m=segments[-1].end_chainage_m,
@@ -94,8 +100,8 @@ def integrate_sections(
         valid_section_count=coverage.valid_section_count,
         missing_section_count=coverage.missing_section_count,
         reference_axis=reference_axis,
-        volume_m3=float(sum(g.volume_m3 for g in segments)),
-        mean_area_m2=float(area_sum / n),
+        volume_m3=volume,
+        mean_area_m2=volume / coverage.covered_length_m,
         missing_chainages_m=list(coverage.missing_chainages_m),
         frame=frame,
         coverage=coverage,

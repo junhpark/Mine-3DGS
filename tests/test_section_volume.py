@@ -707,3 +707,61 @@ def test_a_holdout_with_no_two_consecutive_sections_reaches_the_coverage_refusal
     assert r.exit_code == 2, r.output
     assert "volume_accuracy is a claim about the whole declared holdout" in flat(r)
     assert "20-26 m" in flat(r)
+
+
+def test_a_coarse_station_grid_reports_how_little_of_the_span_it_sampled(chain, tmp_path):
+    """Coverage is a statement about the station grid, and the grid is the caller's choice.
+
+    Two stations 6 m apart integrate the 6 m between them completely — by the trapezoid rule,
+    which is ordinary practice — so a hole that no station lands in is invisible to
+    ``coverage_fraction``. Here the gappy surface has an unobserved band at 23-25 m that the 1 m
+    grid refuses on and a 6 m grid pinned to the holdout ends does not see. What stops that from
+    reading as a dense measurement is ``sampled_fraction``, reported on the claim, and the
+    section parameters travelling into the report.
+
+    Gated, it would need a minimum section resolution — the same kind of number the product
+    owner ruled out for coverage until real data justifies one. So this test pins the behaviour
+    rather than asserting a refusal: it is a known, reported limitation, not a silent one.
+    """
+    fine, coarse = tmp_path / "fine.json", tmp_path / "coarse.json"
+    out = tmp_path / "v.json"
+    args = {"thickness_m": 0.5, "angle_bins": 72, "start_m": HOLDOUT[0], "end_m": HOLDOUT[1]}
+    cut(chain.gappy, chain.dataset_dir, fine, interval_m=1, **args)
+    assert runner.invoke(app, volume_argv(fine, chain.dataset_dir)).exit_code == 2
+
+    cut(chain.gappy, chain.dataset_dir, coarse, interval_m=6, **args)
+    r = runner.invoke(app, volume_argv(coarse, chain.dataset_dir, out))
+    assert r.exit_code == 0, r.output
+    vol = volume_json(out)
+    assert vol["claim"] == "volume_accuracy"
+    assert vol["coverage"]["coverage_fraction"] == pytest.approx(1.0)
+    # ...and the report says what it rests on: two 0.5 m slabs across 6 m of holdout
+    assert vol["coverage"]["sampled_fraction"] < 0.1
+    assert vol["coverage"]["sampled_length_m"] == pytest.approx(0.5)
+    assert vol["section_parameters"]["interval_m"] == 6.0
+    assert "sampled 0.50 m of that (8.3%)" in flat(r)
+
+
+def test_sampled_length_is_the_union_of_the_integrated_slabs():
+    ser = _series([10.0, 10.0, 10.0], interval_m=1.0)
+    ser.thickness_m = 0.5
+    cov = summarise_coverage(ser, integration_segments(ser), None)
+    assert cov.covered_length_m == pytest.approx(2.0)
+    # slabs [-0.25,0.25], [0.75,1.25], [1.75,2.25] clipped to [0,2] -> 0.25 + 0.5 + 0.25
+    assert cov.sampled_length_m == pytest.approx(1.0)
+    assert cov.sampled_fraction == pytest.approx(0.5)
+
+    ser.thickness_m = 4.0  # slabs wider than the span: sampled is clipped, never > covered
+    cov = summarise_coverage(ser, integration_segments(ser), None)
+    assert cov.sampled_length_m == pytest.approx(2.0) and cov.sampled_fraction == pytest.approx(1.0)
+
+
+def test_the_headline_numbers_are_self_consistent_across_a_gap():
+    """mean_area x covered_length is the volume; mean_area x (end - start) is not, and the
+    report says so rather than letting a reader multiply the envelope."""
+    rep = integrate_sections(_series([10.0, 10.0, None, 10.0, 10.0]), "x")
+
+    assert rep.start_chainage_m == 0.0 and rep.end_chainage_m == 4.0  # the envelope
+    assert rep.coverage.covered_length_m == pytest.approx(2.0)  # what was integrated
+    assert rep.mean_area_m2 * rep.coverage.covered_length_m == pytest.approx(rep.volume_m3)
+    assert rep.mean_area_m2 * (rep.end_chainage_m - rep.start_chainage_m) > rep.volume_m3

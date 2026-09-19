@@ -590,6 +590,13 @@ def volume(
             f"({cov.coverage_fraction * 100:.1f}%) in {len(rep.segments)} segment(s); "
             f"gaps: {cov.describe_gaps()}"
         )
+        # Coverage is about the station grid, which the caller chose. This says how much of the
+        # integrated span the slabs actually looked at, so a coarse grid cannot read as a dense
+        # measurement. Reported, not gated — see CoverageReport.sampled_fraction.
+        console.print(
+            f"  sampled {cov.sampled_length_m:.2f} m of that ({cov.sampled_fraction * 100:.1f}%) "
+            f"in {ser.interval_m:g} m stations of {ser.thickness_m:g} m slabs"
+        )
         result = {"volume": rep}
         if design_radius_m:
             dc = compare_to_design(ser, design_radius_m, ranges=ranges)

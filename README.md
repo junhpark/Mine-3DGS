@@ -468,11 +468,23 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
 * `integrate_sections` · `compare_to_design` · `diff_sections` 가 모두 같은 helper
   (`eval/volume/coverage.py`)를 쓴다. 셋이 "어느 구간이 관측되었는가" 에 대해 갈라지지 않는다.
 * `VolumeReport` 에 `coverage{requested_intervals_m, integrated_intervals_m, missing_intervals_m,
-  requested_length_m, covered_length_m, coverage_fraction, valid/missing_section_count,
-  missing_chainages_m}` 와 `segments[]` 가 실린다. `volume_m3` 는 segment 합과 정확히 같다.
+  requested_length_m, covered_length_m, coverage_fraction, sampled_length_m, sampled_fraction,
+  valid/missing_section_count, missing_chainages_m}` 와 `segments[]`, `section_parameters`,
+  `source` 가 실린다. `volume_m3` 는 segment 합과 정확히 같고, `mean_area_m2` 는 적분 구간
+  길이 가중 평균이라 `mean_area_m2 × covered_length_m == volume_m3` 이다.
+  `start/end_chainage_m` 은 적분 구간의 **외곽** 이지 적분된 길이가 아니다 (구간이 둘이면
+  그 사이는 포함되지 않는다).
 * **임의 임계값을 만들지 않는다.** 이 PR 은 80 %/90 % 같은 coverage threshold 를 도입하지
   않는다. claim 은 "요청한 holdout 을 전부 적분할 수 있어야 한다" 로 두고, 실측 검증으로 허용
   가능한 최소 coverage 가 정해지면 그때 별도 결정으로 완화한다.
+* **coverage 는 station 격자에 대한 진술이고, 격자는 사용자가 고른다.** 6 m 떨어진 두 station
+  은 그 사이 6 m 를 사다리꼴 규칙으로 완전히 적분한다 — 통상적인 관행이다 — 그래서 어느
+  station 도 걸리지 않는 구멍은 `coverage_fraction` 에 보이지 않는다. 대신
+  `sampled_length_m` / `sampled_fraction` 에 보인다: 적분된 구간 중 슬랩이 실제로 들여다본
+  길이의 비율이다. 위 예시에서 1 m 격자는 거부되고 6 m 격자는 통과하지만, 통과한 쪽은
+  `sampled 0.50 m of that (8.3%)` 로 보고된다. **게이트가 아니라 읽을 수 있는 수치다** —
+  claim 에 필요한 최소 해상도는 최소 coverage 와 같은 성격의 미결 결정이고, 여기서 숫자를
+  지어내지 않는다. `section_parameters` 가 volume.json 에 함께 실리는 이유이기도 하다.
 
 ### 알려진 한계
 

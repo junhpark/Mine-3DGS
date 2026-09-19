@@ -126,6 +126,17 @@ class CoverageReport(_Strict):
     #: Stations inside the requested span whose section is invalid. Kept alongside the intervals
     #: because a reader chasing one bad station wants the station, not the span it sits in.
     missing_chainages_m: list[float] = Field(default_factory=list)
+    #: How much of the integrated span the slabs actually looked at: the union of
+    #: ``[s ± thickness/2]`` over the stations that were integrated, clipped to the request.
+    #:
+    #: Coverage is a statement about the *station grid*, and the grid is the caller's choice.
+    #: Two stations 6 m apart with a 0.5 m slab cover the 6 m between them completely — by the
+    #: trapezoid rule, which is ordinary practice — while 8 % of it was ever sampled. A hole
+    #: no station lands in is invisible to ``coverage_fraction`` and visible here. This is a
+    #: number to read, not a gate: what minimum resolution a claim needs is the same open
+    #: decision as what minimum coverage it needs, and neither is invented here.
+    sampled_length_m: float = 0.0
+    sampled_fraction: float = 0.0
 
     @property
     def complete(self) -> bool:
@@ -280,6 +291,7 @@ def summarise_coverage(
     )
     missing = subtract_intervals(requested, covered)
     req_len, cov_len = total_length(requested), total_length(covered)
+    sampled = _sampled_within(s, covered, float(series.thickness_m))
     inside = np.zeros(len(s), bool)
     for lo, hi in requested:
         inside |= (s >= lo - EPS_M) & (s <= hi + EPS_M)
@@ -296,4 +308,19 @@ def summarise_coverage(
         valid_section_count=int(observed.sum()),
         missing_section_count=int((inside & ~observed).sum()),
         missing_chainages_m=[float(v) for v in s[inside & ~observed]],
+        sampled_length_m=sampled,
+        sampled_fraction=(sampled / cov_len) if cov_len > EPS_M else 0.0,
     )
+
+
+def _sampled_within(s: np.ndarray, covered: list[Interval], thickness_m: float) -> float:
+    """Union length of the slabs of the stations inside *covered*, clipped to it."""
+    if thickness_m <= 0 or not covered:
+        return 0.0
+    half = thickness_m / 2.0
+    slabs = []
+    for lo, hi in covered:
+        for v in s[(s >= lo - EPS_M) & (s <= hi + EPS_M)]:
+            slabs.append((float(v) - half, float(v) + half))
+    inside_only = subtract_intervals(covered, subtract_intervals(covered, merge_intervals(slabs)))
+    return total_length(inside_only)

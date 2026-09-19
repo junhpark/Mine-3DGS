@@ -629,6 +629,16 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   은 "요청한 holdout 을 전부 적분할 수 있어야 한다" 로 두고, 실측 검증으로 허용 가능한 최소
   coverage 가 정해지면 그때 별도 결정으로 완화한다. 1e-9 m 의 epsilon 은 부동소수 표현 오차용
   이지 coverage 허용치가 아니다.
+* **남아 있는 결정 — 최소 section 해상도**: coverage 는 station 격자에 대한 진술이고 격자는
+  사용자가 고른다. `--interval-m 6 --start-m 20 --end-m 26` 처럼 holdout 양 끝에 맞춘 거친
+  격자는, 1 m 격자라면 거부될 4 m 짜리 무관측 구간을 지나쳐 `volume_accuracy` 에 도달한다
+  (`tests/test_section_volume.py::test_a_coarse_station_grid_reports_how_little_of_the_span_it_sampled`
+  가 이 동작을 고정한다). 게이트로 막으려면 최대 section interval 이라는 숫자가 필요한데,
+  그것이 바로 이 directive 가 금지한 종류의 임의 임계값이다. 그래서 막는 대신 드러낸다:
+  `coverage.sampled_length_m` / `sampled_fraction` (적분 구간 중 슬랩이 실제로 들여다본 길이)
+  과 `section_parameters` 가 report 에 실리고, CLI 가 claim 줄 바로 아래에 출력한다. 위 예시는
+  `sampled 0.50 m of that (8.3%)` 로 보고된다. **최소 coverage 와 함께 실측 검증 뒤에 정할
+  미결 결정으로 남긴다** (Phase 1 G2).
 * **fail closed**: dataset id/hash 불일치 · 축 문자열/digest 불일치 · station 격자 불일치 ·
   surface 가 record 와 달라짐 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
   `external_unverified` 로 claim 요청 · holdout 미선언 · holdout coverage 불완전 ·
