@@ -43,6 +43,7 @@ from minegs.eval.surface.models import (
     DepthManifest,
     RenderedDepth,
 )
+from minegs.train.backends.gsplat import PINNED_GSPLAT
 
 DEPTH_DIRNAME = "depth"
 #: Below this accumulated opacity a pixel's ray did not terminate on anything, so it has no
@@ -57,6 +58,10 @@ class DepthRenderer(ABC):
     name: str = "abstract"
     backend: str = "abstract"
 
+    #: The one version of the underlying rasteriser this adapter was written against. Depth
+    #: from any other version was produced by code whose semantics nobody here has checked.
+    pinned_version: str = ""
+
     @abstractmethod
     def version(self) -> str: ...
 
@@ -70,7 +75,7 @@ class DepthRenderer(ABC):
 
     @abstractmethod
     def render(
-        self, checkpoint: Path, cameras: dict, images: dict
+        self, checkpoint: Path, cameras: dict, images: dict, expected_step: int | None = None
     ) -> Iterator[tuple[Any, np.ndarray]]:
         """Yield ``(image, depth)`` per view: (H,W) metres along that camera's +z.
 
@@ -91,6 +96,7 @@ class GsplatDepthRenderer(DepthRenderer):
 
     name = "gsplat-ed"
     backend = "gsplat"
+    pinned_version = PINNED_GSPLAT
 
     def __init__(self, min_alpha: float = DEFAULT_MIN_ALPHA) -> None:
         self.min_alpha = float(min_alpha)
@@ -135,7 +141,7 @@ class GsplatDepthRenderer(DepthRenderer):
         }
 
     def render(
-        self, checkpoint: Path, cameras: dict, images: dict
+        self, checkpoint: Path, cameras: dict, images: dict, expected_step: int | None = None
     ) -> Iterator[tuple[Any, np.ndarray]]:
         import torch
         from gsplat import rasterization
@@ -146,7 +152,7 @@ class GsplatDepthRenderer(DepthRenderer):
         # only tensors, dicts and ints, so every legitimate checkpoint loads under the
         # restricted unpickler and anything that does not is refused rather than executed.
         blob = torch.load(checkpoint, map_location=device, weights_only=True)
-        splats = check_checkpoint_blob(blob, checkpoint)
+        splats = check_checkpoint_blob(blob, checkpoint, expected_step)
         means = splats["means"].to(device)
         quats = splats["quats"].to(device)
         # stored as log-scale and logit-opacity, exactly as the trainer's parameterisation
@@ -190,7 +196,7 @@ class GsplatDepthRenderer(DepthRenderer):
             yield im, depth.cpu().numpy().astype(np.float32)
 
 
-def check_checkpoint_blob(blob: object, checkpoint: Path) -> dict:
+def check_checkpoint_blob(blob: object, checkpoint: Path, expected_step: int | None = None) -> dict:
     """Contract-check a loaded gsplat checkpoint and return its splats.
 
     Split out of ``render`` so it is reachable without CUDA: what a checkpoint file contains is
@@ -212,11 +218,24 @@ def check_checkpoint_blob(blob: object, checkpoint: Path) -> dict:
             "the wrong cameras — every ray slightly misplaced, and nothing downstream able to "
             "tell."
         )
+    # The step the trainer itself stamped inside the file, against the step run.json recorded
+    # from the filename. They are written by the same branch upstream, so a disagreement means
+    # the file at this path is not the checkpoint the run ended on -- renamed, or swapped.
+    if expected_step is not None and blob.get("step") != expected_step:
+        raise ContractError(
+            f"{checkpoint}: the checkpoint records step {blob.get('step')!r}, but run.json says "
+            f"the run ended at {expected_step}. This is not the checkpoint the run recorded."
+        )
     splats = blob["splats"]
     missing = sorted({"means", "quats", "scales", "opacities"} - set(splats))
     if missing:
         raise ContractError(f"{checkpoint}: checkpoint splats are missing {missing}")
     return splats
+
+
+def pinned_renderer_version(name: str) -> str | None:
+    """The rasteriser version the named renderer was written against, or ``None`` if unknown."""
+    return {GsplatDepthRenderer.name: GsplatDepthRenderer.pinned_version}.get(name)
 
 
 def known_renderer_names() -> frozenset[str]:
@@ -359,6 +378,41 @@ def _require_renderable_cameras(cameras: dict, dataset_dir: Path) -> None:
         )
 
 
+def require_images_match_cameras(dataset_dir: Path, cameras: dict, images: dict) -> None:
+    """The dataset's images must be the size its intrinsics describe.
+
+    ``fx, fy, cx, cy`` are pixel quantities. If ``sparse/0`` says 4096x4096 and ``images/``
+    holds 2048x2048, the intrinsics do not describe those images: the model was trained on one
+    thing and depth would be rendered for another, at the camera's resolution, with every ray
+    off. Nothing else notices — the depth matches the camera, the manifest verifies, the
+    surface promotes. Only the header is read, not the pixels.
+    """
+    from PIL import Image as PILImage
+    from PIL import UnidentifiedImageError
+
+    bad: list[str] = []
+    for im in images.values():
+        cam = cameras[im.camera_id]
+        f = dataset_dir / "images" / im.name
+        if not f.is_file():
+            raise ContractError(f"{f}: image named by sparse/0 is missing from the dataset")
+        try:
+            with PILImage.open(f) as handle:
+                width, height = handle.size
+        except (OSError, UnidentifiedImageError) as e:
+            raise ContractError(f"{f}: cannot read the image size ({e})") from e
+        if (width, height) != (cam.width, cam.height):
+            bad.append(
+                f"{im.name} is {width}x{height} but camera {cam.id} is {cam.width}x{cam.height}"
+            )
+    if bad:
+        raise ContractError(
+            f"{dataset_dir}: {len(bad)} image(s) do not match the intrinsics that describe "
+            f"them — {bad[:4]}{' ...' if len(bad) > 4 else ''}. Depth rendered at the camera's "
+            "resolution would not be the view this model was trained on."
+        )
+
+
 def require_metric_outputs(record) -> None:
     """Refuse a run whose backend frame is not LOCAL_METRIC one-to-one.
 
@@ -480,6 +534,7 @@ def render_depths(
         raise ContractError(f"{dataset_dir}/sparse/0: images reference unknown cameras {unknown}")
     require_unique_stems(model.images)
     _require_renderable_cameras(model.cameras, dataset_dir)
+    require_images_match_cameras(dataset_dir, model.cameras, model.images)
     dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
 
     record = check_run(run_dir, manifest_ds.dataset_id, dataset_hash)
@@ -503,7 +558,9 @@ def render_depths(
     entries: list[RenderedDepth] = []
     seen: set[str] = set()
     with staged_dir(out) as tmp:
-        for image, depth in renderer.render(ckpt, model.cameras, model.images):
+        for image, depth in renderer.render(
+            ckpt, model.cameras, model.images, record.checkpoint_step
+        ):
             if image.name not in expected:
                 raise ContractError(
                     f"{image.name}: renderer produced a view the dataset does not have"
@@ -589,7 +646,9 @@ __all__ = [
     "check_checkpoint_blob",
     "get_depth_renderer",
     "known_renderer_names",
+    "pinned_renderer_version",
     "render_depths",
+    "require_images_match_cameras",
     "require_metric_outputs",
     "require_reproducible_render",
 ]

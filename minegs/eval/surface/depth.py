@@ -106,6 +106,13 @@ def check_depth_shape(depth: np.ndarray, camera, name: str) -> None:
     surface is quietly wrong, and the artifact, the record and the evaluation all succeed. Any
     rescaling has to adjust K, so this refuses rather than guessing which of the two is right.
     """
+    # ndim first, and separately: the message below indexes shape[1], so a 1-D array used to
+    # raise IndexError from inside the refusal itself -- a crash where a contract error belongs.
+    if depth.ndim != 2:
+        raise ContractError(
+            f"{name}: depth map is {depth.ndim}-D with shape {tuple(depth.shape)}; a depth map "
+            "is a 2-D (height, width) array of metres along camera +z"
+        )
     expected = (camera.height, camera.width)
     if depth.shape != expected:
         raise ContractError(

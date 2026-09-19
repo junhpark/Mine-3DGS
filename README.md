@@ -361,6 +361,11 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
   계약 검사 *전에* pickle 이 코드를 실행하게 두지 않는다.
 * **왜곡 있는 camera model 도 거부한다**: rasterizer 는 pinhole 로 투영하므로 `SIMPLE_RADIAL`
   등은 왜곡이 조용히 빠진 채 모든 ray 가 틀어진다. `PINHOLE`/`SIMPLE_PINHOLE` 만 지원.
+* **image 실측 크기와 intrinsics 크기가 다르면 거부한다**: `fx,fy,cx,cy` 는 픽셀 값이므로
+  `sparse/0` 와 `images/` 의 해상도가 다르면 그 intrinsics 는 그 이미지를 기술하지 않는다.
+* **rasteriser 버전도 증거다**: manifest 의 `renderer.version` 이 `PINNED_GSPLAT` 과 다르면
+  (`"not installed"` 포함) 승격하지 않는다. manifest 의 `backend` 도 run 의 것과 대조한다.
+* **checkpoint 내부 `step`** 도 run.json 의 `checkpoint_step` 과 대조한다.
 * **fail closed**: run != succeeded · dataset id/hash 불일치 · checkpoint 없음/경로 깨짐 ·
   `T_local_from_internal` 이 항등이 아님(= backend 단위가 미터라고 보장 못 함) · backend 가
   `depth_render` 미선언 · 지원하지 않는 backend · CUDA 없음 · torch/gsplat 없음 · view 누락/중복/

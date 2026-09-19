@@ -543,6 +543,16 @@ scientific validation remain pending.**
   함께 `geometry_diagnostic` 으로 강등한다.
 * **camera model**: `RENDERABLE_CAMERA_MODELS = {PINHOLE, SIMPLE_PINHOLE}`. 왜곡 모델은
   pinhole 로 투영되어 모든 ray 가 조용히 틀어지므로 거부한다.
+* **image 실측 크기 = intrinsics 크기**: `fx,fy,cx,cy` 는 픽셀 단위 값이므로 `sparse/0` 가
+  4096x4096 이라 하는데 `images/` 가 2048x2048 이면 그 intrinsics 는 그 이미지를 기술하지
+  않는다. render-depth 진입 시 헤더만 읽어 대조하고 불일치면 거부한다.
+* **rasteriser 버전도 증거의 일부**: manifest 의 `renderer.version` 이 이 빌드가 pin 한
+  `PINNED_GSPLAT` 과 다르면 (`"not installed"` 포함) 승격하지 않는다. gsplat 의 투영·합성은
+  릴리스 간 고정이 아니고, 그 equivalence 를 측정한 적이 없다 — `antialiased` 를 거부하는 것과
+  같은 논리다. manifest 의 `backend` 도 run 의 것과 일치해야 한다.
+* **checkpoint 내부 step**: `check_checkpoint_blob` 이 blob 의 `step` 을 run.json 의
+  `checkpoint_step` 과 대조한다. 둘은 upstream 에서 같은 분기가 쓰므로, 불일치는 그 경로의
+  파일이 run 이 기록한 checkpoint 가 아니라는 뜻이다.
 * **fail closed, CPU fallback 없음**: run != succeeded · dataset id/hash 불일치 · checkpoint
   미기록/부재 · `T_local_from_internal` 비항등 · backend 가 `depth_render` 미선언 · 지원하지 않는
   backend · torch/gsplat 부재 · CUDA 부재 · view 누락/중복/유령 · image stem 충돌 · 해상도
@@ -732,6 +742,10 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | 검증에 실패하는 depth manifest | `ContractError` (exit 2) | 강등이 아니라 거부 — 무언가 움직였다는 신호다 | 해당 없음 (설계) |
 | `pose_opt`/`antialiased` run 의 depth 렌더 | `ContractError` (exit 2) | renderer 가 재현하지 않는 설정이다 — equivalence 미검증 재현은 증거가 아니다 | pose 복원·mode 재현을 실제로 검증한 뒤 |
 | 왜곡 camera model 의 depth 렌더 | `ContractError` (exit 2) | pinhole 로 투영되어 모든 ray 가 조용히 틀어진다 | 해당 없음 (설계) |
+| intrinsics 와 크기가 다른 image | `ContractError` (exit 2) | intrinsics 가 그 이미지를 기술하지 않는다 | 해당 없음 (설계) |
+| pin 되지 않은 rasteriser 버전의 depth | `ContractError` (exit 2) | 릴리스 간 렌더 semantics 가 보장되지 않는다 | 해당 버전의 equivalence 를 측정한 뒤 |
+| blob 의 step 이 run 의 step 과 다른 checkpoint | `ContractError` (exit 2) | 그 경로의 파일이 run 이 기록한 checkpoint 가 아니다 | 해당 없음 (설계) |
+| 2-D 가 아닌 depth `.npy` | `ContractError` (exit 2) | depth map 은 (H, W) 배열이다 | 해당 없음 (설계) |
 | manifest 의 `file` 이 naming contract 와 다름 | `ContractError` (exit 2) | 검사한 파일과 역투영할 파일이 달라진다 | 해당 없음 (설계) |
 | reasoned about 하지 않은 `backend_args` 키의 depth 렌더 | `ContractError` (exit 2) | trainer 에 그대로 전달되는 옵션이 투영/frustum 을 바꿀 수 있다 | 해당 항목이 neutral 임을 보인 뒤 |
 | `--no-holdout-only` 에 `geometry_accuracy` | claim 을 `geometry_diagnostic` 으로 강등 + 경고 | 학습에 쓴 형상을 다시 재는 수치다 | 해당 없음 (설계) |

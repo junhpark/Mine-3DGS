@@ -79,8 +79,9 @@ class FakeRenderer(DepthRenderer):
     def settings(self) -> dict:
         return {"render_mode": "ED", "min_alpha": 0.5}
 
-    def render(self, checkpoint, cameras, images):
+    def render(self, checkpoint, cameras, images, expected_step=None):
         self.checkpoint = checkpoint
+        self.expected_step = expected_step
         for im in images.values():
             if im.name in self.skip:
                 continue
@@ -117,6 +118,12 @@ class StandInRenderer(FakeRenderer):
     """
 
     name = GsplatDepthRenderer.name
+    pinned_version = GsplatDepthRenderer.pinned_version
+
+    def version(self) -> str:
+        # Stands in for the pinned rasteriser, which is the substitution being made: promotion
+        # requires the recorded version to be the one this build pins.
+        return GsplatDepthRenderer.pinned_version
 
 
 def make_run(dataset_dir: Path, run_dir: Path, run_id: str = "run_1b", **over):
@@ -660,3 +667,77 @@ def test_compare_clouds_reports_no_samples_rather_than_raising(rng):
     rep = compare_clouds(rng.random((32, 3)), np.empty((0, 3)), 1.0)
     assert rep.completeness.n == 0
     assert all(v != v for v in rep.completeness.ratio_within_tau.values())  # NaN
+
+
+# ------------------------------------------------- version and dimension trust gates
+
+
+def test_depth_from_an_unpinned_rasteriser_version_does_not_promote(env, tmp_path):
+    """gsplat's projection is not frozen across releases; an unpinned version is not evidence."""
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
+    where = depth_dir / DEPTH_MANIFEST_FILE
+
+    for version in ("1.4.0", "not installed", None):
+        manifest = DepthManifest.load(where)
+        manifest.renderer = {**manifest.renderer, "version": version}
+        manifest.save(where)
+        with pytest.raises(ContractError, match="pins"):
+            build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / f"s{version}")
+
+    # and the pinned one still promotes
+    manifest = DepthManifest.load(where)
+    manifest.renderer = {**manifest.renderer, "version": GsplatDepthRenderer.pinned_version}
+    manifest.save(where)
+    rec, _ = build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "ok")
+    assert rec.depth_source == "minegs_render"
+
+
+def test_a_manifest_attributed_to_another_backend_does_not_promote(env, tmp_path):
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
+    where = depth_dir / DEPTH_MANIFEST_FILE
+    manifest = DepthManifest.load(where)
+    manifest.backend = {"name": "gsplat", "version": "9.9.9"}
+    manifest.save(where)
+
+    with pytest.raises(ContractError, match="attributed to backend"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")
+
+
+def test_the_checkpoints_own_step_must_be_the_runs(tmp_path):
+    """run.json's step comes from the filename; the blob's comes from the trainer."""
+    ckpt = tmp_path / "ckpt_6999_rank0.pt"
+    blob = {"step": 6999, "splats": _SPLATS}
+    assert check_checkpoint_blob(blob, ckpt, 6999) is _SPLATS
+
+    with pytest.raises(ContractError, match="records step 3000"):
+        check_checkpoint_blob({"step": 3000, "splats": _SPLATS}, ckpt, 6999)
+    with pytest.raises(ContractError, match="records step None"):
+        check_checkpoint_blob({"splats": _SPLATS}, ckpt, 6999)
+
+
+def test_images_that_do_not_match_their_intrinsics_are_refused(dataset_small, tmp_path):
+    """fx, fy, cx, cy are pixel quantities: half-size images make every ray wrong."""
+    from PIL import Image as PILImage
+
+    ds = tmp_path / "ds"
+    shutil.copytree(dataset_small.dataset_dir, ds)
+    victim = sorted((ds / "images").glob("*"))[0]
+    with PILImage.open(victim) as handle:
+        handle.resize((handle.width // 2, handle.height // 2)).save(victim)
+
+    run_dir = tmp_path / "runs" / "dims"
+    make_run(dataset_small.dataset_dir, run_dir, run_id="dims")
+    with pytest.raises(ContractError, match="do not match the intrinsics"):
+        render_depths(run_dir, ds, tmp_path / "d", renderer=StandInRenderer())
+    assert not (tmp_path / "d").exists()
+
+
+def test_a_one_dimensional_depth_map_is_refused_cleanly(env, tmp_path):
+    """It used to raise IndexError from inside the refusal message itself."""
+    _, depth_dir = render_depths(env.run_dir, env.dataset_dir, env.out, renderer=StandInRenderer())
+    (depth_dir / DEPTH_MANIFEST_FILE).unlink()  # external depth: the fuse path, not the render
+    victim = sorted(depth_dir.glob("*.npy"))[0]
+    np.save(victim, np.zeros(100, np.float32))
+
+    with pytest.raises(ContractError, match="1-D with shape"):
+        build_depth_surface(depth_dir, env.dataset_dir, env.run_dir, tmp_path / "surface")

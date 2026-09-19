@@ -392,7 +392,7 @@ def _verify_renderer_and_staging(manifest: DepthManifest, where: Path, run) -> N
     testing, and says nothing about minegs having rendered anything. ``staged`` must still match
     the run, so a manifest cannot describe a full-dataset run while the record says a subset.
     """
-    from minegs.eval.surface.render import known_renderer_names
+    from minegs.eval.surface.render import known_renderer_names, pinned_renderer_version
 
     name = (manifest.renderer or {}).get("name")
     known = known_renderer_names()
@@ -401,6 +401,26 @@ def _verify_renderer_and_staging(manifest: DepthManifest, where: Path, run) -> N
             f"{where}: depth was produced by renderer {name!r}, which this build does not ship "
             f"(known: {sorted(known)}). A manifest from an unknown renderer is not evidence "
             "that minegs rendered the depth."
+        )
+    # The rasteriser's own version, not just its name. gsplat's projection and compositing are
+    # not frozen across releases, so depth from an unpinned version was produced by code whose
+    # equivalence to the pinned one nobody here has measured -- the same argument that refuses
+    # `antialiased`. "not installed" lands here too, which is right: a renderer that could not
+    # import its rasteriser did not render this.
+    pinned = pinned_renderer_version(name)
+    version = (manifest.renderer or {}).get("version")
+    if pinned is not None and version != pinned:
+        raise ContractError(
+            f"{where}: depth was rendered by {name} on rasteriser version {version!r}, but this "
+            f"build pins {pinned!r}. Rendering semantics are not guaranteed across versions, so "
+            "depth from another one is not evidence for a claim."
+        )
+    # The training backend the manifest names must be the one the run recorded: a manifest
+    # carrying a different backend or version describes weights produced by other code.
+    if dict(manifest.backend or {}) != dict(run.backend or {}):
+        raise ContractError(
+            f"{where}: depth is attributed to backend {dict(manifest.backend or {})}, but run "
+            f"{run.run_id} was trained by {dict(run.backend or {})}"
         )
     recorded = manifest.staged or {}
     actual = {k: v for k, v in (run.staged or {}).items() if k in recorded}
