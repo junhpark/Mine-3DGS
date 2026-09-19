@@ -11,7 +11,17 @@ from minegs.core.errors import ContractError
 from minegs.eval.sections.models import SectionRecord, SectionSource, reference_axis_of
 from minegs.eval.sections.sections import extract_sections
 
-__all__ = ["build_section_record", "section_source"]
+__all__ = [
+    "build_section_record",
+    "reproducibility_refusal",
+    "require_reproducible_sections",
+    "section_source",
+]
+
+#: Relative slack when re-cutting a series and comparing it to the recorded one. The cut is
+#: deterministic given the same points, axis and parameters, so this absorbs float
+#: representation between builds and nothing else. It is not a tolerance on geometry.
+_RTOL = 1e-9
 
 
 def section_source(surface, path: str | Path) -> SectionSource:
@@ -106,4 +116,101 @@ def build_section_record(
             parameters,
             parents=[p for p in (manifest.dataset_id, source.surface_id, source.run_id) if p],
         ),
+    )
+
+
+def require_reproducible_sections(rec: SectionRecord, manifest, centerline) -> None:
+    """``reproducibility_refusal`` as an assertion, for callers that are not the CLI."""
+    reason = reproducibility_refusal(rec, manifest, centerline)
+    if reason is not None:
+        raise ContractError(reason)
+
+
+def reproducibility_refusal(rec: SectionRecord, manifest, centerline) -> str | None:
+    """Why these sections cannot carry a claim, or ``None`` if they can. Claim path only.
+
+    Everything else in ``check_section_record`` ties the record to the right dataset, the right
+    axis and the right surface. None of it says the *areas* came from that surface: the series
+    lives inside the record, so editing ``area_m2`` in the JSON — or flipping an invalid station
+    to a plausible number and closing a gap with it — leaves every identity check satisfied.
+
+    A claim is not a declaration, so here the numbers are re-derived. The surface points are
+    verified against their own record (``check_surface``), hopped into TLS_GLOBAL and cut again
+    with the parameters the record names; the result must be the series the record carries.
+
+    Only on the claim path. It costs a full re-extraction, and a diagnostic number is allowed to
+    be its producer's word — that is most of what "diagnostic" means. And only while the surface
+    is still there: a claim whose evidence has been archived is a claim nothing can check, which
+    is a refusal rather than something to wave through.
+    """
+    from minegs.eval.surface.models import check_surface, find_surface, load_surface
+
+    src = rec.source
+    if src.kind != "surface" or not src.point_path:
+        return f"sections {rec.section_id} were cut from {src.kind}, which cannot carry a claim"
+    path = Path(src.point_path)
+    if find_surface(path) is None:
+        return (
+            f"sections {rec.section_id} name surface {src.surface_id} at {path}, and it is not "
+            "there. A volume_accuracy claim re-cuts the sections from the surface and compares "
+            "them, so without the surface these areas are only this file's own word for them. "
+            "Restore the surface artifact, or pass --diagnostic for non-claim numbers."
+        )
+    surface, points = load_surface(path)
+    pc = check_surface(surface, points, rec.dataset_id, rec.dataset_hash)
+    if pc.frame != "TLS_GLOBAL":
+        pc = pc.transformed(manifest.T_tls_from_local, "TLS_GLOBAL")
+    p = rec.parameters
+    again = extract_sections(
+        pc.xyz,
+        centerline,
+        interval_m=float(rec.series.interval_m),
+        thickness_m=float(rec.series.thickness_m),
+        angle_bins=int(rec.series.angle_bins),
+        start_m=p.get("start_m"),
+        end_m=p.get("end_m"),
+        frame="TLS_GLOBAL",
+    )
+    return _compare_series(rec, again)
+
+
+def _compare_series(rec: SectionRecord, again) -> str | None:
+    where = f"sections {rec.section_id}"
+    if len(again.sections) != len(rec.series.sections):
+        return (
+            f"{where}: re-cutting surface {rec.source.surface_id} gives {len(again.sections)} "
+            f"stations, the record holds {len(rec.series.sections)}"
+        )
+    valid_now = [s.valid for s in again.sections]
+    valid_rec = [s.valid for s in rec.series.sections]
+    if valid_now != valid_rec:
+        flipped = [
+            f"{s.chainage_m:g}"
+            for s, a, b in zip(rec.series.sections, valid_rec, valid_now, strict=True)
+            if a != b
+        ]
+        return (
+            f"{where}: re-cutting surface {rec.source.surface_id} disagrees about which stations "
+            f"are observed at {flipped[:8]}. A station the surface does not support cannot be "
+            "made observed by editing the series."
+        )
+    for name, got, want in (
+        ("area_m2", again.areas(), rec.series.areas()),
+        ("radii_m", _radii(again), _radii(rec.series)),
+    ):
+        if not np.allclose(got, want, rtol=_RTOL, atol=0.0, equal_nan=True):
+            bad = int(np.argmax(~np.isclose(got, want, rtol=_RTOL, atol=0.0, equal_nan=True)))
+            return (
+                f"{where}: re-cutting surface {rec.source.surface_id} does not reproduce this "
+                f"series' {name} (first disagreement at index {bad}: recorded "
+                f"{np.ravel(want)[bad]!r}, re-cut {np.ravel(got)[bad]!r}). These areas were not "
+                "measured from that surface."
+            )
+    return None
+
+
+def _radii(series) -> np.ndarray:
+    return np.array(
+        [[np.nan if v is None else v for v in s.radii_m] for s in series.sections],
+        dtype=np.float64,
     )

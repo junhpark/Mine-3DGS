@@ -420,6 +420,7 @@ parameters · provenance`.
 | `reference_axis_sha256` | 축 CSV 파일 자체의 digest |
 | `series` 의 chainage 격자 | 지금의 centerline 과 기록된 parameters 로 다시 만든 station 격자 |
 | `source.surface_id` · `point_sha256` · `depth_source` | surface artifact 가 아직 디스크에 있다면 그것 (`check_surface` 포함) |
+| (claim 경로만) `series` 의 면적·반경 자체 | 검증된 surface 에서 **다시 잘라** 재현되는가 |
 | `series.frame` | record 의 `frame` (TLS_GLOBAL) |
 
 축 digest 가 따로 필요한 이유: `DATASET_HASH_PATTERNS` 는 dataset 루트의 `centerline.csv` 만
@@ -434,8 +435,25 @@ polyline 위에서는 다른 뜻이 된다.
 2. 입력이 bare series 가 아니라 section artifact 다;
 3. record 가 지금의 dataset·축·surface 와 일치한다 (위 표, 항상 검사);
 4. `source.kind == "surface"` 이고 `depth_source == "minegs_render"` 다;
-5. 적분이 선언된 geometry holdout 구간으로 제한된다;
-6. 그 구간의 coverage 가 완전하다.
+5. **series 를 그 surface 에서 다시 잘라 재현할 수 있다** (아래);
+6. 적분이 선언된 geometry holdout 구간으로 제한된다;
+7. 그 구간의 coverage 가 완전하다.
+
+### 면적은 claim 경로에서 다시 계산된다
+
+identity 검사는 record 를 옳은 dataset·옳은 축·옳은 surface 에 묶지만, **면적이 그 surface 에서
+나왔다는 것은 말하지 않는다** — series 가 record 안에 들어 있으므로 `area_m2` 를 편집하거나,
+invalid station 하나를 그럴듯한 값으로 뒤집어 gap 을 메워도 identity 검사는 전부 통과한다.
+
+그래서 claim 경로에서는 surface 점군을 `check_surface` 로 검증해 읽고, TLS_GLOBAL 로 옮긴 뒤
+record 가 기록한 parameters 로 **다시 자르고** 결과를 대조한다 — station 별 valid 여부, 면적,
+그리고 각도 bin 별 반경까지. 재현 슬랙은 1e-9 상대오차 (부동소수 표현용이지 기하 허용치가
+아니다).
+
+* diagnostic 경로에서는 하지 않는다. 전체 재추출 비용이 들고, diagnostic 수치가 생산자의
+  선언이라는 것이 바로 "diagnostic" 의 뜻이다.
+* surface 가 사라졌으면 claim 은 **거부**한다 (강등이 아니다). 검증할 수 없는 증거 위의 주장은
+  주장이 아니다. `--diagnostic` 은 여전히 동작한다.
 
 | 입력 | `--diagnostic` 없이 | `--diagnostic` |
 |---|---|---|
@@ -488,10 +506,10 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
 
 ### 알려진 한계
 
-* **면적은 생산자의 선언이다.** 다시 계산하려면 점군이 필요한데 volume 평가는 그것을 받지
-  않는다. digest 와 station 격자가 record 를 이 dataset·이 축·이 surface 에 묶지만, 스스로
-  모순 없게 만든 파일은 진짜와 구별되지 않는다. `DepthManifest` 와 같은 경계 — 사고를 막는
-  경계이지 서명이 아니다.
+* **claim 이 아닌 경로의 면적은 생산자의 선언이다.** claim 경로는 surface 에서 다시 잘라
+  대조하지만, diagnostic 수치와 surface 가 사라진 record 는 그렇지 않다. 그리고 재현 대조도
+  서명은 아니다: surface 점군 자체를 바꾸고 record 를 그에 맞춰 다시 만들면 전부 일관된다.
+  `DepthManifest` 와 같은 경계 — 사고를 막는 경계이지 서명이 아니다.
 * `minegs eval change` 는 dataset 을 인자로 받지 않으므로 아무것도 대조하지 않는다. 그래서
   결과는 영구히 `geometry_diagnostic` 이다 (pair protocol 은 Phase 7).
 * `--start-m`/`--end-m` 없이 자른 격자는 축 시작점부터 `interval_m` 간격이다. holdout 경계가

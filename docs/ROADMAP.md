@@ -600,10 +600,18 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
 * **축 digest 가 따로 필요한 이유**: `DATASET_HASH_PATTERNS` 는 dataset 루트의
   `centerline.csv` 만 덮는다. manifest 가 다른 경로를 가리키면 dataset hash 는 축 편집을 보지
   못하고, chainage 는 다른 polyline 위에서 다른 뜻이 된다.
-* **`volume_accuracy` 는 여섯 가지가 동시에 성립할 때만**: protocol 허용 · bare series 가 아닌
+* **`volume_accuracy` 는 일곱 가지가 동시에 성립할 때만**: protocol 허용 · bare series 가 아닌
   section artifact · record 가 지금의 dataset/축/surface 와 일치 · `source.kind == "surface"` 이고
-  `depth_source == "minegs_render"` · 적분이 선언된 holdout 으로 제한됨 · 그 구간의 coverage 가
-  완전함. 하나라도 빠지면 거부하고, `--diagnostic` 이면 `geometry_diagnostic` 으로 계산한다.
+  `depth_source == "minegs_render"` · **series 를 그 surface 에서 다시 잘라 재현 가능** ·
+  적분이 선언된 holdout 으로 제한됨 · 그 구간의 coverage 가 완전함. 하나라도 빠지면 거부하고,
+  `--diagnostic` 이면 `geometry_diagnostic` 으로 계산한다.
+* **면적은 claim 경로에서 다시 계산한다** (`reproducibility_refusal`): identity 검사는 record 를
+  옳은 dataset·축·surface 에 묶지만 면적이 그 surface 에서 나왔다는 것은 말하지 않는다 —
+  series 가 record 안에 있으므로 `area_m2` 편집이나 invalid station 뒤집기는 identity 검사를
+  전부 통과한다. 그래서 surface 점군을 `check_surface` 로 읽어 TLS_GLOBAL 로 옮기고 기록된
+  parameters 로 다시 잘라 station 별 valid·면적·반경을 대조한다 (상대오차 1e-9, 부동소수
+  표현용). diagnostic 경로에서는 하지 않는다: 전체 재추출 비용이 들고, 생산자의 선언이라는
+  것이 diagnostic 의 뜻이다. surface 가 사라졌으면 claim 은 강등이 아니라 거부다.
 * **raw PLY 워크플로는 깨지 않는다**: `eval sections` 는 여전히 PLY 를 받고, `kind="raw_cloud"`
   로 기록하고 경고한다. 금지하는 것은 임의 PLY 가 아니라 임의 PLY 가 scientific claim 으로
   승격되는 경로다. 1C 이전의 bare `SectionSeries` JSON 도 계속 읽히며 diagnostic 전용이다.
@@ -640,14 +648,17 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   `sampled 0.50 m of that (8.3%)` 로 보고된다. **최소 coverage 와 함께 실측 검증 뒤에 정할
   미결 결정으로 남긴다** (Phase 1 G2).
 * **fail closed**: dataset id/hash 불일치 · 축 문자열/digest 불일치 · station 격자 불일치 ·
-  surface 가 record 와 달라짐 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
+  parameters 와 series 불일치 · surface 가 record 와 달라짐 · claim 경로에서 surface 부재 ·
+  재현되지 않는 면적/반경/valid 플래그 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
   `external_unverified` 로 claim 요청 · holdout 미선언 · holdout coverage 불완전 ·
-  중복 chainage · 연속 관측 station 2개 미만 · 축 범위 밖 station 요청.
-* **알려진 한계**: 면적은 생산자의 선언이다. 다시 계산하려면 점군이 필요한데 volume 평가는
-  그것을 받지 않는다. digest 와 station 격자가 record 를 이 dataset·이 축·이 surface 에
-  묶지만, 스스로 모순 없게 만든 파일은 진짜와 구별되지 않는다 — `DepthManifest` 와 같은
-  경계이고, 사고를 막는 경계이지 서명이 아니다. `eval change` 는 dataset 을 받지 않으므로
-  아무것도 대조하지 않고, 그래서 결과가 영구히 `geometry_diagnostic` 이다.
+  중복 chainage · 연속 관측 station 2개 미만 · 축 범위 밖 station 요청 · 면적은 있는데 반경이
+  없는 section · 잘못된 형태의 적분 구간.
+* **알려진 한계**: claim 경로는 면적을 다시 계산하지만 diagnostic 경로는 하지 않고, surface 가
+  사라진 record 도 하지 못한다 (그 경우 claim 자체가 거부된다). 재현 대조도 서명은 아니다:
+  surface 점군 자체를 바꾸고 record 를 그에 맞춰 다시 만들면 전부 일관된다 —
+  `DepthManifest` 와 같은 경계이고, 사고를 막는 경계이지 서명이 아니다. `eval change` 는
+  dataset 을 받지 않으므로 아무것도 대조하지 않고, 그래서 결과가 영구히
+  `geometry_diagnostic` 이다.
 
 구조적 검증만이다 (`tests/test_section_volume.py`). 실제 갱도에서 단면·체적이 정확하다는 주장은
 하지 않는다.
@@ -836,6 +847,8 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | claim 을 담는 `eval volume` 에 `external_unverified` 기반 section | `ContractError` (exit 2) | surface 의 depth 가 run 과 묶여 있지 않다 | 해당 없음 (설계) |
 | holdout coverage 가 불완전한 `volume_accuracy` | `ContractError` (exit 2) | 적분하지 못한 구간의 체적은 측정된 것이 아니다 | 실측 검증으로 최소 coverage 가 정해지면 |
 | dataset/축이 다른 section artifact | `ContractError` (exit 2) | chainage 는 다른 polyline 위에서 다른 뜻이다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
+| surface 에서 다시 잘랐을 때 재현되지 않는 면적/반경 | `ContractError` (exit 2) | 그 면적은 그 surface 에서 측정된 것이 아니다 | 해당 없음 (설계) |
+| claim 경로에서 source surface 부재 | `ContractError` (exit 2) | 검증할 수 없는 증거 위의 주장은 주장이 아니다 (`--diagnostic` 은 동작) | 해당 없음 (설계) |
 | station 격자가 지금의 축에서 재유도되지 않는 section artifact | `ContractError` (exit 2) | 그 시계열은 이 축을 따라 잘린 것이 아니다 | 해당 없음 (설계) |
 | record 를 만든 뒤 내용이 바뀐 source surface | `ContractError` (exit 2) | 디스크에 남아 있으면 믿지 않고 다시 검증한다 | 해당 없음 (설계) |
 | 결측 구간을 가로지르는 체적 적분 | segment 별 적분 + missing interval 보고 | 결측 형상은 결측으로 보고한다, 사다리꼴로 대체하지 않는다 | 해당 없음 (설계) |

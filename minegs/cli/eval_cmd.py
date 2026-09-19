@@ -490,7 +490,12 @@ def volume(
     from minegs.core.errors import ContractError, ProtocolViolation
     from minegs.core.provenance import sha256_tree
     from minegs.eval.protocol import Claim, judge
-    from minegs.eval.sections import check_section_record, load_section_input, reference_axis_of
+    from minegs.eval.sections import (
+        check_section_record,
+        load_section_input,
+        reference_axis_of,
+        reproducibility_refusal,
+    )
     from minegs.eval.volume import compare_to_design, integrate_sections, plan_integration
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
@@ -556,6 +561,18 @@ def volume(
                 "this volume is fit to the data the run saw; reporting as diagnostic[/]"
             )
             claim = Claim.GEOMETRY_DIAGNOSTIC
+
+        if claim is Claim.VOLUME_ACCURACY:
+            # The identity checks above tie the record to this dataset, this axis and this
+            # surface. None of them says the *areas* came from that surface -- the series lives
+            # inside the record, so an edited area, or an invalid station flipped to a plausible
+            # number to close a gap, satisfies every one of them. A claim re-derives instead.
+            reason = reproducibility_refusal(rec, m, cl)
+            if reason is not None:
+                if not diagnostic:
+                    raise ContractError(reason)
+                console.print(f"[yellow]diagnostic: {reason}[/]")
+                claim = Claim.GEOMETRY_DIAGNOSTIC
 
         axis = reference_axis_of(m) if m.centerline else "unknown"
         # On the claim path the integration is restricted to the holdout ranges, because that is

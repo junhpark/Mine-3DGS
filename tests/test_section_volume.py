@@ -693,20 +693,81 @@ def test_the_volume_report_says_at_what_resolution_the_claim_was_made(chain, tmp
 
 
 def test_a_holdout_with_no_two_consecutive_sections_reaches_the_coverage_refusal(chain, tmp_path):
-    """Not a bare "nothing to integrate": the refusal has to say what is missing."""
+    """Not a bare "nothing to integrate": the refusal has to say what is missing.
+
+    A 5 m grid over the gappy surface puts one valid station (20 m) and one invalid one (25 m)
+    inside the holdout, so there is no pair to integrate anywhere in it.
+    """
     sec = tmp_path / "s.json"
-    rec = cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
-    raw = json.loads(sec.read_text())
-    for s in raw["series"]["sections"]:
-        if HOLDOUT[0] < s["chainage_m"] < HOLDOUT[1]:
-            s["valid"], s["area_m2"] = False, None
-    sec.write_text(json.dumps(raw))
-    assert SectionRecord.load(sec).section_id == rec.section_id
+    rec = cut(chain.gappy, chain.dataset_dir, sec, interval_m=5, thickness_m=0.5, angle_bins=72)
+    inside = [s for s in rec.series.sections if HOLDOUT[0] <= s.chainage_m <= HOLDOUT[1]]
+    assert sum(s.valid for s in inside) < 2
 
     r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
     assert r.exit_code == 2, r.output
     assert "volume_accuracy is a claim about the whole declared holdout" in flat(r)
     assert "20-26 m" in flat(r)
+
+
+def test_edited_areas_do_not_survive_being_re_cut_from_the_surface(chain, tmp_path):
+    """Every identity check passes: same dataset, same axis, same surface, same grid.
+
+    What the identity checks cannot say is that the *areas* came from that surface, because the
+    series lives inside the record. A claim re-derives them.
+    """
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert runner.invoke(app, volume_argv(sec, chain.dataset_dir, out)).exit_code == 0
+    honest = volume_json(out)["volume_m3"]
+
+    raw = json.loads(sec.read_text())
+    for s in raw["series"]["sections"]:
+        if s["area_m2"] is not None:
+            s["area_m2"] *= 3.0
+    sec.write_text(json.dumps(raw))
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, tmp_path / "v2.json"))
+    assert r.exit_code == 2, r.output
+    assert "does not reproduce this series' area_m2" in flat(r)
+    # ...and the honest run really was three times smaller, so the edit would have mattered
+    assert honest > 0
+
+
+def test_a_gap_cannot_be_closed_by_flipping_a_station_to_observed(chain, tmp_path):
+    """The gappy surface refuses on coverage; filling the hole in the JSON must not fix it."""
+    sec = tmp_path / "s.json"
+    rec = cut(chain.gappy, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert runner.invoke(app, volume_argv(sec, chain.dataset_dir)).exit_code == 2
+
+    raw = json.loads(sec.read_text())
+    good = [s for s in rec.series.sections if s.valid]
+    fill, radii = good[0].area_m2, list(good[0].radii_m)
+    for s in raw["series"]["sections"]:
+        if not s["valid"]:
+            s.update(valid=True, area_m2=fill, radii_m=radii, n_points=100, empty_bins=0)
+    sec.write_text(json.dumps(raw))
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output
+    assert "cannot be made observed by editing the series" in flat(r)
+
+
+def test_a_claim_needs_the_surface_to_still_be_there(chain, tmp_path):
+    """Archived evidence is a claim nothing can check, so it is a refusal -- not a downgrade."""
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    moved = chain.root / "archived_surface"
+    shutil.move(str(chain.full), str(moved))
+    try:
+        r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+        assert r.exit_code == 2, r.output
+        assert "it is not there" in flat(r) and "--diagnostic" in flat(r)
+        # the diagnostic number is still available, and still labelled
+        r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, out, diagnostic=True))
+        assert r.exit_code == 0, r.output
+        assert volume_json(out)["claim"] == "geometry_diagnostic"
+    finally:
+        shutil.move(str(moved), str(chain.full))
 
 
 def test_a_coarse_station_grid_reports_how_little_of_the_span_it_sampled(chain, tmp_path):

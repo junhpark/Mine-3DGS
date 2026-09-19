@@ -1,4 +1,9 @@
-from minegs.eval.sections.build import build_section_record, section_source
+from minegs.eval.sections.build import (
+    build_section_record,
+    reproducibility_refusal,
+    require_reproducible_sections,
+    section_source,
+)
 from minegs.eval.sections.models import (
     SectionRecord,
     SectionSource,
@@ -18,5 +23,7 @@ __all__ = [
     "extract_sections",
     "load_section_input",
     "reference_axis_of",
+    "reproducibility_refusal",
+    "require_reproducible_sections",
     "section_source",
 ]
