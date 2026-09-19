@@ -86,15 +86,15 @@ def run(
         "closed rather than silently restarting from iteration 0 (Phase 0D.3, docs/ROADMAP.md).",
     ),
     chunk: str | None = typer.Option(None),
-    wait: bool = typer.Option(
-        True,
-        "--wait/--no-wait",
-        help="block until the run reaches a terminal state. On by default because a run is "
-        "only verified when it finishes: with --no-wait nothing normalises the outputs or "
-        "checks the artifacts, and run.json stays at 'running' however the trainer ended.",
-    ),
 ) -> None:
-    """Submit a training run. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8).
+    """Run training to completion. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8).
+
+    Blocks until the run reaches a terminal state, and there is deliberately no flag to detach.
+    A run is only verified when it finishes — outputs normalised, checkpoint and PLY checked,
+    frame invariant confirmed — and nothing can pick that up afterwards: there is no reattach
+    path, so a detached run would leave run.json at 'running' for ever however the trainer
+    ended. Detaching needs a finalize-on-inspection path that does not exist yet; until it does,
+    use your shell's job control if you need the terminal back.
 
     --resume-from names a parent run explicitly, and always fails closed today: neither the
     runner nor any shipped backend implements resuming, and a restart from iteration 0 is a
@@ -128,13 +128,6 @@ def run(
             )
         )
         console.print(f"submitted [bold]{h.run_id}[/] -> {h.run_dir}")
-        if not wait:
-            console.print(
-                "[yellow]--no-wait: this run will not be verified or finalised.[/] Its outputs "
-                "stay in backend_out/ and run.json stays at 'running' whatever the trainer does "
-                "(§0D.2). Re-run without --no-wait for a baseline you intend to keep."
-            )
-            return
         st = h.wait(poll_s=2.0)
         console.print(f"status: {st.value}  artifacts: {[str(p) for p in h.fetch_artifacts()]}")
         if st is not RunStatus.SUCCEEDED:

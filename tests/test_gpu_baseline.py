@@ -13,6 +13,7 @@ only if it can be shown to have trained.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -403,10 +404,14 @@ def test_the_default_cli_invocation_finalises_the_run(synthetic, tmp_path, gpu, 
     assert rec.completed_at and rec.final_checkpoint
 
 
-def test_no_wait_says_the_run_is_unverified_rather_than_implying_success(
-    synthetic, tmp_path, gpu, trainer
-):
-    """The old default, kept — but it no longer looks like a finished run."""
+def test_there_is_no_way_to_detach_a_run_from_its_verification(synthetic, tmp_path, gpu, trainer):
+    """A detached run could never be finalised, so the flag that allowed it is gone.
+
+    Verification happens when the handle reaches a terminal state. Nothing reattaches to a run
+    whose submitter walked away, so ``--no-wait`` could only ever leave run.json at 'running'
+    for ever — a record that says less than nothing about what the trainer did. Detaching needs
+    a finalize-on-inspection path; until that exists the honest interface has no such flag.
+    """
     from minegs.cli.main import app
     from typer.testing import CliRunner
 
@@ -414,6 +419,164 @@ def test_no_wait_says_the_run_is_unverified_rather_than_implying_success(
         app,
         ["train", "run", str(synthetic.dataset_dir), "--profile", "light", "--native", "--no-wait"],
     )
-    assert r.exit_code == 0, r.output
-    out = " ".join(r.output.split())
-    assert "will not be verified" in out and "status: succeeded" not in out
+    assert r.exit_code != 0
+    assert "no such option" in " ".join(r.output.split()).lower()
+
+
+# ------------------------------------------------- B1: a fresh run needs a fresh directory
+
+
+def test_a_second_run_cannot_inherit_the_first_runs_artifacts(synthetic, tmp_path, gpu, trainer):
+    """B1: valid stale artifacts + a trainer that writes nothing must not read as success.
+
+    Evidence is discovered in ``backend_out`` after the trainer exits, and nothing clears it
+    between runs. Without the refusal, run two finds run one's checkpoint, stats and PLY —
+    every postcondition passes on someone else's work, and "exit 0 having produced nothing"
+    is recorded as a verified baseline.
+    """
+    from minegs.core.errors import ContractError
+
+    trainer(n=64, span=8.0)
+    h, run_dir = _run(synthetic, tmp_path)
+    assert h.wait(poll_s=0.01) is RunStatus.SUCCEEDED
+    stale = run_dir / "backend_out" / "ply" / "point_cloud_9.ply"
+    assert stale.is_file()  # a genuine, complete artifact from run one
+
+    # run two into the same directory, with a trainer that produces nothing at all
+    trainer(write_ckpt=False, write_ply=False, write_stats=False, write_renders=False)
+    with pytest.raises(ContractError, match="already holds"):
+        _run(synthetic, tmp_path)
+
+    # and run one's record is untouched by the attempt
+    assert load_record(run_dir).status is RunStatus.SUCCEEDED
+    assert stale.is_file()
+
+
+def test_the_refusal_comes_before_anything_is_written(synthetic, tmp_path, gpu, trainer):
+    """A directory holding one stray file is refused without being added to."""
+    from minegs.core.errors import ContractError
+
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "notes.txt").write_text("someone's working notes")
+    with pytest.raises(ContractError, match="already holds"):
+        _run(synthetic, tmp_path)
+    assert sorted(p.name for p in run_dir.iterdir()) == ["notes.txt"]
+
+
+# ------------------------------------------------- B2: one GPU, both paths
+
+
+@pytest.mark.parametrize("spec", ["all", "device=0,1", "2", "0", ""])
+def test_a_multi_gpu_spec_is_refused(spec):
+    """B2: gsplat decides to go distributed from the device count alone, with no flag to decline.
+
+    Its PLY export is not rank-qualified (upstream writes ``ply/point_cloud_{step}.ply`` with no
+    rank in the name and no rank guard), so several ranks race on one file. A bare integer is
+    refused too: to docker ``--gpus 2`` means two GPUs, not GPU 2.
+    """
+    from minegs.core.errors import ContractError
+    from minegs.train.runner.base import single_device_index
+
+    with pytest.raises(ContractError, match="more than one GPU"):
+        single_device_index(spec)
+
+
+@pytest.mark.parametrize(("spec", "want"), [("device=0", "0"), ("device=3", "3")])
+def test_one_device_is_accepted_by_index(spec, want):
+    from minegs.train.runner.base import single_device_index
+
+    assert single_device_index(spec) == want
+
+
+def test_the_native_path_exposes_exactly_one_gpu(synthetic, tmp_path, gpu, trainer, monkeypatch):
+    """CUDA_VISIBLE_DEVICES is what gsplat's launcher reads, and there is no docker to narrow."""
+    seen: list[dict] = []
+    real_popen = runner_local.subprocess.Popen
+
+    def spy(argv, **kw):
+        if "--result_dir" in argv:
+            seen.append(dict(kw.get("env") or {}))
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(runner_local.subprocess, "Popen", spy)
+    h, _ = _run(synthetic, tmp_path)
+    h.wait(poll_s=0.01)
+    assert seen and seen[0].get("CUDA_VISIBLE_DEVICES") == "0"
+
+
+def test_the_docker_path_narrows_the_device_and_says_so_inside(
+    synthetic, tmp_path, gpu, monkeypatch
+):
+    """--gpus decides what the container can see; CUDA_VISIBLE_DEVICES is what gsplat reads."""
+    monkeypatch.setattr(runner_local, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner_local, "container_runtime_info", lambda *a, **k: {"source": "container"}
+    )
+    seen: list[list[str]] = []
+    real_popen = runner_local.subprocess.Popen
+
+    def spy(argv, **kw):
+        # docker is not installed here, and provenance's git probes go through Popen too, so
+        # stand in for the container launch only and let everything else run for real.
+        if argv and argv[0] == "docker":
+            seen.append(list(argv))
+            return real_popen([sys.executable, "-c", ""], **kw)
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(runner_local.subprocess, "Popen", spy)
+    r = get_runner(
+        "local",
+        RunnerConfig(runner="local", native=False, image="minegs:gpu@sha256:" + "a" * 64),
+    )
+    r.submit(
+        RunConfig(
+            dataset_dir=str(synthetic.dataset_dir),
+            profile="light",
+            run_dir=str(tmp_path / "runs" / "d1"),
+            overrides={"max_steps": 10, "max_images": 4},
+        )
+    )
+    argv = seen[0]
+    assert argv[:3] == ["docker", "run", "--rm"]
+    assert "--gpus" in argv and argv[argv.index("--gpus") + 1] == "device=0"
+    assert "CUDA_VISIBLE_DEVICES=0" in argv
+    assert "all" not in argv
+
+
+def test_a_multi_gpu_runner_config_never_reaches_the_trainer(synthetic, tmp_path, gpu, trainer):
+    """The refusal is on the run, not only on the helper."""
+    from minegs.core.errors import ContractError
+
+    r = get_runner("local", RunnerConfig(runner="local", native=True, gpus="all"))
+    with pytest.raises(ContractError, match="more than one GPU"):
+        r.submit(
+            RunConfig(
+                dataset_dir=str(synthetic.dataset_dir),
+                profile="light",
+                run_dir=str(tmp_path / "runs" / "multi"),
+            )
+        )
+
+
+# ------------------------------------------------- S2: the record is a versioned schema
+
+
+def test_a_pre_0d2_run_record_still_loads():
+    """S2: 1.1 adds evidence fields, so a 1.0 record migrates forward rather than failing."""
+    from minegs.train.runner.base import RunRecord
+
+    old = {
+        "schema_version": "1.0",
+        "run_id": "gsplat_20260101_abcdef",
+        "dataset_id": "d",
+        "dataset_hash": "0" * 64,
+        "backend": {"name": "gsplat", "version": "1.5.3"},
+        "profile": {},
+        "runner": "local",
+        "provenance": {"git_commit": "abc", "source_assets": [], "tool_versions": {}},
+    }
+    rec = RunRecord.from_dict(old)
+    assert rec.schema_version == "1.1"
+    # a 1.0 run recorded no evidence, and the migration does not invent any
+    assert rec.final_model is None and rec.observed_final_step is None and rec.extents == {}

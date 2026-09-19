@@ -209,20 +209,37 @@ def test_fresh_gsplat_command_carries_no_checkpoint_argument(synthetic, tmp_path
 def test_a_fresh_run_never_picks_up_a_checkpoint_lying_around(
     synthetic, tmp_path, no_exec, monkeypatch
 ):
-    """Resume is requested, never inferred: checkpoints in the run directory change nothing."""
+    """Resume is requested, never inferred — and a used run directory is now refused outright.
+
+    This used to submit into a directory already holding ``backend_out/ckpts/ckpt_900.pt`` and
+    assert the assembled command ignored it. Phase 0D.2 closes the situation one step earlier:
+    evidence is read back out of ``backend_out`` after training, so a second run into an
+    occupied directory would read the first run's artifacts as its own. The stray checkpoint is
+    therefore a refusal, not something to step around. A clean run with checkpoints lying
+    *elsewhere* still carries no ``--ckpt`` — the second half below.
+    """
     trainer = tmp_path / "simple_trainer.py"  # the real one lives in the GPU image
     trainer.write_text("")
     monkeypatch.setenv("MINEGS_GSPLAT_TRAINER", str(trainer))
-    run_dir = tmp_path / "runs" / "fresh"
-    (run_dir / "backend_out" / "ckpts").mkdir(parents=True)
-    (run_dir / "backend_out" / "ckpts" / "ckpt_900.pt").write_bytes(b"x")
     r = get_runner("local", RunnerConfig(runner="local", native=True))
-    r.submit(
-        RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light", run_dir=str(run_dir))
-    )
+
+    used = tmp_path / "runs" / "fresh"
+    (used / "backend_out" / "ckpts").mkdir(parents=True)
+    (used / "backend_out" / "ckpts" / "ckpt_900.pt").write_bytes(b"x")
+    with pytest.raises(ContractError, match="already holds"):
+        r.submit(
+            RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light", run_dir=str(used))
+        )
+    assert no_exec.calls == []  # refused before the trainer was reached
+
+    # ...and a checkpoint sitting next door changes nothing about a clean run
+    (tmp_path / "runs" / "elsewhere" / "ckpts").mkdir(parents=True)
+    (tmp_path / "runs" / "elsewhere" / "ckpts" / "ckpt_900.pt").write_bytes(b"x")
+    clean = tmp_path / "runs" / "clean"
+    r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light", run_dir=str(clean)))
     argv = no_exec.calls[-1]
     assert not any(a.startswith("--ckpt") for a in argv)
-    assert Path(run_dir / "run.json").exists()
+    assert Path(clean / "run.json").exists()
 
 
 def test_the_printed_train_command_is_the_command_that_runs(synthetic, tmp_path, monkeypatch):

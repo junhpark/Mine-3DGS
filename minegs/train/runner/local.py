@@ -1,6 +1,10 @@
-"""LocalRunner (§8.2): ``docker run --gpus all <image@digest> train run ...``.
+"""LocalRunner (§8.2): ``docker run --gpus device=<n> <image@digest> ...``.
+
 Refuses without CUDA and suggests RunPod. ``native=True`` runs the backend command in the
-current environment (developer mode, no digest recorded)."""
+current environment (developer mode, no digest recorded). Exactly one GPU is exposed either
+way: gsplat v1.5.3 reads ``torch.cuda.device_count()`` and spawns a rank per visible device
+with no flag to decline, and its PLY export carries no rank in the name — so a second visible
+GPU turns the baseline into a distributed run whose ranks overwrite one another (§0D.2)."""
 
 from __future__ import annotations
 
@@ -16,10 +20,12 @@ from minegs.train.runner.base import (
     Runner,
     RunRecord,
     RunStatus,
+    container_runtime_info,
     cuda_available,
     docker_available,
     load_record,
     runtime_info,
+    single_device_index,
     verify_postconditions,
 )
 from minegs.train.staging import stage_dataset
@@ -111,9 +117,15 @@ class LocalRunner(Runner):
         if not cuda_available():
             raise NoGpuError(
                 "No CUDA device found. Training needs a GPU. Run on a CUDA host (docker with "
-                "--gpus all), or use --native for a developer run in the current environment. "
+                "--gpus device=0), or use --native for a developer run in the current environment. "
                 "Cloud routing (RunPod) is Phase 6 and not implemented yet — see docs/ROADMAP.md."
             )
+
+        # One GPU, decided before anything is staged. gsplat reads torch.cuda.device_count() and
+        # spawns a rank per visible device with no way to decline, and its PLY export is not
+        # rank-qualified — so a second visible GPU turns this baseline into a distributed run
+        # whose ranks overwrite each other's point_cloud_<step>.ply (§0D.2 B2).
+        device = single_device_index(self.config.gpus)
 
         staged = stage_dataset(
             dataset_dir,
@@ -136,6 +148,9 @@ class LocalRunner(Runner):
         if self.config.native:
             cmd = backend.build_command(staged.path, work, profile)
             argv = cmd.argv
+            # No docker to narrow the device set here, so say it directly. gsplat's own docs
+            # give CUDA_VISIBLE_DEVICES as the way to choose ranks.
+            cmd.env["CUDA_VISIBLE_DEVICES"] = device
         else:
             if not docker_available():
                 raise ContractError(
@@ -156,7 +171,12 @@ class LocalRunner(Runner):
                 "run",
                 "--rm",
                 "--gpus",
-                self.config.gpus,
+                f"device={device}",
+                # ...and again inside, because --gpus decides what the container *can* see while
+                # CUDA_VISIBLE_DEVICES is what gsplat's launcher reads. Belt and braces: either
+                # one alone leaves a way for a second rank to appear.
+                "-e",
+                "CUDA_VISIBLE_DEVICES=0",
                 "--shm-size",
                 self.config.shm_size,
                 "-v",
@@ -173,7 +193,11 @@ class LocalRunner(Runner):
         record.T_local_from_internal = cmd.T_local_from_internal.to_list()
         record.image = self.config.image or None
         record.max_steps = profile.max_steps
-        record.runtime = runtime_info()
+        record.runtime = (
+            runtime_info()
+            if self.config.native
+            else container_runtime_info(self.config.image, device, cmd.argv[1])
+        )
         record.started_at = _now()
         record.status = RunStatus.RUNNING
         self.write_record(record, run_dir)

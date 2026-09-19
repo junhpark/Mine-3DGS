@@ -364,7 +364,15 @@ validation 으로 주장하지 않는다 — 합성 데이터 위의 execution c
 **범위**: pinned GPU docker image, gsplat v1.5.3 executable contract, LocalRunner,
 light profile, staging, checkpoint/output, LOCAL_METRIC 출력 정규화 계약.
 
-**원칙**: `normalize_world_space=false`, BACKEND_INTERNAL = LOCAL_METRIC.
+**원칙**: `normalize_world_space=false`, BACKEND_INTERNAL = LOCAL_METRIC, **GPU 정확히 1개**.
+
+gsplat v1.5.3 은 `torch.cuda.device_count()` 만 보고 distributed 로 전환하며 (`gsplat/distributed.py`
+`cli()`), 그 모드에서 PLY 는 rank 로 구분되지 않는다 (`ply/point_cloud_{step}.ply`, rank guard 없음).
+따라서 baseline 은 docker `--gpus device=<n>` 과 `CUDA_VISIBLE_DEVICES` 양쪽으로 한 장에 고정한다.
+multi-GPU 는 Phase 0D.2 범위가 아니다.
+
+**detach 불가**: run 은 끝날 때 검증되고, 중간에 떠난 run 을 나중에 finalize 하는 경로가 없다.
+그래서 `minegs train run` 은 항상 끝까지 기다린다 — detach 는 finalize-on-inspection 이 생긴 뒤의 일이다.
 
 **Gate** — 중단 없는 단일 학습으로 다음 10 항목을 모두 확인한다. 1·3·4·5·6·7·8·9 는
 `LocalRunner` 가 run 마다 자동으로 확인하고 `run.json` 에 기록한다 (아래 fail-closed 표 참조);
@@ -634,6 +642,9 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | trainer `cfg.yml` 이 `normalize_world_space: true` | `FAILED` | upstream 기본값이 true 다 — 출력이 metre 가 아니게 된다 | 해당 없음 (설계) |
 | 출력 span 이 init span 대비 20배 밖 | `FAILED` | scale 이 바뀌었다는 정황 (보조 신호) | 해당 없음 (설계) |
 | CUDA 없음 | `NoGpuError` (exit 4) | CPU 학습은 느린 GPU 학습이 아니라 다른 실험이다 | 해당 없음 (설계) |
+| 이미 사용된 run directory | `ContractError` | 이전 run 의 artifact 를 이번 run 의 증거로 읽게 된다 | 해당 없음 (설계) |
+| `runner.gpus` 가 GPU 를 2개 이상 노출 | `ContractError` | gsplat 이 device count 만 보고 distributed 로 가고, PLY 는 rank 로 구분되지 않아 서로 덮어쓴다 | multi-GPU 는 범위 밖 |
+| container 안의 torch 가 CUDA 를 못 봄 | `ContractError` | 학습할 런타임이 GPU 를 못 보면 GPU baseline 이 아니다 | 해당 없음 (설계) |
 | option name 이 될 수 없는 `backend_args` key (내부 공백) | `ContractError` | flag 로 넘길 수 없고, 출력된 command 에서는 인자 두 개로 읽힌다 | 해당 없음 (설계) |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |

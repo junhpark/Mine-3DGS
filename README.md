@@ -236,7 +236,7 @@ dataset/
 
 ```bash
 # 로컬 GPU (docker, digest 로 pin 된 이미지) — configs/runner/local.yaml
-minegs train run data/<id>/dataset --profile light --runner local --config configs/runner/local.yaml --wait
+minegs train run data/<id>/dataset --profile light --runner local --config configs/runner/local.yaml
 minegs train command data/<id>/dataset --profile light   # 실행할 커맨드만 확인 (GPU·trainer 불필요)
 minegs train status  data/<id>/runs/<run_id>             # run.json: backend, digest, dataset_hash, staged, provenance
 ```

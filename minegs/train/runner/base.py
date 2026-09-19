@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -19,7 +20,7 @@ from typing import Any, ClassVar
 
 from pydantic import Field
 
-from minegs.core.config import VersionedModel
+from minegs.core.config import MigrationRegistry, VersionedModel
 from minegs.core.errors import ContractError
 from minegs.core.manifest import Manifest
 from minegs.core.provenance import ProvenanceRecord, make_id, sha256_tree, stamp
@@ -52,7 +53,12 @@ class RunnerConfig(VersionedModel):
     runner: str = "local"
     image: str = ""
     data_root: str = "./data"
-    gpus: str = "all"
+    #: Which GPU the baseline runs on, as a docker ``--gpus`` value. One device, by index:
+    #: gsplat v1.5.3 sets ``world_size = torch.cuda.device_count()`` and spawns one process per
+    #: visible device with no flag to decline (gsplat/distributed.py cli()), so "all" silently
+    #: turns a single-GPU baseline into distributed training — whose PLY write is not
+    #: rank-qualified, leaving every rank racing on the same point_cloud_<step>.ply.
+    gpus: str = "device=0"
     shm_size: str = "16g"
     native: bool = False
     gpu_types: list[str] = Field(default_factory=list)
@@ -83,10 +89,25 @@ class RunConfig(VersionedModel):
     overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+RUN_RECORD_MIGRATIONS = MigrationRegistry("run_record")
+
+
+@RUN_RECORD_MIGRATIONS.register("1.0", "1.1")
+def _run_1_0_to_1_1(d: dict[str, Any]) -> dict[str, Any]:
+    """1.1 adds Phase 0D.2 execution evidence; 1.0 records simply have none.
+
+    Nothing is translated because nothing moved: every 1.1 field is new, and a 1.0 run genuinely
+    did not record whether its artifacts were ever checked. Leaving them unset says that, which
+    is the honest reading — inventing a ``succeeded`` run's missing evidence would not be.
+    """
+    return d
+
+
 class RunRecord(VersionedModel):
     """``runs/<run_id>/run.json`` (§9)."""
 
-    SCHEMA_VERSION: ClassVar[str] = "1.0"
+    SCHEMA_VERSION: ClassVar[str] = "1.1"
+    MIGRATIONS: ClassVar[MigrationRegistry | None] = RUN_RECORD_MIGRATIONS
     run_id: str
     dataset_id: str
     dataset_hash: str
@@ -104,9 +125,8 @@ class RunRecord(VersionedModel):
     outputs: list[str] = Field(default_factory=list)
     provenance: ProvenanceRecord
 
-    # ---- Phase 0D.2 execution evidence. Added with defaults and *without* bumping
-    # SCHEMA_VERSION on purpose: RunRecord declares no migrations, so a bump would make every
-    # run.json already on disk unreadable. Absent fields simply mean "written before 0D.2".
+    # ---- Phase 0D.2 execution evidence (schema 1.1). Every field defaults, so a 1.0 record
+    # migrates forward by doing nothing; see _run_1_0_to_1_1.
     image: str | None = None  # the full ref; docker_digest is the @sha256 half of it
     started_at: str | None = None
     completed_at: str | None = None
@@ -202,6 +222,7 @@ class Runner(ABC):
         # as Path(".")), but the guard should not depend on that.
         if run.resume_from is not None:
             refuse_resume(backend)
+        refuse_used_run_dir(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         record = RunRecord(
             run_id=run.run_id,
@@ -230,6 +251,28 @@ class Runner(ABC):
         record.save(tmp)
         os.replace(tmp, final)
         return final
+
+
+def refuse_used_run_dir(run_dir: Path) -> None:
+    """A fresh run needs a directory nothing has run in before (§0D.2 B1).
+
+    Evidence is read back out of ``backend_out`` after the trainer exits, and nothing clears it
+    between runs. So a second run into an occupied directory inherits the first one's checkpoint,
+    stats and PLY — and a trainer that writes nothing then passes every postcondition on someone
+    else's artifacts, which is the "exit 0 and produced nothing" case wearing a successful run's
+    clothes. Refusing is the fail-closed answer: clearing would destroy the earlier run's
+    evidence, and merging would be worse than either.
+    """
+    if not run_dir.exists():
+        return
+    existing = sorted(p.name for p in run_dir.iterdir())
+    if not existing:
+        return
+    raise ContractError(
+        f"{run_dir} already holds {existing[:6]}. A run directory is written once: artifacts "
+        "left by an earlier run would be read back as this one's evidence. Submit without "
+        "run_dir to mint a fresh run id, or point at a directory that does not exist yet."
+    )
 
 
 def refuse_resume(backend: Any) -> None:
@@ -272,6 +315,34 @@ def refuse_resume(backend: Any) -> None:
 MAX_EXTENT_RATIO = 20.0
 
 
+#: Only the explicit ``device=<n>`` form, optionally quoted as docker's own docs write it. A
+#: bare integer is deliberately refused: to docker ``--gpus 2`` means *two* GPUs, not GPU 2, and
+#: a spec whose meaning flips between "index" and "count" is not one to guess at.
+_ONE_DEVICE = re.compile(r"^\"?device=(\d+)\"?$")
+
+
+def single_device_index(gpus: str) -> str:
+    """The one GPU index this baseline may use, or a refusal (§0D.2 B2).
+
+    Multi-GPU is not a faster version of this baseline. gsplat decides to go distributed purely
+    from how many devices it can see, and in that mode every rank writes the same
+    ``ply/point_cloud_<step>.ply`` — so what lands on disk is whichever rank finished last, or a
+    torn file. Distributed training is out of Phase 0D.2's scope, so the run is pinned to one
+    device rather than left to discover this at the end of a long job.
+    """
+    m = _ONE_DEVICE.match(str(gpus).strip())
+    if m is None:
+        raise ContractError(
+            f"runner.gpus={gpus!r} exposes more than one GPU. gsplat v1.5.3 reads "
+            "torch.cuda.device_count() and spawns one training process per visible device, and "
+            "its PLY export is not rank-qualified, so the ranks would overwrite each other's "
+            "point_cloud_<step>.ply. Phase 0D.2 is a single-GPU baseline: write "
+            "gpus: device=<n> (a bare number is docker's *count*, not an index). Multi-GPU is "
+            "not in scope — docs/ROADMAP.md §Phase 0D."
+        )
+    return m.group(1)
+
+
 def runtime_info() -> dict[str, Any]:
     """What the machine says about itself, best effort, before a trainer starts (§0D.2 D2-2).
 
@@ -303,6 +374,7 @@ def runtime_info() -> dict[str, Any]:
                     info["driver_version"] = first[1].strip()
         except (OSError, subprocess.SubprocessError) as e:
             info["nvidia_smi_error"] = str(e)
+    info["source"] = "host"
     try:  # present on the native path; absent on a host that only runs the container
         import torch
 
@@ -311,6 +383,68 @@ def runtime_info() -> dict[str, Any]:
         info["torch_cuda_available"] = bool(torch.cuda.is_available())
     except Exception:
         info["torch"] = None
+    return info
+
+
+#: Asked of the image itself, so the recorded versions are the ones that trained.
+_PROBE = (
+    "import json,sys,torch;"
+    "d={'python':sys.version.split()[0],'torch':torch.__version__,"
+    "'torch_cuda':torch.version.cuda,'torch_cuda_available':torch.cuda.is_available(),"
+    "'device_count':torch.cuda.device_count()};"
+    "d['gpu_model']=torch.cuda.get_device_name(0) if torch.cuda.is_available() else None;"
+    "\ntry:\n import gsplat; d['gsplat']=gsplat.__version__\nexcept Exception as e:"
+    " d['gsplat']=None\n"
+    "print('MINEGS_PROBE'+json.dumps(d))"
+)
+
+
+def container_runtime_info(image: str, device: str, trainer_path: str) -> dict[str, Any]:
+    """What the *container* reports about itself, before the trainer starts (§0D.2 D2-2, S1).
+
+    The host's torch and the image's torch are different installations, and it is the image's
+    that trains — on a machine with no torch at all the host view is empty while the run is
+    perfectly fine. So the image is asked directly, with the same single device the run will
+    use, and the answer is a gate as well as a description: a container whose torch cannot see
+    a GPU cannot produce a GPU baseline, however healthy ``nvidia-smi`` looks outside it.
+    """
+    argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        f"device={device}",
+        "-e",
+        "CUDA_VISIBLE_DEVICES=0",
+        "--entrypoint",
+        "python",
+        image,
+        "-c",
+        _PROBE,
+    ]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ContractError(f"could not probe the GPU image {image}: {e}") from e
+    marker = next((ln for ln in out.stdout.splitlines() if ln.startswith("MINEGS_PROBE")), None)
+    if out.returncode != 0 or marker is None:
+        raise ContractError(
+            f"the GPU image {image} could not report its runtime (exit {out.returncode}). "
+            f"stderr: {(out.stderr or '').strip()[:400]}"
+        )
+    info: dict[str, Any] = json.loads(marker[len("MINEGS_PROBE") :])
+    info["source"] = "container"
+    info["trainer_path"] = trainer_path
+    if not info.get("torch_cuda_available"):
+        raise ContractError(
+            f"torch inside {image} reports no CUDA device. A baseline cannot be trained on the "
+            "CPU, and this is the runtime that would have trained it (§0D.2 D2-2)."
+        )
+    if int(info.get("device_count") or 0) != 1:
+        raise ContractError(
+            f"the container sees {info.get('device_count')} GPUs; gsplat would go distributed "
+            "and its ranks would overwrite one another's PLY (§0D.2 B2)."
+        )
     return info
 
 
