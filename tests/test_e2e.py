@@ -34,11 +34,16 @@ from minegs.e2e.runner import (
 from minegs.e2e.stages import (
     dataset_identity,
     dataset_spec,
+    depth_spec,
     ingest_spec,
     staging_digest,
+    surface_spec,
+    train_spec,
 )
+from minegs.train.runner.base import RunStatus
 
 from e57_fakes import make_scan, pose_node
+from test_depth_render import StandInRenderer, make_run
 
 
 def blank_state(**over) -> WorkflowState:
@@ -219,8 +224,9 @@ def test_a_stale_stage_is_visible_before_anything_is_attempted(tmp_path):
     wf.execute(chain_specs(ran, world))
     assert Workflow(tmp_path / "wf").stale_stages(chain_specs([], world)) == []
 
+    # ...and it cascades: every stage after it was built on what changed
     world["source"] = "e57_b"
-    assert Workflow(tmp_path / "wf").stale_stages(chain_specs([], world)) == [Stage.INGEST]
+    assert Workflow(tmp_path / "wf").stale_stages(chain_specs([], world)) == list(STAGE_ORDER)
 
 
 def test_rebuild_from_is_the_explicit_answer_and_cascades(tmp_path):
@@ -483,3 +489,146 @@ def test_a_supplied_camera_convention_is_left_exactly_as_it_is(
     out = state.stages[Stage.DATASET].outputs
     assert out["camera_convention_status"] == "supplied"
     assert sha256_file(mine) == before
+
+
+# ---------------------------------------------------------------- C3: train, depth, surface
+
+
+def stand_in_trainer(run_cfg, runner_cfg):
+    """A run the real validators accept, minted without a GPU.
+
+    The seam is the *execution*, not the contract: what comes out still has to pass check_run,
+    still has to carry this dataset's hash, and still has to leave a checkpoint the depth
+    manifest can be verified against.
+    """
+    run_dir = Path(run_cfg.run_dir)
+    make_run(Path(run_cfg.dataset_dir), run_dir, run_id=run_dir.name)
+    return run_dir
+
+
+@pytest.fixture(scope="module")
+def chain(staging_small, build_config_small, tmp_path_factory):
+    """The whole Phase 0B -> 1B chain, driven by the workflow, with both seams substituted."""
+    root = tmp_path_factory.mktemp("c3")
+    cfg = e2e_config(
+        staging_dir=str(staging_small.staging_dir),
+        build_config=str(write_build_config(root, build_config_small, root / "conv.json")),
+        dataset_dir=str(root / "dataset"),
+        stride=2,
+    )
+    wf = Workflow(root / "wf", cfg)
+    specs = {
+        Stage.INGEST: ingest_spec(),
+        Stage.DATASET: dataset_spec(),
+        Stage.TRAIN: train_spec(),
+        Stage.DEPTH: depth_spec(),
+        Stage.SURFACE: surface_spec(),
+    }
+    state = wf.execute(
+        specs,
+        through=Stage.SURFACE,
+        renderer=StandInRenderer(depth_m=7.0),
+        trainer=stand_in_trainer,
+    )
+    return SimpleNamespace(root=root, wf=wf, state=state, config=cfg, specs=specs)
+
+
+def test_the_train_stage_validates_the_run_it_launched(chain):
+    """check_run is the same gate `eval surface-depth` applies; launching it is not evidence."""
+    out = chain.state.stages[Stage.TRAIN].outputs
+    dataset = chain.state.stages[Stage.DATASET].outputs
+
+    assert out["status"] == "succeeded"
+    assert out["dataset_id"] == dataset["dataset_id"]
+    assert out["dataset_hash"] == dataset["dataset_hash"]
+    assert out["frame_of_outputs"] == "LOCAL_METRIC"
+    assert out["final_checkpoint"] and out["checkpoint_sha256"]
+    assert out["real_gpu_execution"] is False  # substituted, and said so
+
+
+def test_a_substituted_trainer_claims_no_gpu_it_did_not_use(chain):
+    """The host having a GPU would say nothing about where these weights came from."""
+    env = chain.state.stages[Stage.TRAIN].runtime_env
+    assert env["gpu_model"] is None and env["cuda_version"] is None
+    assert "substituted" in env["reason"]
+
+
+def test_the_depth_stage_produces_a_manifest_tied_to_that_run(chain):
+    out = chain.state.stages[Stage.DEPTH].outputs
+    train = chain.state.stages[Stage.TRAIN].outputs
+
+    assert out["run_id"] == train["run_id"]
+    assert out["depth_manifest_id"] and out["depth_manifest_sha256"]
+    assert out["depth_map_count"] > 0 and 0.0 < out["mean_valid_ratio"] <= 1.0
+    assert out["real_renderer_execution"] is False
+
+
+def test_the_surface_stage_re_derives_its_own_promotion(chain):
+    """Having built the surface is not evidence about it: it is re-read and re-derived."""
+    out = chain.state.stages[Stage.SURFACE].outputs
+
+    assert out["depth_source"] == "minegs_render"
+    assert out["point_count"] > 0 and out["verified_point_count"] == out["point_count"]
+    assert out["point_sha256"] and out["surface_id"]
+    assert out["run_id"] == chain.state.stages[Stage.TRAIN].outputs["run_id"]
+
+
+def test_a_surface_that_does_not_promote_stops_the_stage(chain, tmp_path):
+    """T4: the stage calls rederive_depth_source, so a demoted surface is a stage failure."""
+    from minegs.eval.surface.depth import rederive_depth_source
+    from minegs.eval.surface.models import load_surface
+
+    surface_dir = Path(chain.state.stages[Stage.SURFACE].outputs["surface_dir"])
+    dataset_dir = chain.state.stages[Stage.DATASET].outputs["dataset_dir"]
+    surface, _ = load_surface(surface_dir)
+    assert rederive_depth_source(surface, dataset_dir) is None
+
+    gone = dict(surface.parameters)
+    gone["depth_dir"] = str(tmp_path / "not_here")
+    surface.parameters = gone
+    assert "cannot be re-derived" in (rederive_depth_source(surface, dataset_dir) or "")
+
+
+def test_a_failed_train_stage_is_not_a_run_the_depth_stage_will_touch(
+    staging_small, build_config_small, tmp_path
+):
+    """T3: DEPTH needs TRAIN usable, and a trainer that does not finish leaves it failed."""
+    cfg = e2e_config(
+        staging_dir=str(staging_small.staging_dir),
+        build_config=str(write_build_config(tmp_path, build_config_small, tmp_path / "c.json")),
+        dataset_dir=str(tmp_path / "dataset"),
+    )
+
+    def broken(run_cfg, runner_cfg):
+        run_dir = Path(run_cfg.run_dir)
+        make_run(Path(run_cfg.dataset_dir), run_dir, run_id=run_dir.name, status=RunStatus.FAILED)
+        return run_dir
+
+    specs = {
+        Stage.INGEST: ingest_spec(),
+        Stage.DATASET: dataset_spec(),
+        Stage.TRAIN: train_spec(),
+        Stage.DEPTH: depth_spec(),
+    }
+    wf = Workflow(tmp_path / "wf", cfg)
+    with pytest.raises(ContractError, match="not succeeded"):
+        wf.execute(specs, through=Stage.DEPTH, trainer=broken, renderer=StandInRenderer())
+
+    state = WorkflowState.load(tmp_path / "wf" / "workflow.json")
+    assert state.stages[Stage.TRAIN].status is StageStatus.FAILED
+    assert state.stages[Stage.DEPTH].status is StageStatus.PENDING
+
+
+def test_a_retrained_run_makes_the_depth_and_surface_stages_stale(chain):
+    """T2: depth hangs off the run id and the checkpoint digest, both re-read from disk."""
+    run_dir = Path(chain.state.stages[Stage.TRAIN].outputs["run_dir"])
+    checkpoint = run_dir / chain.state.stages[Stage.TRAIN].outputs["final_checkpoint"]
+    keep = checkpoint.read_bytes()
+    try:
+        checkpoint.write_bytes(keep + b"another run's weights")
+        wf = Workflow(chain.root / "wf")
+        assert wf.stale_stages(chain.specs) == [Stage.DEPTH, Stage.SURFACE]
+        with pytest.raises(ContractError, match="checkpoint_sha256"):
+            wf.execute(chain.specs, through=Stage.SURFACE)
+    finally:
+        checkpoint.write_bytes(keep)

@@ -205,6 +205,42 @@ class Workflow:
 
     # ---------------------------------------------------------------- execution
 
+    def _context(self, stage: Stage, renderer: Any = None, trainer: Any = None) -> StageContext:
+        return StageContext(
+            stage=stage,
+            config=self.config,
+            work_dir=self.work_dir,
+            state=self.state,
+            renderer=renderer,
+            trainer=trainer,
+        )
+
+    def resolve_inputs(
+        self,
+        stage: Stage,
+        specs: dict[Stage, StageSpec],
+        cache: dict[Stage, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """A stage's own inputs, plus the fingerprint of the stage before it.
+
+        The chain link is what makes one changed identity invalidate *everything* after it. A
+        stage only reads what it directly touches — ``surface`` does not re-hash the checkpoint —
+        so without it a retrained run would leave the depth stage stale and the surface built
+        from that depth looking fresh. The upstream fingerprint is recomputed from the world,
+        never read back from the ledger, and memoised per call so a multi-gigabyte E57 is
+        digested once however many stages hang off it.
+        """
+        cache = {} if cache is None else cache
+        if stage in cache:
+            return cache[stage]
+        own = dict(specs[stage].inputs(self._context(stage)))
+        idx = STAGE_ORDER.index(stage)
+        if idx > 0 and STAGE_ORDER[idx - 1] in specs:
+            prev = STAGE_ORDER[idx - 1]
+            own["_upstream"] = fingerprint(self.resolve_inputs(prev, specs, cache))
+        cache[stage] = own
+        return own
+
     def execute(
         self,
         specs: dict[Stage, StageSpec],
@@ -221,25 +257,28 @@ class Workflow:
         if rebuild_from is not None:
             self._clear_from(rebuild_from)
         wanted = [s for s in STAGE_ORDER if STAGE_ORDER.index(s) <= STAGE_ORDER.index(through)]
+        cache: dict[Stage, dict[str, Any]] = {}
         for stage in wanted:
-            spec = specs.get(stage)
-            if spec is None:
+            if stage not in specs:
                 raise ContractError(f"no handler registered for stage {stage.value}")
-            self._one(spec, renderer=renderer, trainer=trainer)
+            # Dropped after each stage runs: the stage that just executed changed the world its
+            # successors read, so a cached answer from before it would describe the old one.
+            self._one(specs, stage, cache, renderer=renderer, trainer=trainer)
+            cache.clear()
         return self.state
 
-    def _one(self, spec: StageSpec, renderer: Any, trainer: Any) -> StageRecord:
-        stage = spec.stage
+    def _one(
+        self,
+        specs: dict[Stage, StageSpec],
+        stage: Stage,
+        cache: dict[Stage, dict[str, Any]],
+        renderer: Any,
+        trainer: Any,
+    ) -> StageRecord:
+        spec = specs[stage]
         rec = self.state.stages[stage]
-        ctx = StageContext(
-            stage=stage,
-            config=self.config,
-            work_dir=self.work_dir,
-            state=self.state,
-            renderer=renderer,
-            trainer=trainer,
-        )
-        inputs = spec.inputs(ctx)
+        ctx = self._context(stage, renderer=renderer, trainer=trainer)
+        inputs = self.resolve_inputs(stage, specs, cache)
         fp = fingerprint(inputs)
 
         if rec.usable:
@@ -294,17 +333,14 @@ class Workflow:
         an operator wants before deciding what to rebuild.
         """
         out: list[Stage] = []
+        cache: dict[Stage, dict[str, Any]] = {}
         for stage in STAGE_ORDER:
             rec = self.state.stages[stage]
-            spec = specs.get(stage)
-            if not rec.usable or spec is None:
+            if not rec.usable or stage not in specs:
                 continue
-            ctx = StageContext(
-                stage=stage, config=self.config, work_dir=self.work_dir, state=self.state
-            )
             try:
-                fp = fingerprint(spec.inputs(ctx))
-            except Exception:
+                fp = fingerprint(self.resolve_inputs(stage, specs, cache))
+            except Exception:  # an input that cannot even be read is not a match
                 out.append(stage)
                 continue
             if fp != rec.input_fingerprint:

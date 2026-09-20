@@ -30,6 +30,7 @@ from minegs.core.errors import ContractError
 from minegs.core.provenance import sha256_file, sha256_tree
 from minegs.e2e.models import Stage
 from minegs.e2e.runner import StageContext, StageOutcome, StageSpec
+from minegs.eval.surface.models import DEPTH_MANIFEST_FILE
 
 __all__ = ["STAGING_ARTIFACTS", "dataset_identity", "dataset_spec", "ingest_spec", "staging_digest"]
 
@@ -60,6 +61,20 @@ def dataset_identity(dataset_dir: str | Path) -> dict[str, str]:
         "dataset_id": manifest.dataset_id,
         "dataset_hash": sha256_tree(d, DATASET_HASH_PATTERNS),
     }
+
+
+def fresh_artifact_dir(ctx: StageContext, name: str) -> Path:
+    """A never-before-used directory under the workflow, because artifacts are written once.
+
+    Every publish in this project refuses an existing target (``staged_dir``,
+    ``build_depth_surface``, ``refuse_used_run_dir``), which is what stops an interrupted write
+    from being read as a thinner artifact. A fixed path per stage would make ``--rebuild-from``
+    collide with the run it is replacing, so each execution gets its own and the ledger records
+    which one it used.
+    """
+    from minegs.core.provenance import make_id
+
+    return ctx.work_dir / "artifacts" / name / make_id(name)
 
 
 def _digest_if_there(path: str | Path | None) -> str | None:
@@ -262,7 +277,8 @@ def _dataset_run(ctx: StageContext) -> StageOutcome:
     if problems:
         raise ContractError(f"{out}: the dataset this stage built does not validate: {problems}")
     judgement = judge(result.manifest)
-    gate = run_golden_gate(out, staging, ctx.work_dir / "golden_gate", raise_on_fail=True)
+    gate_dir = fresh_artifact_dir(ctx, "golden_gate")
+    gate = run_golden_gate(out, staging, gate_dir, raise_on_fail=True)
 
     ident = dataset_identity(out)
     report = result.report
@@ -284,7 +300,7 @@ def _dataset_run(ctx: StageContext) -> StageOutcome:
             "golden_gate_passed": gate.get("structural_result") == "pass",
             "golden_gate_problems": list(gate.get("structural_problems") or []),
             "roundtrip_error_m": gate.get("roundtrip_error_m"),
-            "golden_gate_dir": str((ctx.work_dir / "golden_gate").resolve()),
+            "golden_gate_dir": str(gate_dir.resolve()),
         },
         command={
             "call": "minegs.dataset.materialize.build_dataset",
@@ -324,3 +340,245 @@ def write_json(path: Path, data: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return path
+
+
+# ---------------------------------------------------------------- TRAIN
+
+
+def _train_inputs(ctx: StageContext) -> dict[str, Any]:
+    cfg = ctx.config
+    dataset_dir = ctx.upstream(Stage.DATASET)["dataset_dir"]
+    return {
+        **dataset_identity(dataset_dir),
+        "profile": cfg.profile,
+        "backend": cfg.backend,
+        "runner": cfg.runner,
+        "native": cfg.native,
+    }
+
+
+def _train_run(ctx: StageContext) -> StageOutcome:
+    from minegs.eval.surface.depth import check_run
+    from minegs.train.runner.base import RunnerConfig
+    from minegs.train.runner.local import RunConfig
+
+    cfg = ctx.config
+    dataset_dir = Path(ctx.upstream(Stage.DATASET)["dataset_dir"])
+    ident = dataset_identity(dataset_dir)
+    run_cfg = RunConfig(
+        dataset_dir=str(dataset_dir),
+        profile=cfg.profile,
+        backend=cfg.backend,
+        runner=cfg.runner,
+    )
+    from minegs.core.provenance import make_id
+
+    base = Path(cfg.runs_dir) if cfg.runs_dir else ctx.work_dir / "artifacts" / "runs"
+    base.mkdir(parents=True, exist_ok=True)
+    run_cfg.run_dir = str(base / make_id("run"))
+    runner_cfg = RunnerConfig(runner=cfg.runner, native=cfg.native)
+
+    trainer = ctx.trainer or _default_trainer
+    run_dir = Path(trainer(run_cfg, runner_cfg))
+
+    # The same check `eval surface-depth` makes before it will touch a run: succeeded, this
+    # dataset, this hash, LOCAL_METRIC outputs. Having just launched the run is not evidence
+    # that it finished one, and a trainer injected for a test is not evidence of anything.
+    record = check_run(run_dir, ident["dataset_id"], ident["dataset_hash"])
+    checkpoint = run_dir / record.final_checkpoint if record.final_checkpoint else None
+    return StageOutcome(
+        outputs={
+            "run_id": record.run_id,
+            "run_dir": str(run_dir.resolve()),
+            "status": record.status.value,
+            "backend": dict(record.backend or {}),
+            "profile_name": cfg.profile,
+            "runner": record.runner,
+            "checkpoint_step": record.checkpoint_step,
+            "final_checkpoint": record.final_checkpoint,
+            "checkpoint_sha256": _digest_if_there(checkpoint),
+            "staged": dict(record.staged or {}),
+            "frame_of_outputs": record.frame_of_outputs,
+            "real_gpu_execution": ctx.trainer is None,
+            **dataset_identity(dataset_dir),
+        },
+        command={
+            "call": "minegs.train.runner.local.LocalRunner.submit",
+            "dataset_dir": str(dataset_dir),
+            "profile": cfg.profile,
+            "backend": cfg.backend,
+            "runner": cfg.runner,
+            "native": cfg.native,
+            "substituted_trainer": ctx.trainer is not None,
+        },
+        runtime_env=_training_env(record, substituted=ctx.trainer is not None),
+    )
+
+
+def _default_trainer(run_cfg: Any, runner_cfg: Any) -> Path:
+    """Submit and block. The CLI's own path, including its refusal to detach."""
+    from minegs.train.runner import get_runner
+    from minegs.train.runner.base import RunStatus, load_record
+
+    handle = get_runner(runner_cfg.runner, runner_cfg).submit(run_cfg)
+    status = handle.wait(poll_s=2.0)
+    if status is not RunStatus.SUCCEEDED:
+        raise ContractError(
+            load_record(handle.run_dir).failure_reason or f"run finished {status.value}"
+        )
+    return Path(handle.run_dir)
+
+
+def _training_env(record: Any, substituted: bool) -> dict[str, Any]:
+    """What the machine was, as the run recorded it — and null with a reason when it did not.
+
+    A substituted trainer never ran on a GPU, so nothing here is filled in from the host: the
+    host having a GPU would say nothing about where these weights came from.
+    """
+    if substituted:
+        return {
+            "gpu_model": None,
+            "cuda_version": None,
+            "reason": "the training backend was substituted; no GPU executed this run",
+        }
+    evidence = dict(getattr(record, "runtime", None) or {})
+    env: dict[str, Any] = {
+        "gpu_model": evidence.get("gpu_model"),
+        "cuda_version": evidence.get("torch_cuda") or evidence.get("cuda"),
+        "driver_version": evidence.get("driver_version"),
+        "torch": evidence.get("torch"),
+        "gsplat": evidence.get("gsplat"),
+        "source": evidence.get("source"),
+    }
+    if not env["gpu_model"]:
+        env["reason"] = "the run record carries no GPU identification"
+    return env
+
+
+def train_spec() -> StageSpec:
+    return StageSpec(stage=Stage.TRAIN, inputs=_train_inputs, run=_train_run)
+
+
+# ---------------------------------------------------------------- DEPTH
+
+
+def _depth_inputs(ctx: StageContext) -> dict[str, Any]:
+    up = ctx.upstream(Stage.TRAIN)
+    run_dir = Path(up["run_dir"])
+    from minegs.train.runner.base import load_record
+
+    record = load_record(run_dir)
+    checkpoint = run_dir / record.final_checkpoint if record.final_checkpoint else None
+    return {
+        "run_id": record.run_id,
+        "run_status": record.status.value,
+        "checkpoint": record.final_checkpoint,
+        "checkpoint_sha256": _digest_if_there(checkpoint),
+        **dataset_identity(ctx.upstream(Stage.DATASET)["dataset_dir"]),
+        "min_alpha": ctx.config.min_alpha,
+    }
+
+
+def _depth_run(ctx: StageContext) -> StageOutcome:
+    from minegs.eval.surface.render import render_depths
+
+    cfg = ctx.config
+    run_dir = Path(ctx.upstream(Stage.TRAIN)["run_dir"])
+    dataset_dir = Path(ctx.upstream(Stage.DATASET)["dataset_dir"])
+    out = fresh_artifact_dir(ctx, "depth")
+    manifest, depth_dir = render_depths(
+        run_dir, dataset_dir, out, cfg.min_alpha, renderer=ctx.renderer
+    )
+    ratios = [d.valid_ratio for d in manifest.depths]
+    return StageOutcome(
+        outputs={
+            "depth_manifest_id": manifest.manifest_id,
+            "depth_dir": str(Path(depth_dir).resolve()),
+            "depth_manifest_sha256": _digest_if_there(Path(depth_dir) / DEPTH_MANIFEST_FILE),
+            "renderer": (manifest.renderer or {}).get("name"),
+            "renderer_version": (manifest.renderer or {}).get("version"),
+            "depth_map_count": len(manifest.depths),
+            "mean_valid_ratio": sum(ratios) / len(ratios) if ratios else None,
+            "run_id": manifest.run_id,
+            "real_renderer_execution": ctx.renderer is None,
+        },
+        command={
+            "call": "minegs.eval.surface.render.render_depths",
+            "run_dir": str(run_dir),
+            "dataset_dir": str(dataset_dir),
+            "out": str(out),
+            "min_alpha": cfg.min_alpha,
+            "substituted_renderer": ctx.renderer is not None,
+        },
+    )
+
+
+def depth_spec() -> StageSpec:
+    return StageSpec(stage=Stage.DEPTH, inputs=_depth_inputs, run=_depth_run)
+
+
+# ---------------------------------------------------------------- SURFACE
+
+
+def _surface_inputs(ctx: StageContext) -> dict[str, Any]:
+    up = ctx.upstream(Stage.DEPTH)
+    depth_dir = Path(up["depth_dir"])
+    return {
+        "depth_manifest_id": up["depth_manifest_id"],
+        "depth_manifest_sha256": _digest_if_there(depth_dir / DEPTH_MANIFEST_FILE),
+        "run_id": ctx.upstream(Stage.TRAIN)["run_id"],
+        **dataset_identity(ctx.upstream(Stage.DATASET)["dataset_dir"]),
+        "stride": ctx.config.stride,
+        "max_depth_m": ctx.config.max_depth_m,
+    }
+
+
+def _surface_run(ctx: StageContext) -> StageOutcome:
+    from minegs.eval.surface.depth import build_depth_surface, rederive_depth_source
+    from minegs.eval.surface.models import check_surface, load_surface
+
+    cfg = ctx.config
+    depth_dir = Path(ctx.upstream(Stage.DEPTH)["depth_dir"])
+    dataset_dir = Path(ctx.upstream(Stage.DATASET)["dataset_dir"])
+    run_dir = Path(ctx.upstream(Stage.TRAIN)["run_dir"])
+    out = fresh_artifact_dir(ctx, "surface")
+    _built, surface_dir = build_depth_surface(
+        depth_dir, dataset_dir, run_dir, out, cfg.stride, cfg.max_depth_m
+    )
+
+    # Re-read it from disk through the same validators an evaluation would, and re-derive the
+    # promotion rather than trusting the value this stage just wrote. The orchestrator having
+    # produced an artifact is not evidence about the artifact (§Phase 1C).
+    ident = dataset_identity(dataset_dir)
+    surface, points = load_surface(surface_dir)
+    cloud = check_surface(surface, points, ident["dataset_id"], ident["dataset_hash"])
+    stale = rederive_depth_source(surface, dataset_dir)
+    if stale is not None:
+        raise ContractError(f"the surface this stage built does not promote: {stale}")
+    return StageOutcome(
+        outputs={
+            "surface_id": surface.surface_id,
+            "surface_dir": str(Path(surface_dir).resolve()),
+            "point_sha256": surface.point_sha256,
+            "point_count": surface.point_count,
+            "depth_map_count": surface.depth_map_count,
+            "depth_source": surface.depth_source,
+            "run_id": surface.run_id,
+            "span_m": list(surface.span_m or []),
+            "verified_point_count": len(cloud),
+            **ident,
+        },
+        command={
+            "call": "minegs.eval.surface.depth.build_depth_surface",
+            "depth_dir": str(depth_dir),
+            "dataset_dir": str(dataset_dir),
+            "run_dir": str(run_dir),
+            "out": str(out),
+            "stride": cfg.stride,
+            "max_depth": cfg.max_depth_m,
+        },
+    )
+
+
+def surface_spec() -> StageSpec:
+    return StageSpec(stage=Stage.SURFACE, inputs=_surface_inputs, run=_surface_run)
