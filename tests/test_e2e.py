@@ -7,9 +7,13 @@ them in follows in later checkpoints; what is asserted here is the contract they
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from minegs.core.errors import ContractError
-from minegs.core.provenance import ProvenanceRecord
+from minegs.core.provenance import ProvenanceRecord, sha256_file
 from minegs.e2e.models import (
     STAGE_ORDER,
     MaturitySummary,
@@ -27,6 +31,14 @@ from minegs.e2e.runner import (
     Workflow,
     fingerprint,
 )
+from minegs.e2e.stages import (
+    dataset_identity,
+    dataset_spec,
+    ingest_spec,
+    staging_digest,
+)
+
+from e57_fakes import make_scan, pose_node
 
 
 def blank_state(**over) -> WorkflowState:
@@ -298,3 +310,176 @@ def test_a_config_that_does_not_name_what_a_stage_needs_says_all_of_it_at_once()
 def test_the_fingerprint_does_not_depend_on_key_order():
     assert fingerprint({"a": 1, "b": 2}) == fingerprint({"b": 2, "a": 1})
     assert fingerprint({"a": 1}) != fingerprint({"a": 2})
+
+
+# ---------------------------------------------------------------- C2: ingest and dataset
+
+
+def e2e_config(**over) -> E2EConfig:
+    return E2EConfig(**over)
+
+
+def _fake_scan():
+    """A registered scan with coordinates — the smallest thing `extract` can stage."""
+    import numpy as np
+
+    n = 6
+    return make_scan(
+        guid="{scan-a}",
+        pose=pose_node((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        point_data={
+            "cartesianX": np.arange(n, dtype=np.float64),
+            "cartesianY": np.zeros(n),
+            "cartesianZ": np.zeros(n),
+        },
+    )
+
+
+def write_build_config(tmp_path: Path, build_config_small, convention: Path) -> Path:
+    """The operator's build config, with the convention file wherever the test wants it."""
+    spec = build_config_small.model_dump(mode="json")
+    spec["camera"] = {"mode": "e57_pinhole", "convention_file": str(convention)}
+    path = tmp_path / "build_config.json"
+    path.write_text(json.dumps(spec, indent=2))
+    return path
+
+
+def test_ingest_extracts_an_e57_and_carries_its_identity(fake_e57, tmp_path):
+    """The real inventory and the real extractor, through the stage that will call them."""
+    path, _ = fake_e57([_fake_scan()])
+    wf = Workflow(
+        tmp_path / "wf",
+        e2e_config(source_e57=str(path), staging_dir=str(tmp_path / "staging")),
+    )
+    state = wf.execute({Stage.INGEST: ingest_spec()}, through=Stage.INGEST)
+
+    out = state.stages[Stage.INGEST].outputs
+    assert out["mode"] == "extract"
+    assert out["source_sha256"] == sha256_file(path)
+    assert out["source_file_name"] == path.name
+    assert out["n_scans_extracted"] == 1
+    assert out["registration"] == "registered" and out["output_frame"] == "SOURCE"
+    assert (tmp_path / "staging" / "extraction_manifest.json").is_file()
+    assert out["staging_digest"] == staging_digest(tmp_path / "staging")
+    assert state.stages[Stage.INGEST].command["call"].endswith("extract.extract")
+
+
+def test_a_replaced_e57_will_not_be_carried_by_an_old_ingest_record(fake_e57, tmp_path):
+    """T1: source identity changes, so everything recorded about it is about another survey."""
+    path, _ = fake_e57([_fake_scan()])
+    cfg = e2e_config(source_e57=str(path), staging_dir=str(tmp_path / "staging"))
+    Workflow(tmp_path / "wf", cfg).execute({Stage.INGEST: ingest_spec()}, through=Stage.INGEST)
+
+    path.write_bytes(path.read_bytes() + b"a different survey")
+    wf = Workflow(tmp_path / "wf")
+    assert wf.stale_stages({Stage.INGEST: ingest_spec()}) == [Stage.INGEST]
+    with pytest.raises(ContractError, match="source_sha256"):
+        wf.execute({Stage.INGEST: ingest_spec()}, through=Stage.INGEST)
+
+
+def test_ingest_adopts_a_staging_tree_it_did_not_make_and_records_that(staging_small, tmp_path):
+    """Extracting on the machine with the disk for it is legitimate — and is not the same thing."""
+    wf = Workflow(tmp_path / "wf", e2e_config(staging_dir=str(staging_small.staging_dir)))
+    state = wf.execute({Stage.INGEST: ingest_spec()}, through=Stage.INGEST)
+
+    out = state.stages[Stage.INGEST].outputs
+    assert out["mode"] == "adopted_staging" and out["adopted"] is True
+    assert out["source_sha256"] and out["n_scans_extracted"] > 0
+    assert out["staging_digest"] == staging_digest(staging_small.staging_dir)
+
+
+@pytest.fixture(scope="module")
+def dataset_stage(staging_small, build_config_small, tmp_path_factory):
+    """One real Phase 0C build, driven by the DATASET stage, shared by the tests below."""
+    root = tmp_path_factory.mktemp("c2")
+    convention = root / "camera_convention.json"
+    cfg = e2e_config(
+        staging_dir=str(staging_small.staging_dir),
+        build_config=str(write_build_config(root, build_config_small, convention)),
+        dataset_dir=str(root / "dataset"),
+    )
+    wf = Workflow(root / "wf", cfg)
+    state = wf.execute(
+        {Stage.INGEST: ingest_spec(), Stage.DATASET: dataset_spec()}, through=Stage.DATASET
+    )
+    return SimpleNamespace(root=root, state=state, config=cfg, convention=convention)
+
+
+def test_the_dataset_stage_builds_validates_judges_and_gates(dataset_stage):
+    out = dataset_stage.state.stages[Stage.DATASET].outputs
+    ident = dataset_identity(out["dataset_dir"])
+
+    assert out["dataset_id"] == ident["dataset_id"]
+    assert out["dataset_hash"] == ident["dataset_hash"]
+    assert out["n_stations"] > 0 and out["n_images"] > 0 and out["init_points"] > 0
+    assert "geometry_holdout" in out["protocols"]
+    assert "volume_accuracy" in out["claims"]
+    assert out["golden_gate_passed"] is True and out["golden_gate_result"] == "pass"
+    from minegs.dataset.golden_gate import REPORT_FILE
+
+    assert Path(out["golden_gate_dir"], REPORT_FILE).is_file()
+
+
+def test_the_camera_convention_is_measured_and_recorded_never_assumed(dataset_stage):
+    """§12: the convention is evidence. A default here would be a silent hard-code."""
+    out = dataset_stage.state.stages[Stage.DATASET].outputs
+    assert out["camera_convention_status"] == "measured:selected"
+    assert dataset_stage.convention.is_file()
+    assert out["camera_convention_sha256"] == sha256_file(dataset_stage.convention)
+    assert out["camera_convention"]["source"]
+
+
+def test_the_runner_does_not_invent_a_holdout(dataset_stage):
+    """The manifest and judge() are the source of truth; the workflow only carries them."""
+    from minegs.core.manifest import Manifest
+    from minegs.eval.protocol import judge
+
+    out = dataset_stage.state.stages[Stage.DATASET].outputs
+    manifest = Manifest.load_dataset(out["dataset_dir"], strict_layout=False)
+    declared = [list(r) for r in judge(manifest).holdout_ranges_m]
+    assert out["geometry_holdout_ranges_m"] == declared
+    assert declared == [list(r) for r in manifest.split.geometry_holdout.chainage_ranges_m]
+
+
+def test_an_edited_staging_tree_makes_the_dataset_stage_stale(dataset_stage, tmp_path):
+    """T2 upstream: the build's input is re-read from disk, not copied from the ingest record."""
+    import shutil
+
+    staging = Path(dataset_stage.state.stages[Stage.INGEST].outputs["staging_dir"])
+    moved = tmp_path / "staging_copy"
+    shutil.copytree(staging, moved)
+    cfg = dataset_stage.config.model_dump(mode="json")
+    cfg["staging_dir"] = str(moved)
+    cfg["dataset_dir"] = str(tmp_path / "dataset")
+    wf = Workflow(tmp_path / "wf", E2EConfig.from_dict(cfg))
+    specs = {Stage.INGEST: ingest_spec(), Stage.DATASET: dataset_spec()}
+    wf.execute(specs, through=Stage.DATASET)
+
+    inv = moved / "inventory.json"
+    inv.write_text(inv.read_text().replace('"scan_count"', '"scan_count" '))
+    again = Workflow(tmp_path / "wf")
+    assert again.stale_stages(specs) == [Stage.INGEST, Stage.DATASET]
+    with pytest.raises(ContractError, match="completed against different inputs"):
+        again.execute(specs, through=Stage.DATASET)
+
+
+def test_a_supplied_camera_convention_is_left_exactly_as_it_is(
+    staging_small, build_config_small, calibration_small, tmp_path
+):
+    """An existing convention is the operator's reviewed evidence, not a cache to refresh."""
+    _, conv_path = calibration_small
+    mine = tmp_path / "camera_convention.json"
+    mine.write_text(conv_path.read_text())
+    before = sha256_file(mine)
+
+    cfg = e2e_config(
+        staging_dir=str(staging_small.staging_dir),
+        build_config=str(write_build_config(tmp_path, build_config_small, mine)),
+        dataset_dir=str(tmp_path / "dataset"),
+    )
+    state = Workflow(tmp_path / "wf", cfg).execute(
+        {Stage.INGEST: ingest_spec(), Stage.DATASET: dataset_spec()}, through=Stage.DATASET
+    )
+    out = state.stages[Stage.DATASET].outputs
+    assert out["camera_convention_status"] == "supplied"
+    assert sha256_file(mine) == before
