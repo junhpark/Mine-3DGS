@@ -25,7 +25,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 0C | Metric Dataset Golden Gate | **implementation complete, G1 structurally tested** (합성 staging → dataset → 재투영 Golden Gate) — **G2: DEFERRED / NOT VALIDATED** (PO 결정, §0C) |
 | 0D | Local GS Baseline | **0D.1 resume safety contract** 및 **0D.2 local GPU baseline execution contract** implemented + structurally tested. **실제 GPU baseline 미실행**. 0D 전체는 **NOT COMPLETE** (§0D) |
 | 1 | Metric Surface & Evaluation | **1A metric surface artifact + depth fusion** 및 **1B metric depth rendering: implemented + structurally tested** (§1). 검증된 depth manifest 가 있을 때만 `minegs_render` → `geometry_accuracy`; 외부 depth 는 diagnostic 전용. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), TSDF/mesh: NOT IMPLEMENTED, 실측 과학적 검증: NOT VALIDATED |
-| 2 | E57 End-to-End MVP | 미착수 |
+| 2 | E57 End-to-End MVP | **implemented + structurally tested** — E57 한 개를 ingest→dataset→train→depth→surface→geometry→section/volume→report 로 관통하는 단일 orchestration (`minegs e2e`), stage checkpoint, paired TLS validation, Phase 2 report. 합성 structural gate 는 실제 E57 파일에서 돌지만 **trainer/renderer 는 대체**된다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** (§2) |
 | 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
 | 4 | Advanced GS / Heavy Profile | 미착수 — `depth_loss` 는 여기서 설계 |
 | 5 | Long Tunnel & Chunking | 예약만 (manifest.chunks) |
@@ -712,9 +712,45 @@ section/volume 리포트 일관성).
 E57 → 파노라마 → metric dataset → local gsplat → surface → TLS_GLOBAL → 형상 비교 →
 단면 → 체적 → 리포트.
 
+계약은 [PHASE2_CONTRACT.md](PHASE2_CONTRACT.md), 실행 절차는
+[PHASE2_E57_G2.md](PHASE2_E57_G2.md) 가 담당한다.
+
+**구현된 것** (`minegs/e2e/`, `minegs eval` 과 `minegs e2e`):
+
+* **thin orchestration** — stage 순서·상태·artifact identity·시간만 책임진다. ingest/dataset/
+  train/eval logic 을 복제하지 않고 기존 domain 함수를 그대로 호출한다. 그래서 orchestrated
+  경로가 손으로 돌린 경로와 갈라질 자리가 없다.
+* **fail-closed checkpoint** — stage 마다 입력 identity 를 **세상에서 다시 읽어** digest 하고,
+  앞 stage 의 fingerprint 를 사슬로 엮는다. E57 교체·build config 변경·dataset hash 변경·run
+  교체·surface 교체 중 하나라도 있으면 downstream 은 stale 이고, 조용한 재사용 대신 무엇이
+  움직였는지 말하고 멈춘다. `--rebuild-from` 이 명시적 답이다.
+* **paired TLS validation** (`minegs/eval/volume/paired.py`) — 복원과 held-out TLS 를 **같은
+  section grid** 에서 station 단위로 pair 하고, 체적은 **common integration domain** 에서만
+  비교한다. 결측을 가로지르는 사다리꼴은 없고, 새 사다리꼴 구현도 없다 (Phase 1C helper 재사용).
+* **Phase 2 report** — `phase2_report.json` 이 source of truth, `phase2_report.md` 가 그 표현.
+  report 는 집계만 한다. 다시 계산하지 않고, 못 채운 값은 **null + 이유**이며, maturity status
+  를 올리지 않는다.
+* **CLI** — `minegs e2e run | status | report`. report 재생성은 stage 를 하나도 실행하지 않는다.
+  trainer/renderer 를 대체하는 flag 는 **없다**.
+
+**Structural gate** (`tests/test_e2e_gate.py`): 테스트 시점에 쓴 **실제 E57 파일**에서
+inventory·추출·camera convention 측정·dataset·golden gate·run 검증·depth manifest·surface
+promotion·geometry·section record·paired validation·report 까지 실제 production 함수를 관통한다.
+대체되는 것은 선언된 두 hardware seam — **trainer 와 renderer** — 뿐이고, 둘 다 대체 사실이
+stage 와 report 양쪽에 기록된다. T1–T10 adversarial case 가 여기 붙어 있다.
+
+**이것은 G2 가 아니다.** 합성 renderer 결과를 G2 라고 부르지 않는다.
+
 **Gate (G2)**: 실제 갱도 한 구간에서 end-to-end 리포트 생성 — 갱도 연장, 스테이션 수,
 이미지 수, 학습 설정, 재구성 소요시간, 형상 정확도 median/P95, completeness, 단면 면적 오차,
-체적 오차, valid coverage.
+체적 오차, valid coverage. 여기에 실제 GPU gsplat training 과 **실제
+`GsplatDepthRenderer.render` 최초 실행**, 사람의 육안 검토가 포함된다.
+
+실제 G2 전까지의 표현:
+
+> Phase 2 E57 end-to-end workflow is implemented and structurally tested.
+> Real-data scientific validation remains NOT VALIDATED.
+> Phase 2 G2 remains PENDING.
 
 이 Phase 완료 전에는 cloud infrastructure 와 advanced backend 최적화를 우선하지 않는다.
 
