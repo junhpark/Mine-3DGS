@@ -70,6 +70,7 @@ def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
     from minegs.core.errors import ContractError
     from minegs.core.pointcloud import read_ply
     from minegs.core.provenance import sha256_tree
+    from minegs.eval.surface.depth import rederive_depth_source
     from minegs.eval.surface.models import check_surface, find_surface, load_surface
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
@@ -82,6 +83,19 @@ def _resolve_pred(pred: Path, dataset_dir: Path, m, diagnostic: bool):
             f"surface [bold]{rec.surface_id}[/] ({rec.method}, depth {rec.depth_source}, "
             f"{rec.point_count} points from {rec.depth_map_count} depth maps, run {rec.run_id})"
         )
+        if rec.supports_accuracy_claim:
+            # `depth_source` is derived from evidence once, when the surface is fused, and then
+            # read back forever. `check_surface` re-reads the points and checks their digest; it
+            # has never re-checked this field, so a hand-written surface.json over any PLY --
+            # `raw/tls_full.ply` itself, in the audit that found this -- claimed geometry
+            # accuracy of 0.0 mm against the cloud it had been copied from. So the value is
+            # re-derived here rather than read, and what comes back is what is used.
+            stale = rederive_depth_source(rec, dataset_dir)
+            if stale is not None:
+                if not diagnostic:
+                    raise ContractError(stale)
+                console.print(f"[yellow]warning: {stale}[/]")
+                rec.depth_source = "external_unverified"
         if not rec.supports_accuracy_claim:
             if not diagnostic:
                 raise ContractError(_unverified_depth(rec))

@@ -316,7 +316,14 @@ minegs eval geometry data/<id>/runs/<run_id>/surface/depth_v001 data/<id>/datase
   |---|---|---|
   | 원시 PLY | `ContractError` — "Gaussian centres are not surfaces" | 경고 + `geometry_diagnostic` |
   | surface artifact, `external_unverified` | `ContractError` — depth 가 run 과 묶여 있지 않음 (Phase 1B) | 경고 + `geometry_diagnostic` |
-  | surface artifact, `minegs_render` (Phase 1B) | `geometry_accuracy` | `geometry_accuracy` |
+  | surface artifact, `minegs_render` 인데 재유도 불가 | `ContractError` — 증거가 없다 | 경고 + `geometry_diagnostic` |
+  | surface artifact, `minegs_render` 이고 재유도됨 | `geometry_accuracy` | `geometry_accuracy` |
+
+  **`depth_source` 는 읽지 않고 다시 유도한다** (Phase 1C 에서 추가). 그 값은 fusion 시점에 한 번
+  정해져 record 에 쓰이고, `check_surface` 는 점군 digest 만 다시 본다 — 그래서 `surface.json` 의
+  문자열 한 줄을 고치면 임의의 PLY 가 claim 에 도달했다. 적대적 감사가 `raw/tls_full.ply` 자신을
+  surface 로 위장해 `geometry_accuracy` 0.0 mm 를 얻는 것으로 재현했다. 이제 claim 경로는 surface 가
+  기록한 depth/run 디렉터리에 대해 Phase 1B promotion 을 다시 돌리고, 돌아온 값을 쓴다.
 
   여기에 더해 **`--no-holdout-only` 는 claim 을 내리지 않는다**: `geometry_accuracy` 는 정의상
   holdout TLS 에 대한 주장이고, holdout 구간을 벗어난 수치는 run 이 초기화·학습에 쓴 형상을

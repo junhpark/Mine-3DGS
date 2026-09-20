@@ -286,7 +286,13 @@ def _check_surface_still_agrees(rec: SectionRecord, dataset_id: str, dataset_has
             f"{surface.point_sha256[:12]}, the sections were cut from "
             f"{str(rec.source.point_sha256)[:12]}"
         )
-    if surface.depth_source != rec.source.depth_source:
+    # Directional on purpose. The section builder records the *re-derived* provenance, not the
+    # string surface.json carries, so a record saying less than the file is the honest case and
+    # must keep working. A record saying *more* than the file is the one that would promote.
+    if (
+        rec.source.depth_source in CLAIM_CAPABLE_DEPTH_SOURCES
+        and surface.depth_source not in CLAIM_CAPABLE_DEPTH_SOURCES
+    ):
         raise ContractError(
             f"sections {rec.section_id} record depth_source={rec.source.depth_source!r}, but "
             f"surface {surface.surface_id} is {surface.depth_source!r}"

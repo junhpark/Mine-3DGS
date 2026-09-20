@@ -1005,14 +1005,83 @@ def test_editing_depth_source_in_surface_json_does_not_reach_a_claim(chain, tmp_
     rec.save(promoted / SURFACE_FILE)
 
     sec, out = tmp_path / "s.json", tmp_path / "v.json"
-    srec = cut(promoted, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
-    assert srec.supports_accuracy_claim  # the label made it this far...
+    r = runner.invoke(
+        app,
+        sections_argv(
+            promoted, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72
+        ),
+    )
+    # `eval sections` resolves the surface on the diagnostic path, so it re-derives and records
+    # what came back rather than what was written: the label does not even reach the artifact.
+    assert r.exit_code == 0, r.output
+    assert "re-deriving it" in flat(r)
+    srec = SectionRecord.load(sec)
+    assert srec.source.depth_source == "external_unverified"
+    assert not srec.supports_accuracy_claim
 
     r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
-    assert r.exit_code == 2, r.output  # ...and no further
-    assert "re-deriving it" in flat(r) or "cannot be re-derived" in flat(r)
+    assert r.exit_code == 2, r.output
+    assert "external_unverified" in flat(r)
     r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, out, diagnostic=True))
     assert r.exit_code == 0 and volume_json(out)["claim"] == "geometry_diagnostic"
+
+
+def test_a_surface_forged_over_the_tls_reference_reaches_no_claim(synthetic, tmp_path):
+    """The audit's own attack, end to end: hand-write surface.json over raw/tls_full.ply.
+
+    Every integrity check passes by construction -- the digest is of the file that is there, the
+    dataset ids are this dataset's -- and before Phase 1C it produced `geometry_accuracy` at
+    0.0 mm against the cloud it had been copied from, and `volume_accuracy` over the holdout.
+    """
+    from minegs.core.manifest import Manifest
+    from minegs.core.pointcloud import read_ply, write_ply
+    from minegs.core.provenance import ProvenanceRecord, sha256_file, sha256_tree
+    from minegs.eval.surface.models import SURFACE_FILE, SURFACE_POINTS_FILE, SurfaceRecord
+    from minegs.train.runner.base import DATASET_HASH_PATTERNS
+
+    ds = synthetic.dataset_dir
+    m = Manifest.load_dataset(ds, strict_layout=False)
+    tls = read_ply(synthetic.root / "raw" / "tls_full.ply")
+    forged = tmp_path / "forged_surface"
+    forged.mkdir()
+    ply = write_ply(
+        tls.transformed(m.T_tls_from_local.inverse(), "LOCAL_METRIC"), forged / SURFACE_POINTS_FILE
+    )
+    SurfaceRecord(
+        surface_id="surface_forged",
+        dataset_id=m.dataset_id,
+        dataset_hash=sha256_tree(ds, DATASET_HASH_PATTERNS),
+        run_id="run_never_existed",
+        method="depth_backprojection",
+        depth_source="minegs_render",
+        point_file=SURFACE_POINTS_FILE,
+        point_sha256=sha256_file(ply),
+        point_count=len(tls),
+        depth_map_count=1,
+        depth_sha256="0" * 64,
+        parameters={},
+        provenance=ProvenanceRecord(),
+    ).save(forged / SURFACE_FILE)
+
+    r = runner.invoke(
+        app,
+        [
+            "eval",
+            "geometry",
+            str(forged),
+            str(ds),
+            "--tls-ply",
+            str(synthetic.root / "raw" / "tls_full.ply"),
+        ],
+    )
+    assert r.exit_code == 2, r.output
+    assert "cannot be re-derived" in flat(r)
+
+    sec = tmp_path / "s.json"
+    cut(forged, ds, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert SectionRecord.load(sec).source.depth_source == "external_unverified"
+    r = runner.invoke(app, volume_argv(sec, ds))
+    assert r.exit_code == 2, r.output
 
 
 def test_a_claim_needs_the_depth_and_run_the_surface_was_fused_from(chain, tmp_path):

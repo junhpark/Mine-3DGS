@@ -313,15 +313,22 @@ def test_t8_a_surface_artifact_reaches_the_evaluator_but_external_depth_is_diagn
     same = json.loads(raw.read_text())
     assert same["accuracy"] == rep["accuracy"] and same["completeness"] == rep["completeness"]
 
-    # and the gate really is the depth provenance: the identical artifact, declared as depth
-    # this project rendered, reaches the accuracy claim. That value is Phase 1B's to write.
+    # and the gate really is the depth provenance -- but *declaring* it is not the gate. Until
+    # Phase 1C this same edit reached the accuracy claim: `depth_source` was derived from
+    # evidence once, at fusion, and read back forever, so one string in surface.json promoted
+    # any PLY. The evaluator now re-derives it from the depth and run directories the record
+    # names, and this artifact's depth has no manifest behind it.
     rendered = SurfaceRecord.load(surface_dir / SURFACE_FILE)
     rendered.depth_source = "minegs_render"
     rendered.save(surface_dir / SURFACE_FILE)
     claimed = tmp_path / "claim.json"
     r = runner.invoke(app, geometry_argv(surface_dir, synthetic, claimed))
+    assert r.exit_code == 2, r.output
+    assert "re-deriving it" in " ".join(r.output.split())
+    # ...and with --diagnostic the re-derived value is what gets used, not the declared one
+    r = runner.invoke(app, geometry_argv(surface_dir, synthetic, claimed, diagnostic=True))
     assert r.exit_code == 0, r.output
-    assert json.loads(claimed.read_text())["claim"] == "geometry_accuracy"
+    assert json.loads(claimed.read_text())["claim"] == "geometry_diagnostic"
 
 
 def test_t9_a_record_is_not_a_surface(synthetic, tmp_path):
