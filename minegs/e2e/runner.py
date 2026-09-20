@@ -54,7 +54,10 @@ __all__ = [
     "StageSpec",
     "Workflow",
     "fingerprint",
+    "load_e2e_config",
     "now_iso",
+    "stage_from_name",
+    "stages_through",
 ]
 
 import minegs
@@ -113,6 +116,33 @@ class E2EConfig(VersionedModel):
     interval_m: float = 1.0
     thickness_m: float = 0.5
     angle_bins: int = 180
+
+    #: Everything above that names a file or a directory. A config is a document an operator
+    #: keeps beside its inputs, so its relative paths mean "next to me", not "next to wherever
+    #: this was invoked from".
+    PATH_FIELDS: ClassVar[tuple[str, ...]] = (
+        "source_e57",
+        "staging_dir",
+        "dataset_dir",
+        "runs_dir",
+        "build_config",
+        "tls_reference_ply",
+        "mapping",
+        "vendor_manifest",
+        "images_dir",
+    )
+
+    def resolve_paths(self, base: str | Path) -> E2EConfig:
+        """Make relative file references absolute against the config file's directory."""
+        base = Path(base)
+        cfg = self.model_copy(deep=True)
+        for name in self.PATH_FIELDS:
+            value = getattr(cfg, name)
+            if not value:
+                continue
+            q = Path(value)
+            setattr(cfg, name, str(q if q.is_absolute() else (base / q).resolve()))
+        return cfg
 
     def require(self, *names: str) -> tuple[Any, ...]:
         """Fetch config values a stage cannot run without, naming all the missing ones at once."""
@@ -248,11 +278,16 @@ class Workflow:
         rebuild_from: Stage | None = None,
         renderer: Any = None,
         trainer: Any = None,
+        on_stage: Callable[[str, StageRecord], None] | None = None,
     ) -> WorkflowState:
         """Run the stages up to *through*, reusing what is still valid.
 
         *rebuild_from* is the explicit answer to a stale stage: it clears that stage and
         everything after it, so what gets rebuilt is visible in the ledger rather than implied.
+
+        *on_stage* is called ``("start", rec)`` and ``("end", rec)`` around each stage. It exists
+        so the CLI can say what is happening during a run measured in hours; it is told, never
+        asked, and returning from it cannot change what the workflow does.
         """
         if rebuild_from is not None:
             self._clear_from(rebuild_from)
@@ -261,9 +296,13 @@ class Workflow:
         for stage in wanted:
             if stage not in specs:
                 raise ContractError(f"no handler registered for stage {stage.value}")
+            if on_stage is not None:
+                on_stage("start", self.state.stages[stage])
             # Dropped after each stage runs: the stage that just executed changed the world its
             # successors read, so a cached answer from before it would describe the old one.
-            self._one(specs, stage, cache, renderer=renderer, trainer=trainer)
+            rec = self._one(specs, stage, cache, renderer=renderer, trainer=trainer)
+            if on_stage is not None:
+                on_stage("end", rec)
             cache.clear()
         return self.state
 
@@ -346,6 +385,14 @@ class Workflow:
             if fp != rec.input_fingerprint:
                 out.append(stage)
         return out
+
+
+def load_e2e_config(path: str | Path) -> E2EConfig:
+    """Read a workflow config, with its relative paths taken against its own directory."""
+    p = Path(path)
+    if not p.is_file():
+        raise ContractError(f"workflow config {p} not found")
+    return E2EConfig.load(p).resolve_paths(p.parent)
 
 
 def _stale(stage: Stage, rec: StageRecord, now: dict[str, Any]) -> str:

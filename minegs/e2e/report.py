@@ -396,8 +396,9 @@ def render_markdown(report: Phase2Report) -> str:
         f"- centerline length: {_m(d.centerline_length_m, ' m', 2)}",
         f"- evaluated (holdout) length: {_m(d.evaluated_length_m, ' m', 2)}",
         f"- geometry holdout: {_intervals(d.geometry_holdout_ranges_m)}",
-        f"- camera convention: {d.camera_convention.get('label', '—')} "
-        f"({d.camera_convention.get('source', '—')})",
+        f"- camera convention: {d.camera_convention.get('label') or '—'} "
+        f"({d.camera_convention.get('source') or '—'}, "
+        f"{d.camera_convention.get('origin') or '—'})",
         f"- protocol: {', '.join(d.protocol) or '—'}",
         f"- claims the dataset allows: {', '.join(d.claims_allowed) or '—'}",
         f"- golden gate: {_m(d.golden_gate_passed)}",

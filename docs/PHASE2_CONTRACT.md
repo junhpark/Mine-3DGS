@@ -92,6 +92,24 @@ surface 교체 중 하나라도 있으면 downstream evidence 는 stale 이다.
 artifact 에서 DEPTH 부터 이어 간다는 뜻이다. gsplat training 자체의 resume 은 여전히 미구현이고
 fail closed 다 (Phase 0D.3).
 
+## 3.1 CLI
+
+`minegs e2e run | status | report` — 하나의 discoverable entry point.
+
+| 커맨드 | 하는 일 |
+|---|---|
+| `run <config> --work-dir <dir> [--through <stage>] [--rebuild-from <stage>]` | stage 를 순서대로 실행한다. 비싼 쪽. |
+| `status --work-dir <dir> [--json <file>]` | 읽기 전용. 어디까지 됐고, 지금 실행하면 무엇이 거부되는지. |
+| `report --work-dir <dir> [--out <dir>]` | 이미 있는 artifact 에서 문서만 다시 만든다. **stage 를 하나도 실행하지 않는다.** |
+
+workflow 실행과 report 생성은 분리한다. 제목 한 줄을 고치려고 E57 추출이나 training 을 다시
+하지 않는다.
+
+CLI 에는 trainer 나 renderer 를 대체하는 flag 가 **없다**. 그 seam 은 Python 에서 structural
+gate 가 잡고, 잡았다는 사실을 stage 와 report 양쪽에 기록한다. `--fake-renderer` 같은 flag 는
+GPU 가 한 번도 돌지 않은 채로 Phase 2 report 를 만들어 내는 길이고, 이 저장소의 계약이 막으려는
+것이 정확히 그것이다.
+
 ## 4. Report schema
 
 `phase2_report.json` = `Phase2Report` (schema 1.0) 가 **machine-readable source of truth** 다.
