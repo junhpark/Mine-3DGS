@@ -8,6 +8,7 @@ them in follows in later checkpoints; what is asserted here is the contract they
 from __future__ import annotations
 
 import pytest
+from minegs.core.errors import ContractError
 from minegs.core.provenance import ProvenanceRecord
 from minegs.e2e.models import (
     STAGE_ORDER,
@@ -17,6 +18,14 @@ from minegs.e2e.models import (
     StageRecord,
     StageStatus,
     WorkflowState,
+)
+from minegs.e2e.runner import (
+    E2EConfig,
+    StageContext,
+    StageOutcome,
+    StageSpec,
+    Workflow,
+    fingerprint,
 )
 
 
@@ -121,3 +130,171 @@ def test_the_report_carries_both_geometry_directions():
     assert {"accuracy_median_m", "accuracy_p95_m"} <= fields
     assert {"completeness_median_m", "completeness_p95_m"} <= fields
     assert {"chamfer_m", "f_score"} <= fields
+
+
+# ---------------------------------------------------------------- C1: the ledger and the loop
+
+
+def spec_for(stage: Stage, inputs, ran: list[Stage], outputs=None) -> StageSpec:
+    def _run(ctx: StageContext) -> StageOutcome:
+        ran.append(stage)
+        return StageOutcome(outputs=dict(outputs or {"id": f"{stage.value}_out"}))
+
+    return StageSpec(stage=stage, inputs=inputs, run=_run)
+
+
+def chain_specs(ran: list[Stage], world: dict) -> dict[Stage, StageSpec]:
+    """A stage graph shaped like the real one: each stage's inputs come from the one before.
+
+    ``world`` stands in for what is on disk, so a test can change it under a completed stage.
+    """
+    specs: dict[Stage, StageSpec] = {}
+    for i, stage in enumerate(STAGE_ORDER):
+        if i == 0:
+            specs[stage] = spec_for(stage, lambda ctx: {"source": world["source"]}, ran)
+        else:
+            prev = STAGE_ORDER[i - 1]
+            specs[stage] = spec_for(
+                stage, lambda ctx, prev=prev: {"upstream": ctx.upstream(prev)}, ran
+            )
+    return specs
+
+
+def test_a_workflow_runs_its_stages_in_order_and_records_each_one(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    wf = Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57"))
+    state = wf.execute(chain_specs(ran, world))
+
+    assert ran == list(STAGE_ORDER)
+    for stage in STAGE_ORDER:
+        rec = state.stages[stage]
+        assert rec.status is StageStatus.SUCCEEDED
+        assert rec.input_fingerprint and rec.started_at and rec.completed_at
+        assert rec.elapsed_seconds is not None and rec.elapsed_seconds >= 0
+        assert rec.minegs_version and rec.tool_versions
+        assert rec.outputs == {"id": f"{stage.value}_out"}
+
+
+def test_a_second_run_reuses_every_stage_and_says_so(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    wf = Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57"))
+    wf.execute(chain_specs(ran, world))
+    ran.clear()
+
+    again = Workflow(tmp_path / "wf").execute(chain_specs(ran, world))
+    assert ran == []  # nothing re-ran
+    assert all(again.stages[s].status is StageStatus.REUSED for s in STAGE_ORDER)
+
+
+def test_a_changed_source_refuses_to_reuse_the_stage_it_changed(tmp_path):
+    """The whole point of the fingerprint: a green tick on evidence about another survey."""
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    wf = Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57"))
+    wf.execute(chain_specs(ran, world))
+
+    world["source"] = "e57_b"
+    with pytest.raises(ContractError, match="completed against different inputs"):
+        Workflow(tmp_path / "wf").execute(chain_specs([], world))
+
+
+def test_a_stale_stage_is_visible_before_anything_is_attempted(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    wf = Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57"))
+    wf.execute(chain_specs(ran, world))
+    assert Workflow(tmp_path / "wf").stale_stages(chain_specs([], world)) == []
+
+    world["source"] = "e57_b"
+    assert Workflow(tmp_path / "wf").stale_stages(chain_specs([], world)) == [Stage.INGEST]
+
+
+def test_rebuild_from_is_the_explicit_answer_and_cascades(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57")).execute(chain_specs(ran, world))
+    ran.clear()
+
+    world["source"] = "e57_b"
+    state = Workflow(tmp_path / "wf").execute(chain_specs(ran, world), rebuild_from=Stage.INGEST)
+    assert ran == list(STAGE_ORDER)  # everything after the changed stage too
+    assert all(state.stages[s].status is StageStatus.SUCCEEDED for s in STAGE_ORDER)
+
+
+def test_rebuilding_one_stage_leaves_the_ones_before_it_reused(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57")).execute(chain_specs(ran, world))
+    ran.clear()
+
+    state = Workflow(tmp_path / "wf").execute(chain_specs(ran, world), rebuild_from=Stage.DEPTH)
+    assert ran == [Stage.DEPTH, Stage.SURFACE, Stage.GEOMETRY, Stage.SECTIONS_VOLUME, Stage.REPORT]
+    assert state.stages[Stage.TRAIN].status is StageStatus.REUSED
+    assert state.stages[Stage.DEPTH].status is StageStatus.SUCCEEDED
+
+
+def test_a_downstream_stage_refuses_to_run_on_an_upstream_that_did_not(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    specs = chain_specs(ran, world)
+
+    def boom(ctx: StageContext) -> StageOutcome:
+        raise ContractError("the extractor said no")
+
+    specs[Stage.INGEST] = StageSpec(
+        stage=Stage.INGEST, inputs=lambda ctx: {"source": world["source"]}, run=boom
+    )
+    wf = Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57"))
+    with pytest.raises(ContractError, match="the extractor said no"):
+        wf.execute(specs)
+
+    # the ledger survives the crash and says where it stopped
+    state = WorkflowState.load(tmp_path / "wf" / "workflow.json")
+    assert state.stages[Stage.INGEST].status is StageStatus.FAILED
+    assert "the extractor said no" in (state.stages[Stage.INGEST].failure_reason or "")
+    assert state.stages[Stage.INGEST].elapsed_seconds is not None
+    assert state.stages[Stage.DATASET].status is StageStatus.PENDING
+
+    # ...and a later stage will not build on the hole it left
+    ctx = StageContext(
+        stage=Stage.DATASET,
+        config=E2EConfig(source_e57="a.e57"),
+        work_dir=tmp_path / "wf",
+        state=state,
+    )
+    with pytest.raises(ContractError, match="needs ingest, which is failed"):
+        ctx.upstream(Stage.INGEST)
+
+
+def test_through_stops_where_it_is_told(tmp_path):
+    ran: list[Stage] = []
+    world = {"source": "e57_a"}
+    state = Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57")).execute(
+        chain_specs(ran, world), through=Stage.SURFACE
+    )
+    assert ran == [Stage.INGEST, Stage.DATASET, Stage.TRAIN, Stage.DEPTH, Stage.SURFACE]
+    assert state.done_through() == ran
+    assert state.stages[Stage.GEOMETRY].status is StageStatus.PENDING
+
+
+def test_reopening_a_workflow_with_a_different_config_is_a_different_workflow(tmp_path):
+    Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57", profile="light"))
+    with pytest.raises(ContractError, match="different workflow config"):
+        Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57", profile="heavy"))
+    # ...and reopening with the same config, or with none, is fine
+    assert Workflow(tmp_path / "wf", E2EConfig(source_e57="a.e57", profile="light"))
+    assert Workflow(tmp_path / "wf").config.profile == "light"
+
+
+def test_a_config_that_does_not_name_what_a_stage_needs_says_all_of_it_at_once():
+    cfg = E2EConfig(source_e57="a.e57")
+    assert cfg.require("source_e57") == ("a.e57",)
+    with pytest.raises(ContractError, match=r"\['staging_dir', 'dataset_dir'\]"):
+        cfg.require("source_e57", "staging_dir", "dataset_dir")
+
+
+def test_the_fingerprint_does_not_depend_on_key_order():
+    assert fingerprint({"a": 1, "b": 2}) == fingerprint({"b": 2, "a": 1})
+    assert fingerprint({"a": 1}) != fingerprint({"a": 2})
