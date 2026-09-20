@@ -34,12 +34,10 @@ from minegs.e2e.runner import (
 from minegs.e2e.stages import (
     dataset_identity,
     dataset_spec,
+    default_specs,
     depth_spec,
-    geometry_spec,
     ingest_spec,
-    sections_volume_spec,
     staging_digest,
-    surface_spec,
     train_spec,
 )
 from minegs.eval.volume import compare_to_reference
@@ -543,18 +541,10 @@ def chain(staging_small, build_config_small, tls_reference, tmp_path_factory):
         max_dist_m=1.0,
     )
     wf = Workflow(root / "wf", cfg)
-    specs = {
-        Stage.INGEST: ingest_spec(),
-        Stage.DATASET: dataset_spec(),
-        Stage.TRAIN: train_spec(),
-        Stage.DEPTH: depth_spec(),
-        Stage.SURFACE: surface_spec(),
-        Stage.GEOMETRY: geometry_spec(),
-        Stage.SECTIONS_VOLUME: sections_volume_spec(),
-    }
+    specs = default_specs()
     state = wf.execute(
         specs,
-        through=Stage.SECTIONS_VOLUME,
+        through=Stage.REPORT,
         renderer=StandInRenderer(depth_m=7.0),
         trainer=stand_in_trainer,
     )
@@ -661,6 +651,7 @@ def test_a_retrained_run_makes_the_depth_and_surface_stages_stale(chain):
             Stage.SURFACE,
             Stage.GEOMETRY,
             Stage.SECTIONS_VOLUME,
+            Stage.REPORT,
         ]
         with pytest.raises(ContractError, match="checkpoint_sha256"):
             wf.execute(chain.specs, through=Stage.SURFACE)
@@ -885,3 +876,234 @@ def test_t5_the_geometry_numbers_are_measured_inside_the_holdout_only(chain):
     assert rep["claim"] == "geometry_accuracy"
     command = chain.state.stages[Stage.GEOMETRY].command
     assert command["holdout_only"] is True and command["diagnostic"] is False
+
+
+# ---------------------------------------------------------------- C5: the report
+
+
+def test_the_report_stage_writes_both_documents(chain):
+    out = chain.state.stages[Stage.REPORT].outputs
+    assert Path(out["report_json_path"]).is_file()
+    assert Path(out["report_md_path"]).is_file()
+    assert Path(out["report_json_path"]).name == "phase2_report.json"
+    assert Path(out["report_md_path"]).name == "phase2_report.md"
+    report = Phase2Report.load(out["report_json_path"])
+    assert report.report_id == out["report_id"]
+    assert report.workflow_id == chain.state.workflow_id
+
+
+def test_the_report_copies_its_numbers_and_recomputes_none(chain):
+    """A report that recomputes is a second implementation, and a second answer."""
+    sv = chain.state.stages[Stage.SECTIONS_VOLUME].outputs
+    paired = json.loads(Path(sv["paired_validation_path"]).read_text())
+    report = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
+
+    for field in (
+        "predicted_volume_m3",
+        "reference_volume_m3",
+        "signed_error_m3",
+        "absolute_error_m3",
+        "relative_error",
+        "requested_length_m",
+        "common_covered_length_m",
+        "coverage_fraction",
+    ):
+        # Equality, not approximate equality: these are copies, so any difference at all means
+        # something along the way did arithmetic of its own.
+        assert getattr(report.volume, field) == paired["volume"][field], field
+    for field in (
+        "station_count",
+        "paired_valid_count",
+        "missing_prediction_count",
+        "missing_reference_count",
+        "mean_absolute_error_m2",
+        "median_absolute_error_m2",
+        "p95_absolute_error_m2",
+        "mean_signed_error_m2",
+        "mean_relative_error",
+    ):
+        assert getattr(report.sections, field) == paired["sections"][field], field
+
+    geometry = chain.state.stages[Stage.GEOMETRY].outputs
+    assert report.geometry.chamfer_m == geometry["chamfer_m"]
+    assert report.geometry.accuracy_p95_m == geometry["accuracy_p95_m"]
+    assert report.geometry.claim == geometry["claim"] == "geometry_accuracy"
+
+
+def test_the_markdown_is_a_rendering_of_the_json_and_not_a_second_one(chain):
+    from minegs.e2e.report import render_markdown
+
+    out = chain.state.stages[Stage.REPORT].outputs
+    report = Phase2Report.load(out["report_json_path"])
+    assert Path(out["report_md_path"]).read_text() == render_markdown(report)
+
+
+def test_the_report_never_upgrades_a_maturity_status(chain):
+    """Whatever the numbers look like, the workflow does not get to validate itself."""
+    from minegs.e2e.report import MATURITY_PENDING
+
+    report = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
+    assert report.maturity.structural_status == "implemented_and_structurally_tested"
+    assert report.maturity.real_data_validation_status == "not_validated"
+    assert report.maturity.human_visual_review_status == "pending"
+    assert report.maturity.statement == MATURITY_PENDING
+    assert "NOT VALIDATED" in report.maturity.statement
+    assert "PENDING" in report.maturity.statement
+
+
+def test_the_report_records_both_substitutions_rather_than_the_appearance_of_a_run(chain):
+    report = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
+    md = Path(chain.state.stages[Stage.REPORT].outputs["report_md_path"]).read_text()
+
+    assert report.training.real_gpu_execution is False
+    assert report.reconstruction.real_renderer_execution is False
+    assert report.training.gpu_model is None and report.training.cuda_version is None
+    assert any("substituted" in n for n in report.training.notes)
+    assert any("GsplatDepthRenderer.render" in n for n in report.reconstruction.notes)
+    assert any("GsplatDepthRenderer.render" in n for n in report.maturity.notes)
+    # The reader sees it beside the maturity statement, not buried in a JSON field.
+    assert "real GPU training executed: **False**" in md
+    assert "real depth renderer executed: **False**" in md
+
+
+def test_the_report_states_the_identities_its_numbers_rest_on(chain):
+    report = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
+    dataset = chain.state.stages[Stage.DATASET].outputs
+    train = chain.state.stages[Stage.TRAIN].outputs
+    surface = chain.state.stages[Stage.SURFACE].outputs
+
+    assert report.dataset.dataset_id == dataset["dataset_id"]
+    assert report.dataset.dataset_hash == dataset["dataset_hash"]
+    assert report.dataset.golden_gate_passed is True
+    assert report.dataset.centerline_length_m == dataset["centerline_length_m"] > 0
+    assert report.dataset.geometry_holdout_ranges_m == [
+        tuple(r) for r in dataset["geometry_holdout_ranges_m"]
+    ]
+    assert report.training.run_id == train["run_id"]
+    assert report.reconstruction.surface_id == surface["surface_id"]
+    assert report.reconstruction.depth_source == "minegs_render"
+    assert report.source.sha256 or report.source.notes  # adopted staging says so in notes
+
+
+def test_a_value_the_report_cannot_find_is_null_with_a_reason():
+    """An invented number travels further from a report than from anywhere else."""
+    from minegs.e2e.report import build_report, render_markdown
+
+    report = build_report(blank_state())
+
+    assert report.volume.predicted_volume_m3 is None
+    assert report.sections.paired_valid_count is None
+    assert report.geometry.chamfer_m is None
+    assert report.dataset.dataset_id is None and report.runtime.total_seconds is None
+    assert report.maturity.structural_status == "incomplete"
+    assert any("ingest" in n for n in report.maturity.notes)
+    assert any("unidentified" in n for n in report.source.notes)
+    # And the rendering says so rather than printing a zero.
+    md = render_markdown(report)
+    assert "- predicted: —" in md and "Chamfer: —" in md
+
+
+def test_the_report_names_every_stage_that_did_not_complete():
+    from minegs.e2e.report import build_report
+
+    state = blank_state(
+        stages={
+            Stage.INGEST: StageRecord(stage=Stage.INGEST, status=StageStatus.SUCCEEDED),
+            Stage.DATASET: StageRecord(
+                stage=Stage.DATASET,
+                status=StageStatus.FAILED,
+                failure_reason="ContractError: golden gate",
+            ),
+        }
+    )
+    report = build_report(state)
+
+    note = "\n".join(report.maturity.notes)
+    assert "dataset=failed" in note and "train=pending" in note
+    assert "ingest=" not in note  # it completed; only the missing ones are named
+    rows = {row["stage"]: row for row in report.stages}
+    assert rows["dataset"]["failure_reason"] == "ContractError: golden gate"
+    assert [row["stage"] for row in report.stages] == [s.value for s in STAGE_ORDER]
+
+
+def test_regenerating_the_report_runs_no_stage(chain, tmp_path):
+    """Rewriting a heading must not cost an E57 extraction or a training run."""
+    from minegs.e2e.report import report_from_workflow
+
+    before = json.loads((chain.root / "wf" / "workflow.json").read_text())
+    path = report_from_workflow(chain.root / "wf", tmp_path / "again")
+    after = json.loads((chain.root / "wf" / "workflow.json").read_text())
+
+    assert path.is_file() and (tmp_path / "again" / "phase2_report.md").is_file()
+    # The ledger is untouched: nothing ran, nothing was marked reused, no time was spent.
+    assert before["stages"] == after["stages"]
+    regenerated = Phase2Report.load(path)
+    original = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
+    assert regenerated.volume.model_dump() == original.volume.model_dump()
+    assert regenerated.sections.model_dump() == original.sections.model_dump()
+    assert regenerated.report_id != original.report_id  # a new document, not a forged copy
+
+
+def test_there_is_nothing_to_report_on_without_a_workflow(tmp_path):
+    from minegs.e2e.report import report_from_workflow
+
+    with pytest.raises(ContractError, match="no workflow there"):
+        report_from_workflow(tmp_path)
+
+
+def test_an_edited_paired_validation_makes_the_report_stale(chain, tmp_path):
+    """The report reads that file, so a change to it is a change to the report's inputs."""
+    from minegs.e2e.report import build_report
+
+    root = tmp_path / "restale"
+    root.mkdir()
+    state_path = root / "workflow.json"
+    state_path.write_text((chain.root / "wf" / "workflow.json").read_text())
+    wf = Workflow(root)
+    paired = Path(chain.state.stages[Stage.SECTIONS_VOLUME].outputs["paired_validation_path"])
+    original = paired.read_text()
+    try:
+        edited = json.loads(original)
+        edited["volume"]["predicted_volume_m3"] = 1.0
+        paired.write_text(json.dumps(edited))
+        assert Stage.REPORT in wf.stale_stages(default_specs())
+        with pytest.raises(ContractError, match="stage report completed against different"):
+            wf.execute(
+                default_specs(),
+                renderer=StandInRenderer(depth_m=7.0),
+                trainer=stand_in_trainer,
+            )
+        # And the report the edit was trying to reach reads the edited file, not a cached number.
+        assert build_report(wf.state).volume.predicted_volume_m3 == 1.0
+    finally:
+        paired.write_text(original)
+
+
+def test_the_report_stage_refuses_a_paired_validation_that_is_not_there(chain, tmp_path):
+    from minegs.e2e.stages import report_spec
+
+    ctx = StageContext(
+        stage=Stage.REPORT,
+        config=chain.config,
+        work_dir=tmp_path,
+        state=chain.state,
+    )
+    paired = Path(chain.state.stages[Stage.SECTIONS_VOLUME].outputs["paired_validation_path"])
+    original = paired.read_text()
+    try:
+        paired.unlink()
+        with pytest.raises(ContractError, match="is not there"):
+            report_spec().inputs(ctx)
+    finally:
+        paired.write_text(original)
+
+
+def test_the_runtime_table_sums_only_the_stages_this_workflow_ran(chain):
+    report = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
+    measured = [
+        chain.state.stages[s].elapsed_seconds
+        for s in STAGE_ORDER
+        if chain.state.stages[s].elapsed_seconds is not None and s is not Stage.REPORT
+    ]
+    assert report.runtime.total_seconds == pytest.approx(sum(measured), abs=1e-6)
+    assert report.runtime.dataset_seconds == chain.state.stages[Stage.DATASET].elapsed_seconds

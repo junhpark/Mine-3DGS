@@ -32,7 +32,20 @@ from minegs.e2e.models import Stage
 from minegs.e2e.runner import StageContext, StageOutcome, StageSpec
 from minegs.eval.surface.models import DEPTH_MANIFEST_FILE
 
-__all__ = ["STAGING_ARTIFACTS", "dataset_identity", "dataset_spec", "ingest_spec", "staging_digest"]
+__all__ = [
+    "STAGING_ARTIFACTS",
+    "dataset_identity",
+    "dataset_spec",
+    "default_specs",
+    "depth_spec",
+    "geometry_spec",
+    "ingest_spec",
+    "report_spec",
+    "sections_volume_spec",
+    "staging_digest",
+    "surface_spec",
+    "train_spec",
+]
 
 #: The three files that make a staging tree what it is (``minegs/dataset/staging_input.py``).
 STAGING_ARTIFACTS = ("inventory.json", "pano_mapping.json", "extraction_manifest.json")
@@ -282,10 +295,16 @@ def _dataset_run(ctx: StageContext) -> StageOutcome:
 
     ident = dataset_identity(out)
     report = result.report
+    # Read back from the dataset's own centerline file rather than measured over some other
+    # polyline: the report states how long the tunnel this dataset describes is, and it has to
+    # be the same axis the holdout ranges were cut out of.
+    extent = _centerline_extent(out, result.manifest)
     return StageOutcome(
         outputs={
             **ident,
             "dataset_dir": str(out.resolve()),
+            "centerline_extent_m": list(extent) if extent else None,
+            "centerline_length_m": (float(extent[1]) - float(extent[0])) if extent else None,
             "n_stations": report.get("n_stations"),
             "n_images": report.get("n_images"),
             "init_points": (report.get("initialization") or {}).get("points_out"),
@@ -309,6 +328,17 @@ def _dataset_run(ctx: StageContext) -> StageOutcome:
             "config": str(build_config),
         },
     )
+
+
+def _centerline_extent(dataset_dir: Path, manifest: Any) -> tuple[float, float] | None:
+    """The chainage this dataset's centerline spans, or None when it declares none."""
+    from minegs.core.centerline import Centerline
+
+    ref = getattr(manifest, "centerline", None)
+    if ref is None:
+        return None
+    cl = Centerline.from_csv(dataset_dir / ref.file, ref.frame, ref.source)
+    return (cl.s_start, cl.s_end)
 
 
 def _ensure_camera_convention(spec: Any, staging: str | Path, calibrate: Any, load: Any) -> str:
@@ -786,3 +816,75 @@ def _sections_run(ctx: StageContext) -> StageOutcome:
 
 def sections_volume_spec() -> StageSpec:
     return StageSpec(stage=Stage.SECTIONS_VOLUME, inputs=_sections_inputs, run=_sections_run)
+
+
+# ---------------------------------------------------------------- REPORT
+
+
+def _report_inputs(ctx: StageContext) -> dict[str, Any]:
+    """The artifact the report actually reads, by digest.
+
+    Everything else it needs comes from the ledger, and the ledger's own identities arrive
+    through the chained upstream fingerprint. The paired validation is the one file it opens, so
+    it is the one thing that can move under it without any earlier stage noticing.
+    """
+    sv = ctx.upstream(Stage.SECTIONS_VOLUME)
+    paired = Path(sv["paired_validation_path"])
+    if not paired.is_file():
+        raise ContractError(
+            f"{paired}: the paired validation the sections/volume stage recorded is not there, "
+            "so there is nothing to report on. Re-run that stage (`--rebuild-from "
+            "sections_volume`)."
+        )
+    return {
+        "paired_validation_sha256": sha256_file(paired),
+        # Named, not read: it is what the report is a report *of*, and a workflow whose geometry
+        # artifact was replaced is not the workflow this document describes.
+        "geometry_report_sha256": _digest_if_there(ctx.upstream(Stage.GEOMETRY).get("report_path")),
+    }
+
+
+def _report_run(ctx: StageContext) -> StageOutcome:
+    """Aggregate. No science: every number is copied from an artifact that verified itself.
+
+    The stage row for REPORT itself reads ``running`` in the document, because that is what it
+    is doing while it writes it. Regenerating afterwards with ``report_from_workflow`` shows the
+    finished status instead; neither version invents one.
+    """
+    from minegs.e2e.report import build_report, write_report
+
+    out = fresh_artifact_dir(ctx, "report")
+    report = build_report(ctx.state)
+    json_path, md_path = write_report(report, out)
+    m = report.maturity
+    return StageOutcome(
+        outputs={
+            "report_id": report.report_id,
+            "report_json_path": str(json_path.resolve()),
+            "report_md_path": str(md_path.resolve()),
+            "structural_status": m.structural_status,
+            "real_data_validation_status": m.real_data_validation_status,
+            "human_visual_review_status": m.human_visual_review_status,
+            "real_gpu_execution": report.training.real_gpu_execution,
+            "real_renderer_execution": report.reconstruction.real_renderer_execution,
+        },
+        command={"call": "minegs.e2e.report.build_report", "out": str(out)},
+    )
+
+
+def report_spec() -> StageSpec:
+    return StageSpec(stage=Stage.REPORT, inputs=_report_inputs, run=_report_run)
+
+
+def default_specs() -> dict[Stage, StageSpec]:
+    """The whole chain, in order. One place, so the CLI and a test drive the same stages."""
+    return {
+        Stage.INGEST: ingest_spec(),
+        Stage.DATASET: dataset_spec(),
+        Stage.TRAIN: train_spec(),
+        Stage.DEPTH: depth_spec(),
+        Stage.SURFACE: surface_spec(),
+        Stage.GEOMETRY: geometry_spec(),
+        Stage.SECTIONS_VOLUME: sections_volume_spec(),
+        Stage.REPORT: report_spec(),
+    }

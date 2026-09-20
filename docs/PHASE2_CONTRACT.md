@@ -82,7 +82,7 @@ git_commit · minegs_version · tool_versions · runtime_env · failure_reason
 | `surface` | depth manifest id + run_id + dataset_hash |
 | `geometry` | surface_id + point_sha256 + dataset_hash + TLS reference digest |
 | `sections_volume` | surface_id + dataset_hash + section parameters + TLS reference digest |
-| `report` | 위 전부 |
+| `report` | paired_validation.json digest + geometry report digest (+ `_upstream` 로 위 전부) |
 
 fingerprint 가 다르면 **fail closed** 다. 예전 SUCCESS 를 재사용하지 않고, 무엇이 움직였는지
 말한 뒤 명시적 rebuild 를 요구한다. E57 교체 · build config 변경 · dataset hash 변경 · run 교체 ·
