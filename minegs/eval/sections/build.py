@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,9 @@ from minegs.eval.sections.models import SectionRecord, SectionSource, reference_
 from minegs.eval.sections.sections import extract_sections
 
 __all__ = [
+    "ClaimEvidence",
     "build_section_record",
+    "check_claim_evidence",
     "reproducibility_refusal",
     "require_reproducible_sections",
     "section_source",
@@ -37,15 +40,27 @@ def section_source(surface, path: str | Path) -> SectionSource:
     if surface is None:
         if not path.is_file():
             raise ContractError(f"{path}: not a surface artifact and not a PLY file")
-        return SectionSource(kind="raw_cloud", point_sha256=sha256_file(path), point_path=str(path))
+        return SectionSource(
+            kind="raw_cloud", point_sha256=sha256_file(path), point_path=_resolved(path)
+        )
     return SectionSource(
         kind="surface",
         surface_id=surface.surface_id,
         run_id=surface.run_id,
         depth_source=surface.depth_source,
         point_sha256=surface.point_sha256,
-        point_path=str(path),
+        point_path=_resolved(path),
     )
+
+
+def _resolved(path: Path) -> str:
+    """Absolute, so the recorded path still names the same artifact from another directory.
+
+    Stored as typed, a relative ``surface/depth_v001`` resolves against whatever directory the
+    next command happens to run in: from one place the re-verification finds the surface, from
+    another it finds nothing and the claim is refused for the wrong reason.
+    """
+    return str(path.resolve())
 
 
 def build_section_record(
@@ -126,7 +141,26 @@ def require_reproducible_sections(rec: SectionRecord, manifest, centerline) -> N
         raise ContractError(reason)
 
 
+@dataclass(frozen=True)
+class ClaimEvidence:
+    """What a claim-path re-derivation found.
+
+    ``refusal`` is ``None`` when the sections may carry a claim. ``max_point_gap_m`` is the
+    longest stretch of the claimed span with no reconstructed point in it — a property of the
+    cloud, not of the station grid, so unlike ``coverage_fraction`` it cannot be improved by
+    choosing a coarser interval. It is reported, never gated (see the coverage docs).
+    """
+
+    refusal: str | None = None
+    max_point_gap_m: float | None = None
+
+
 def reproducibility_refusal(rec: SectionRecord, manifest, centerline) -> str | None:
+    """``check_claim_evidence``'s verdict alone, for callers that do not want the numbers."""
+    return check_claim_evidence(rec, manifest, centerline).refusal
+
+
+def check_claim_evidence(rec: SectionRecord, manifest, centerline, ranges=None) -> ClaimEvidence:
     """Why these sections cannot carry a claim, or ``None`` if they can. Claim path only.
 
     Everything else in ``check_section_record`` ties the record to the right dataset, the right
@@ -147,10 +181,23 @@ def reproducibility_refusal(rec: SectionRecord, manifest, centerline) -> str | N
 
     src = rec.source
     if src.kind != "surface" or not src.point_path:
-        return f"sections {rec.section_id} were cut from {src.kind}, which cannot carry a claim"
+        return ClaimEvidence(
+            f"sections {rec.section_id} were cut from {src.kind}, which cannot carry a claim"
+        )
+    if rec.series.thickness_m > rec.series.interval_m * (1 + _RTOL):
+        # Slabs wider than the spacing overlap, so a station with no geometry of its own is
+        # filled from its neighbours' and comes out valid. That is not a threshold on data
+        # quality: it is the condition under which A(s_i) is a measurement *at* s_i rather than
+        # a smoothing of the stations around it, and a gap can be closed by widening it alone.
+        return ClaimEvidence(
+            f"sections {rec.section_id} were cut with a {rec.series.thickness_m:g} m slab at "
+            f"{rec.series.interval_m:g} m spacing, so consecutive slabs overlap and a station "
+            "with no geometry of its own takes its area from its neighbours'. Re-cut with "
+            "--thickness-m no larger than --interval-m for a claim, or pass --diagnostic."
+        )
     path = Path(src.point_path)
     if find_surface(path) is None:
-        return (
+        return ClaimEvidence(
             f"sections {rec.section_id} name surface {src.surface_id} at {path}, and it is not "
             "there. A volume_accuracy claim re-cuts the sections from the surface and compares "
             "them, so without the surface these areas are only this file's own word for them. "
@@ -160,6 +207,7 @@ def reproducibility_refusal(rec: SectionRecord, manifest, centerline) -> str | N
     pc = check_surface(surface, points, rec.dataset_id, rec.dataset_hash)
     if pc.frame != "TLS_GLOBAL":
         pc = pc.transformed(manifest.T_tls_from_local, "TLS_GLOBAL")
+    gap = _largest_unobserved_gap(centerline.project(pc.xyz)[0], ranges, rec.series)
     p = rec.parameters
     again = extract_sections(
         pc.xyz,
@@ -171,7 +219,27 @@ def reproducibility_refusal(rec: SectionRecord, manifest, centerline) -> str | N
         end_m=p.get("end_m"),
         frame="TLS_GLOBAL",
     )
-    return _compare_series(rec, again)
+    return ClaimEvidence(_compare_series(rec, again), gap)
+
+
+def _largest_unobserved_gap(s_points: np.ndarray, ranges, series) -> float:
+    """The longest run of the claimed span holding no reconstructed point.
+
+    Measured on the cloud, so no choice of station grid changes it. ``coverage_fraction`` says
+    the stations tile the span; this says whether there is anything under them, which is the
+    question a coarse grid stops asking.
+    """
+    spans = list(ranges) if ranges else [(series.start_chainage_m, series.end_chainage_m)]
+    worst = 0.0
+    for lo, hi in spans:
+        if hi <= lo:
+            continue
+        inside = np.sort(s_points[(s_points >= lo) & (s_points <= hi)])
+        if len(inside) == 0:
+            worst = max(worst, float(hi - lo))
+            continue
+        worst = max(worst, float(np.max(np.diff(np.concatenate([[lo], inside, [hi]])))))
+    return worst
 
 
 def _compare_series(rec: SectionRecord, again) -> str | None:

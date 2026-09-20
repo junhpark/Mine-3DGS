@@ -435,7 +435,7 @@ polyline 위에서는 다른 뜻이 된다.
 2. 입력이 bare series 가 아니라 section artifact 다;
 3. record 가 지금의 dataset·축·surface 와 일치한다 (위 표, 항상 검사);
 4. `source.kind == "surface"` 이고 `depth_source == "minegs_render"` 다;
-5. **series 를 그 surface 에서 다시 잘라 재현할 수 있다** (아래);
+5. **series 를 그 surface 에서 다시 잘라 재현할 수 있고**, 슬랩이 station 간격보다 넓지 않다;
 6. 적분이 선언된 geometry holdout 구간으로 제한된다;
 7. 그 구간의 coverage 가 완전하다.
 
@@ -483,6 +483,10 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
   "관측됨" 으로 세고, 주변 구간은 여전히 missing 이다. 둘 다 참이다.
 * coverage 는 **요청한 구간** 기준이다. 시계열이 holdout 중간에서 끝나면 coverage 는 절반이지
   "짧은 갱도의 완전 coverage" 가 아니다.
+* **station 이 아예 빠진 것도 gap 이다.** NaN 규칙이 보는 것은 "있는데 invalid" 뿐이라, 행을
+  지우면 이웃이 붙어 사다리꼴이 구멍을 가로지르고 리포트는 아무것도 빠지지 않았다고 말한다.
+  시계열이 스스로 선언한 station 간격보다 넓은 step 은 gap 으로 본다. `diff_sections` 의
+  "한쪽 epoch 에만 있는 station" 도 같은 규칙으로 처리된다.
 * `integrate_sections` · `compare_to_design` · `diff_sections` 가 모두 같은 helper
   (`eval/volume/coverage.py`)를 쓴다. 셋이 "어느 구간이 관측되었는가" 에 대해 갈라지지 않는다.
 * `VolumeReport` 에 `coverage{requested_intervals_m, integrated_intervals_m, missing_intervals_m,
@@ -495,6 +499,10 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
 * **임의 임계값을 만들지 않는다.** 이 PR 은 80 %/90 % 같은 coverage threshold 를 도입하지
   않는다. claim 은 "요청한 holdout 을 전부 적분할 수 있어야 한다" 로 두고, 실측 검증으로 허용
   가능한 최소 coverage 가 정해지면 그때 별도 결정으로 완화한다.
+* **슬랩이 station 간격보다 넓으면 claim 경로에서 거부한다.** `--thickness-m > --interval-m`
+  이면 이웃 슬랩이 겹쳐, 자기 형상이 없는 station 이 이웃의 점으로 채워져 valid 가 된다
+  (gappy 표면에서 1 m 간격 6 m 슬랩은 holdout 의 구멍을 전부 메운다). 데이터 품질 임계값이
+  아니라, `A(s_i)` 가 `s_i` **에서의** 측정이기 위한 조건이다. diagnostic 에서는 허용한다.
 * **coverage 는 station 격자에 대한 진술이고, 격자는 사용자가 고른다.** 6 m 떨어진 두 station
   은 그 사이 6 m 를 사다리꼴 규칙으로 완전히 적분한다 — 통상적인 관행이다 — 그래서 어느
   station 도 걸리지 않는 구멍은 `coverage_fraction` 에 보이지 않는다. 대신
@@ -503,6 +511,15 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
   `sampled 0.50 m of that (8.3%)` 로 보고된다. **게이트가 아니라 읽을 수 있는 수치다** —
   claim 에 필요한 최소 해상도는 최소 coverage 와 같은 성격의 미결 결정이고, 여기서 숫자를
   지어내지 않는다. `section_parameters` 가 volume.json 에 함께 실리는 이유이기도 하다.
+* **격자가 부풀릴 수 없는 수치도 함께 낸다.** claim 경로는 surface 를 다시 읽으므로, 점군
+  자체에서 `max_point_gap_m` — 주장 구간 안에서 복원된 점이 하나도 없는 가장 긴 구간 — 을
+  계산해 리포트와 CLI 에 싣는다. `coverage_fraction` 은 "station 이 구간을 덮는가" 를 말하고,
+  이것은 "그 아래에 무엇이라도 있는가" 를 말한다. 위 6 m 격자 예시는 `coverage 100%` 이면서
+  `max_point_gap_m > 2 m` 로 보고된다. 역시 게이트가 아니라 수치다.
+* **각도 방향 보간도 보고한다.** `extract_sections` 는 빈 angle bin 을 `angle_bins//10` 까지
+  이웃에서 보간하고도 section 을 valid 로 둔다 — chainage 축에서 거부하는 바로 그 보간이다.
+  section geometry 알고리즘 재설계는 이 PR 범위 밖이므로, 적분된 station 들에 대한
+  `interpolated_bin_fraction` 을 coverage 블록에 실어 얼마나 되는지 말한다.
 
 ### 알려진 한계
 
@@ -510,8 +527,10 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
   대조하지만, diagnostic 수치와 surface 가 사라진 record 는 그렇지 않다. 그리고 재현 대조도
   서명은 아니다: surface 점군 자체를 바꾸고 record 를 그에 맞춰 다시 만들면 전부 일관된다.
   `DepthManifest` 와 같은 경계 — 사고를 막는 경계이지 서명이 아니다.
-* `minegs eval change` 는 dataset 을 인자로 받지 않으므로 아무것도 대조하지 않는다. 그래서
-  결과는 영구히 `geometry_diagnostic` 이다 (pair protocol 은 Phase 7).
+* `minegs eval change` 는 dataset 을 인자로 받지 않으므로 대부분을 대조하지 않는다. 그래서
+  결과는 영구히 `geometry_diagnostic` 이다 (pair protocol 은 Phase 7). 다만 dataset 없이도
+  대조 가능한 하나 — 두 시계열의 `reference_axis` — 는 검사하고, 다르면 거부한다. 서로 다른
+  polyline 위의 chainage 를 빼는 것은 변화가 아니라 좌표계 차이다.
 * `--start-m`/`--end-m` 없이 자른 격자는 축 시작점부터 `interval_m` 간격이다. holdout 경계가
   그 격자에 떨어지지 않으면 coverage 는 완전해질 수 없고, 거부 메시지가 재단(re-section)을
   안내한다.

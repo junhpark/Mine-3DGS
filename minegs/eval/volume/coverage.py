@@ -137,6 +137,11 @@ class CoverageReport(_Strict):
     #: decision as what minimum coverage it needs, and neither is invented here.
     sampled_length_m: float = 0.0
     sampled_fraction: float = 0.0
+    #: Fraction of angle bins, over the integrated stations, that held no point and whose wall
+    #: radius was interpolated from its neighbours (``extract_sections`` allows up to a tenth of
+    #: them before a section is invalid). The same imputation this module refuses along the
+    #: chainage axis happens around the section, and a claim should say how much of it there is.
+    interpolated_bin_fraction: float = 0.0
 
     @property
     def complete(self) -> bool:
@@ -207,10 +212,11 @@ def integration_segments(series, ranges: list[Interval] | None = None) -> list[I
     it, which is the same mistake as integrating across a gap.
     """
     s, a = _stations(series)
+    step = float(series.interval_m or 0.0)
     out: list[IntegrationSegment] = []
     for lo, hi in _requested(s, ranges):
         inside = np.flatnonzero((s >= lo - EPS_M) & (s <= hi + EPS_M))
-        out += _segments_within(s, a, inside)
+        out += _segments_within(s, a, inside, step)
     return out
 
 
@@ -218,18 +224,33 @@ def _series_span(s: np.ndarray) -> list[Interval]:
     return [(float(s[0]), float(s[-1]))] if len(s) >= 2 else []
 
 
-def finite_runs(values: np.ndarray, order: np.ndarray | None = None) -> list[np.ndarray]:
+def finite_runs(
+    values: np.ndarray,
+    order: np.ndarray | None = None,
+    at: np.ndarray | None = None,
+    max_step: float | None = None,
+) -> list[np.ndarray]:
     """Maximal runs of consecutive entries of *order* whose value is finite.
 
     *order* defaults to every index in turn. This is the one place a gap is recognised, so
     everything that integrates along chainage — area, over/underbreak, epoch difference — cuts
     at exactly the same stations.
+
+    A station can go missing in two ways, and only one of them leaves a NaN. Deleting the row
+    outright, or an epoch that never had it, leaves the neighbours *adjacent* and the trapezoid
+    runs straight across the hole while the report says nothing is missing. So when *at* and
+    *max_step* are given, a step wider than the series' own declared station spacing is a gap
+    too: a series that says it was cut every 1 m and then jumps 3 m did not observe those 2 m.
     """
     idx = np.arange(len(values)) if order is None else np.asarray(order, dtype=int)
     out: list[np.ndarray] = []
     run: list[int] = []
+    gapped = at is not None and max_step is not None and max_step > 0
     for i in [*list(idx), None]:
         if i is not None and np.isfinite(values[i]):
+            if run and gapped and at[i] - at[run[-1]] > max_step + EPS_M:
+                out.append(np.array(run, dtype=int))
+                run = []
             run.append(int(i))
             continue
         if run:
@@ -238,7 +259,9 @@ def finite_runs(values: np.ndarray, order: np.ndarray | None = None) -> list[np.
     return out
 
 
-def segmented_integral(s: np.ndarray, y: np.ndarray) -> tuple[float, list[Interval]]:
+def segmented_integral(
+    s: np.ndarray, y: np.ndarray, max_step: float | None = None
+) -> tuple[float, list[Interval]]:
     """``Σ ∫y ds`` over the runs of finite *y*, plus the chainage intervals those runs span.
 
     A run of one station spans no length and contributes nothing — it is an observation with
@@ -246,7 +269,7 @@ def segmented_integral(s: np.ndarray, y: np.ndarray) -> tuple[float, list[Interv
     imputation this module exists to refuse.
     """
     total, spans = 0.0, []
-    for run in finite_runs(y):
+    for run in finite_runs(y, at=s, max_step=max_step):
         if len(run) < 2:
             continue
         total += trapezoid(y[run], s[run])
@@ -254,10 +277,12 @@ def segmented_integral(s: np.ndarray, y: np.ndarray) -> tuple[float, list[Interv
     return total, spans
 
 
-def _segments_within(s: np.ndarray, a: np.ndarray, inside: np.ndarray) -> list[IntegrationSegment]:
+def _segments_within(
+    s: np.ndarray, a: np.ndarray, inside: np.ndarray, max_step: float | None = None
+) -> list[IntegrationSegment]:
     """Cut ``inside`` (indices into *s*, ascending and contiguous) at every unobserved station."""
     out: list[IntegrationSegment] = []
-    for idx in finite_runs(a, inside):
+    for idx in finite_runs(a, inside, at=s, max_step=max_step):
         # A run of one station spans no length, so it integrates to nothing. It is still an
         # observation, and the span around it is still missing: both are true, and reporting a
         # segment of zero length would only put a 0 m³ row in front of the reader.
@@ -292,6 +317,7 @@ def summarise_coverage(
     missing = subtract_intervals(requested, covered)
     req_len, cov_len = total_length(requested), total_length(covered)
     sampled = _sampled_within(s, covered, float(series.thickness_m))
+    integrated = _stations_in_intervals(s, covered)
     inside = np.zeros(len(s), bool)
     for lo, hi in requested:
         inside |= (s >= lo - EPS_M) & (s <= hi + EPS_M)
@@ -310,7 +336,25 @@ def summarise_coverage(
         missing_chainages_m=[float(v) for v in s[inside & ~observed]],
         sampled_length_m=sampled,
         sampled_fraction=(sampled / cov_len) if cov_len > EPS_M else 0.0,
+        interpolated_bin_fraction=_interpolated_fraction(series, s, integrated),
     )
+
+
+def _stations_in_intervals(s: np.ndarray, intervals: list[Interval]) -> np.ndarray:
+    keep = np.zeros(len(s), bool)
+    for lo, hi in intervals:
+        keep |= (s >= lo - EPS_M) & (s <= hi + EPS_M)
+    return keep
+
+
+def _interpolated_fraction(series, s: np.ndarray, integrated: np.ndarray) -> float:
+    """Empty angle bins over the integrated stations, as a fraction of all their bins."""
+    order = np.argsort(np.asarray(series.chainages(), dtype=np.float64), kind="stable")
+    picked = [series.sections[int(order[i])] for i in np.flatnonzero(integrated)]
+    bins = series.angle_bins * len(picked)
+    if bins <= 0:
+        return 0.0
+    return float(sum(sec.empty_bins for sec in picked) / bins)
 
 
 def _sampled_within(s: np.ndarray, covered: list[Interval], thickness_m: float) -> float:

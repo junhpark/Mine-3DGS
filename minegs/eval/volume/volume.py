@@ -58,6 +58,11 @@ class VolumeReport(BaseModel):
     #: holds the record; a volume whose source is unknown says so by leaving it null.
     section_id: str | None = None
     source: SectionSource | None = None
+    #: Longest stretch of the integrated span with no reconstructed point in it, measured on
+    #: the cloud rather than on the station grid (claim path only, where the surface is re-read).
+    #: ``coverage_fraction`` says the stations tile the span; this says whether there is anything
+    #: under them, which a coarse grid stops asking.
+    max_point_gap_m: float | None = None
     #: How the sections were cut. ``section_interval_m`` alone does not say it: a 3 m slab and a
     #: 180-bin polygon are as much part of "what this number measured" as the interval, and a
     #: reader of volume.json should not have to open sections.json to see at what resolution the
@@ -120,6 +125,10 @@ class DesignComparison(BaseModel):
     underbreak_m2: list[float | None]
     overbreak_m3: float
     underbreak_m3: float
+    #: Set by the caller that owns the claim decision, exactly as ``VolumeReport.claim`` is. An
+    #: over/underbreak volume printed beside a labelled one, with no label of its own, reads as
+    #: the same kind of number and is not.
+    claim: str = "geometry_diagnostic"
     #: Same coverage contract as ``VolumeReport``: over/underbreak volumes are integrated over
     #: the observed runs only, never across a gap (Phase 1C).
     coverage: CoverageReport = Field(default_factory=CoverageReport)

@@ -60,7 +60,10 @@ def diff_sections(
     # Gap-safe, for the same reason ``integrate_sections`` is (Phase 1C): a station missing from
     # either epoch means nobody measured that span twice, and a trapezoid across it would report
     # a difference over tunnel neither epoch observed.
-    dv, spans = segmented_integral(common.astype(float), d)
+    # ``max_step`` is what makes a station that only one epoch has count as a gap: the
+    # intersection above drops it, leaving its neighbours adjacent and the trapezoid running
+    # straight across a span one of the two epochs never measured.
+    dv, spans = segmented_integral(common.astype(float), d, max_step=a.interval_m)
     return ChangeReport(
         epoch_a=epoch_a,
         epoch_b=epoch_b,

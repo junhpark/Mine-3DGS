@@ -454,10 +454,12 @@ def sections(
 
 def _incomplete_coverage(cov, ranges) -> str:
     asked = ", ".join(f"{lo:g}-{hi:g} m" for lo, hi in ranges)
+    unobserved = cov.requested_length_m - cov.covered_length_m
     return (
         f"volume_accuracy is a claim about the whole declared holdout {asked}, and "
-        f"{cov.covered_length_m:.2f} m of {cov.requested_length_m:.2f} m of it "
-        f"({cov.coverage_fraction * 100:.1f}%) has no observed sections: {cov.describe_gaps()}. "
+        f"{unobserved:.2f} m of {cov.requested_length_m:.2f} m of it "
+        f"({(1 - cov.coverage_fraction) * 100:.1f}%) has no observed sections: "
+        f"{cov.describe_gaps()}. "
         "The volume over a gap is not measured, and this project does not interpolate it or "
         "accept a coverage threshold it has not validated. Re-section over the holdout "
         "(`--start-m`/`--end-m`) once the reconstruction covers it, or pass --diagnostic for "
@@ -491,10 +493,10 @@ def volume(
     from minegs.core.provenance import sha256_tree
     from minegs.eval.protocol import Claim, judge
     from minegs.eval.sections import (
+        check_claim_evidence,
         check_section_record,
         load_section_input,
         reference_axis_of,
-        reproducibility_refusal,
     )
     from minegs.eval.volume import compare_to_design, integrate_sections, plan_integration
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
@@ -562,16 +564,18 @@ def volume(
             )
             claim = Claim.GEOMETRY_DIAGNOSTIC
 
+        evidence = None
         if claim is Claim.VOLUME_ACCURACY:
             # The identity checks above tie the record to this dataset, this axis and this
             # surface. None of them says the *areas* came from that surface -- the series lives
             # inside the record, so an edited area, or an invalid station flipped to a plausible
-            # number to close a gap, satisfies every one of them. A claim re-derives instead.
-            reason = reproducibility_refusal(rec, m, cl)
-            if reason is not None:
+            # number to close a gap, satisfies every one of them. A claim re-derives instead,
+            # and comes back with the one coverage number the station grid cannot flatter.
+            evidence = check_claim_evidence(rec, m, cl, j.holdout_ranges_m)
+            if evidence.refusal is not None:
                 if not diagnostic:
-                    raise ContractError(reason)
-                console.print(f"[yellow]diagnostic: {reason}[/]")
+                    raise ContractError(evidence.refusal)
+                console.print(f"[yellow]diagnostic: {evidence.refusal}[/]")
                 claim = Claim.GEOMETRY_DIAGNOSTIC
 
         axis = reference_axis_of(m) if m.centerline else "unknown"
@@ -589,9 +593,14 @@ def volume(
                 if not diagnostic:
                     raise ContractError(_incomplete_coverage(coverage, ranges))
                 console.print(f"[yellow]diagnostic: {_incomplete_coverage(coverage, ranges)}[/]")
-                claim, ranges = Claim.GEOMETRY_DIAGNOSTIC, None
+                # The holdout stays: the refusal above offers "the partial volume with this
+                # coverage reported alongside it", and quietly swapping in the whole drift
+                # would answer a different question than the one it just described.
+                claim = Claim.GEOMETRY_DIAGNOSTIC
         rep = integrate_sections(ser, axis, ranges=ranges)
         rep.claim = claim.value
+        if evidence is not None:
+            rep.max_point_gap_m = evidence.max_point_gap_m
         if rec is not None:
             rep.section_id = rec.section_id
             rep.source = rec.source
@@ -612,8 +621,13 @@ def volume(
         # measurement. Reported, not gated — see CoverageReport.sampled_fraction.
         console.print(
             f"  sampled {cov.sampled_length_m:.2f} m of that ({cov.sampled_fraction * 100:.1f}%) "
-            f"in {ser.interval_m:g} m stations of {ser.thickness_m:g} m slabs"
+            f"in {ser.interval_m:g} m stations of {ser.thickness_m:g} m slabs; "
+            f"{cov.interpolated_bin_fraction * 100:.1f}% of wall bins interpolated"
         )
+        if rep.max_point_gap_m is not None:
+            console.print(
+                f"  longest span with no reconstructed point: {rep.max_point_gap_m:.2f} m"
+            )
         result = {"volume": rep}
         if design_radius_m:
             dc = compare_to_design(ser, design_radius_m, ranges=ranges)
@@ -622,6 +636,7 @@ def volume(
                 f"(design A={dc.design_area_m2:.2f} m², same {len(dc.overbreak_segments_m3)} "
                 "segment(s))"
             )
+            dc.claim = claim.value
             result["design"] = dc
         dump_json(result, out)
 
@@ -640,6 +655,7 @@ def change(
 
     Diagnostic only: a validated change_volume claim needs the Phase 7 epoch-pair protocol.
     """
+    from minegs.core.errors import ContractError
     from minegs.eval.change import diff_sections
     from minegs.eval.sections import load_section_input
 
@@ -647,9 +663,19 @@ def change(
         # Either input shape: a section artifact or a bare pre-1C series. Neither is checked
         # against a dataset here, because this command names no dataset -- which is part of why
         # its result can never be more than diagnostic.
-        _, a = load_section_input(a_json)
-        _, b = load_section_input(b_json)
-        rep = diff_sections(a, b, epoch_a, epoch_b, "centerline")
+        rec_a, a = load_section_input(a_json)
+        rec_b, b = load_section_input(b_json)
+        # The one thing that *can* be compared without a dataset: chainage is only the same
+        # quantity in both epochs if both were cut along the same axis. Subtracting areas
+        # indexed on two different polylines is not a change, it is a coordinate difference.
+        axes = {r.reference_axis for r in (rec_a, rec_b) if r is not None}
+        if len(axes) > 1:
+            raise ContractError(
+                f"these section series were cut along different reference axes ({sorted(axes)}); "
+                "their chainages do not refer to the same stations, so differencing them "
+                "measures the axes, not the change"
+            )
+        rep = diff_sections(a, b, epoch_a, epoch_b, axes.pop() if axes else "centerline")
         console.print(
             f"\\[{rep.claim}] ΔV = {rep.delta_volume_m3:+.2f} m³ over "
             f"{rep.start_chainage_m}-{rep.end_chainage_m} m"

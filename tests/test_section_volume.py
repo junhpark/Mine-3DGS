@@ -519,6 +519,9 @@ def test_t11_incomplete_holdout_coverage_refuses_the_claim(chain, tmp_path):
 
 
 def test_t12_the_same_gappy_sections_give_a_partial_diagnostic_volume(chain, tmp_path):
+    """The refusal offers "the partial volume with this coverage reported alongside it", so
+    --diagnostic gives exactly that: the holdout still, not the whole drift silently swapped in
+    (that is what --no-holdout-only is for)."""
     sec, out = tmp_path / "gappy.json", tmp_path / "vol.json"
     cut(chain.gappy, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
 
@@ -527,9 +530,73 @@ def test_t12_the_same_gappy_sections_give_a_partial_diagnostic_volume(chain, tmp
     vol = volume_json(out)
     assert vol["claim"] == "geometry_diagnostic"
     cov = vol["coverage"]
+    assert [tuple(i) for i in cov["requested_intervals_m"]] == [HOLDOUT]
     assert cov["missing_intervals_m"] and 0.0 < cov["coverage_fraction"] < 1.0
     assert vol["volume_m3"] == pytest.approx(sum(g["volume_m3"] for g in vol["segments"]))
-    assert len(vol["segments"]) > 1
+
+    whole = tmp_path / "whole.json"
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, whole, no_holdout_only=True))
+    assert r.exit_code == 0, r.output
+    assert volume_json(whole)["coverage"]["requested_length_m"] > 50
+
+
+def test_the_incomplete_coverage_refusal_reports_the_missing_length(chain, tmp_path):
+    """It used to print the *covered* length as the amount with no observed sections."""
+    sec = tmp_path / "gappy.json"
+    cut(chain.gappy, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output
+    # 22-26 m of the 20-26 m holdout is unobserved: 4 of 6 m, 66.7 %
+    assert "4.00 m of 6.00 m of it (66.7%) has no observed sections" in flat(r)
+
+
+def test_slabs_wider_than_the_station_spacing_cannot_carry_a_claim(chain, tmp_path):
+    """Overlapping slabs let a station with no geometry of its own take its neighbours'.
+
+    On the gappy surface a 6 m slab at 1 m spacing fills every hole in the holdout and coverage
+    comes out complete. That is not a data-quality threshold: it is the condition under which
+    A(s) is a measurement at s rather than a smoothing of the stations around it.
+    """
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    rec = cut(chain.gappy, chain.dataset_dir, sec, interval_m=1, thickness_m=6.0, angle_bins=72)
+    covered = [s for s in rec.series.sections if HOLDOUT[0] <= s.chainage_m <= HOLDOUT[1]]
+    assert all(s.valid for s in covered)  # the hole is gone, filled from metres away
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output
+    assert "consecutive slabs overlap" in flat(r)
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, out, diagnostic=True))
+    assert r.exit_code == 0 and volume_json(out)["claim"] == "geometry_diagnostic"
+
+
+def test_the_claim_reports_the_longest_span_with_no_reconstructed_point(chain, tmp_path):
+    """Measured on the cloud, so a coarser station grid cannot flatter it.
+
+    The coarse endpoint-aligned cut below is granted (see the test above it), and this is the
+    number that says what it rests on: several metres of the holdout hold no point at all.
+    """
+    fine, coarse = tmp_path / "fine.json", tmp_path / "coarse.json"
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    cut(chain.full, chain.dataset_dir, fine, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert runner.invoke(app, volume_argv(fine, chain.dataset_dir, a)).exit_code == 0
+    assert volume_json(a)["max_point_gap_m"] < 0.5
+
+    cut(
+        chain.gappy,
+        chain.dataset_dir,
+        coarse,
+        interval_m=6,
+        thickness_m=0.5,
+        angle_bins=72,
+        start_m=HOLDOUT[0],
+        end_m=HOLDOUT[1],
+    )
+    r = runner.invoke(app, volume_argv(coarse, chain.dataset_dir, b))
+    assert r.exit_code == 0, r.output
+    vol = volume_json(b)
+    assert vol["claim"] == "volume_accuracy" and vol["coverage"]["coverage_fraction"] == 1.0
+    assert vol["max_point_gap_m"] > 2.0
+    assert "longest span with no reconstructed point" in flat(r)
 
 
 # ---------------------------------------------------------------- the reference axis
@@ -801,6 +868,8 @@ def test_a_coarse_station_grid_reports_how_little_of_the_span_it_sampled(chain, 
     assert vol["coverage"]["sampled_length_m"] == pytest.approx(0.5)
     assert vol["section_parameters"]["interval_m"] == 6.0
     assert "sampled 0.50 m of that (8.3%)" in flat(r)
+    # ...and the number the grid cannot flatter, measured on the cloud itself
+    assert vol["max_point_gap_m"] > 2.0
 
 
 def test_sampled_length_is_the_union_of_the_integrated_slabs():
@@ -836,3 +905,83 @@ def test_a_section_with_an_area_but_no_radii_is_named_not_a_traceback():
         compare_to_design(ser, 1.0)
     # the area integral does not need the radii, so it is unaffected
     assert integrate_sections(ser, "x").volume_m3 == pytest.approx(20.0)
+
+
+def test_a_station_deleted_from_the_series_is_a_gap_not_a_longer_trapezoid():
+    """The only gap the NaN rule sees is a station that is present and invalid.
+
+    Delete the row instead and its neighbours become adjacent: the trapezoid runs straight
+    across the hole and the report says nothing is missing. The series declares its own station
+    spacing, so a step wider than that is a gap too.
+    """
+    ser = _series([10.0, 10.0, 10.0, 10.0, 10.0])
+    del ser.sections[2]
+    rep = integrate_sections(ser, "x")
+
+    assert rep.volume_m3 == pytest.approx(20.0)
+    assert [(g.start_chainage_m, g.end_chainage_m) for g in rep.segments] == [
+        (0.0, 1.0),
+        (3.0, 4.0),
+    ]
+    assert rep.coverage.missing_intervals_m == [(1.0, 3.0)]
+    assert not rep.coverage.complete
+
+
+def test_a_station_only_one_epoch_has_is_a_gap_in_the_difference():
+    """`np.intersect1d` drops it, leaving the two neighbours adjacent in the common grid."""
+    from minegs.eval.change import diff_sections
+
+    a = _series([10.0, 10.0, 10.0, 10.0, 10.0])
+    b = _series([12.0, 12.0, 12.0, 12.0, 12.0])
+    del b.sections[2]
+    rep = diff_sections(a, b, "ep1", "ep2", "cl")
+
+    assert rep.delta_volume_m3 == pytest.approx(2.0 * 2.0)  # 2 m2 over 1 + 1 m, not over 4 m
+    assert rep.differenced_intervals_m == [(0.0, 1.0), (3.0, 4.0)]
+    assert rep.missing_intervals_m == [(1.0, 3.0)]
+
+
+def test_change_refuses_two_series_cut_along_different_axes(chain, tmp_path):
+    """Chainage is only the same quantity in both epochs if the axis is."""
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    cut(chain.full, chain.dataset_dir, a, interval_m=2, thickness_m=0.5, angle_bins=72)
+    raw = json.loads(a.read_text())
+    raw["reference_axis"] = "centerline:extracted:other.csv"
+    b.write_text(json.dumps(raw))
+
+    r = runner.invoke(app, ["eval", "change", str(a), str(b)])
+    assert r.exit_code == 2, r.output
+    assert "different reference axes" in flat(r)
+
+
+def test_change_records_the_axis_the_sections_declare(chain, tmp_path):
+    a, out = tmp_path / "a.json", tmp_path / "c.json"
+    cut(chain.full, chain.dataset_dir, a, interval_m=2, thickness_m=0.5, angle_bins=72)
+    r = runner.invoke(app, ["eval", "change", str(a), str(a), "--out", str(out)])
+    assert r.exit_code == 0, r.output
+    assert json.loads(out.read_text())["reference_axis"] == "centerline:design:centerline.csv"
+
+
+def test_the_design_comparison_is_labelled_like_the_volume_beside_it(chain, tmp_path):
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, out, design_radius_m=2.4))
+    assert r.exit_code == 0, r.output
+    both = json.loads(out.read_text())
+    assert both["volume"]["claim"] == "volume_accuracy" == both["design"]["claim"]
+
+
+def test_interpolated_wall_bins_are_reported_on_the_claim(chain, tmp_path):
+    """extract_sections fills up to a tenth of the angle bins and still calls the section valid.
+
+    That is the same imputation the chainage axis refuses, so the claim says how much there is.
+    """
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert runner.invoke(app, volume_argv(sec, chain.dataset_dir, out)).exit_code == 0
+    assert volume_json(out)["coverage"]["interpolated_bin_fraction"] == pytest.approx(0.0)
+
+    ser = _series([10.0, 10.0, 10.0], angle_bins=4)
+    ser.sections[1].empty_bins = 1
+    cov = summarise_coverage(ser, integration_segments(ser), None)
+    assert cov.interpolated_bin_fraction == pytest.approx(1 / 12)

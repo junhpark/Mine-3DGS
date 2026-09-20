@@ -603,8 +603,9 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
 * **`volume_accuracy` 는 일곱 가지가 동시에 성립할 때만**: protocol 허용 · bare series 가 아닌
   section artifact · record 가 지금의 dataset/축/surface 와 일치 · `source.kind == "surface"` 이고
   `depth_source == "minegs_render"` · **series 를 그 surface 에서 다시 잘라 재현 가능** ·
-  적분이 선언된 holdout 으로 제한됨 · 그 구간의 coverage 가 완전함. 하나라도 빠지면 거부하고,
-  `--diagnostic` 이면 `geometry_diagnostic` 으로 계산한다.
+  슬랩이 station 간격보다 넓지 않음 · 적분이 선언된 holdout 으로 제한됨 · 그 구간의 coverage 가
+  완전함. 하나라도 빠지면 거부하고, `--diagnostic` 이면 `geometry_diagnostic` 으로 계산한다
+  (이 경우에도 holdout 은 유지한다 — 전 구간은 `--no-holdout-only` 의 몫이다).
 * **면적은 claim 경로에서 다시 계산한다** (`reproducibility_refusal`): identity 검사는 record 를
   옳은 dataset·축·surface 에 묶지만 면적이 그 surface 에서 나왔다는 것은 말하지 않는다 —
   series 가 record 안에 있으므로 `area_m2` 편집이나 invalid station 뒤집기는 identity 검사를
@@ -618,6 +619,17 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
 * **`--no-holdout-only`**: `eval geometry` 와 같은 강등. `volume_accuracy` 는 정의상 holdout 에
   대한 주장이고 전 구간 적분은 run 이 학습에 쓴 형상을 다시 재는 것이므로, 경고와 함께
   `geometry_diagnostic` 으로 보고한다.
+* **station 이 빠진 것도 gap 이다**: NaN 규칙이 보는 것은 "있는데 invalid" 뿐이므로, 행이
+  지워지면 이웃이 붙어 사다리꼴이 구멍을 가로지른다. 시계열이 선언한 station 간격보다 넓은
+  step 은 gap 으로 처리하고, `diff_sections` 의 "한쪽 epoch 에만 있는 station" 도 같다.
+* **슬랩이 station 간격보다 넓으면 claim 불가**: 이웃 슬랩이 겹쳐 자기 형상이 없는 station 이
+  이웃의 점으로 채워진다. 품질 임계값이 아니라 `A(s_i)` 가 `s_i` 에서의 측정이기 위한 조건이다.
+* **격자가 부풀릴 수 없는 수치**: claim 경로는 surface 를 다시 읽으므로 점군에서
+  `max_point_gap_m` (주장 구간 안에서 복원된 점이 없는 가장 긴 구간) 을 계산해 싣는다.
+  `coverage_fraction` 은 station 이 구간을 덮는지를, 이것은 그 아래에 무엇이라도 있는지를 말한다.
+* **각도 방향 보간도 보고**: `extract_sections` 는 빈 angle bin 을 `angle_bins//10` 까지 이웃에서
+  보간하고 section 을 valid 로 둔다. 알고리즘 재설계는 범위 밖이므로 적분된 station 들의
+  `interpolated_bin_fraction` 을 coverage 블록에 싣는다.
 * **gap-safe 적분** (`eval/volume/coverage.py`): 연속된 관측 station 의 run 안에서만 적분한다.
   `10, 10, -, 10, 10` 은 20 m³ 이지 40 m³ 가 아니다. gap 의 체적은 추정하지도 보간하지도
   않으므로 coverage 가 불완전한 수치는 항상 **과소** 추정이고, 그것이 안전한 방향이다.
@@ -649,7 +661,8 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   미결 결정으로 남긴다** (Phase 1 G2).
 * **fail closed**: dataset id/hash 불일치 · 축 문자열/digest 불일치 · station 격자 불일치 ·
   parameters 와 series 불일치 · surface 가 record 와 달라짐 · claim 경로에서 surface 부재 ·
-  재현되지 않는 면적/반경/valid 플래그 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
+  재현되지 않는 면적/반경/valid 플래그 · 슬랩이 station 간격보다 넓음 · 서로 다른 축의 두
+  시계열 차분 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
   `external_unverified` 로 claim 요청 · holdout 미선언 · holdout coverage 불완전 ·
   중복 chainage · 연속 관측 station 2개 미만 · 축 범위 밖 station 요청 · 면적은 있는데 반경이
   없는 section · 잘못된 형태의 적분 구간.
@@ -848,6 +861,9 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | holdout coverage 가 불완전한 `volume_accuracy` | `ContractError` (exit 2) | 적분하지 못한 구간의 체적은 측정된 것이 아니다 | 실측 검증으로 최소 coverage 가 정해지면 |
 | dataset/축이 다른 section artifact | `ContractError` (exit 2) | chainage 는 다른 polyline 위에서 다른 뜻이다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
 | surface 에서 다시 잘랐을 때 재현되지 않는 면적/반경 | `ContractError` (exit 2) | 그 면적은 그 surface 에서 측정된 것이 아니다 | 해당 없음 (설계) |
+| `--thickness-m` > `--interval-m` 로 자른 section 의 claim | `ContractError` (exit 2) | 겹친 슬랩은 자기 형상이 없는 station 을 이웃의 점으로 채운다 | 해당 없음 (설계) |
+| 서로 다른 reference axis 의 두 시계열 차분 | `ContractError` (exit 2) | 다른 polyline 위의 chainage 를 빼면 좌표계 차이가 나온다 | 해당 없음 (설계) |
+| 시계열에서 아예 빠진 station | gap 으로 처리 (적분 경계) | 이웃이 붙어 사다리꼴이 구멍을 가로지른다 | 해당 없음 (설계) |
 | claim 경로에서 source surface 부재 | `ContractError` (exit 2) | 검증할 수 없는 증거 위의 주장은 주장이 아니다 (`--diagnostic` 은 동작) | 해당 없음 (설계) |
 | station 격자가 지금의 축에서 재유도되지 않는 section artifact | `ContractError` (exit 2) | 그 시계열은 이 축을 따라 잘린 것이 아니다 | 해당 없음 (설계) |
 | record 를 만든 뒤 내용이 바뀐 source surface | `ContractError` (exit 2) | 디스크에 남아 있으면 믿지 않고 다시 검증한다 | 해당 없음 (설계) |
