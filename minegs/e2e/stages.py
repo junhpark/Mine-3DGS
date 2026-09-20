@@ -582,3 +582,207 @@ def _surface_run(ctx: StageContext) -> StageOutcome:
 
 def surface_spec() -> StageSpec:
     return StageSpec(stage=Stage.SURFACE, inputs=_surface_inputs, run=_surface_run)
+
+
+# ---------------------------------------------------------------- GEOMETRY
+
+
+def _evaluation_inputs(ctx: StageContext) -> dict[str, Any]:
+    """What both evaluation stages hang off: which surface, which dataset, which reference."""
+    surface = ctx.upstream(Stage.SURFACE)
+    (tls,) = ctx.config.require("tls_reference_ply")
+    ref = Path(tls)
+    if not ref.is_file():
+        raise ContractError(f"{ref}: no TLS reference cloud there")
+    return {
+        "surface_id": surface["surface_id"],
+        "point_sha256": surface["point_sha256"],
+        **dataset_identity(ctx.upstream(Stage.DATASET)["dataset_dir"]),
+        "tls_reference_sha256": sha256_file(ref),
+    }
+
+
+def _geometry_inputs(ctx: StageContext) -> dict[str, Any]:
+    return {**_evaluation_inputs(ctx), "max_dist_m": ctx.config.max_dist_m}
+
+
+def _geometry_run(ctx: StageContext) -> StageOutcome:
+    from minegs.eval.geometry.evaluate import evaluate_geometry
+
+    cfg = ctx.config
+    surface_dir = ctx.upstream(Stage.SURFACE)["surface_dir"]
+    dataset_dir = ctx.upstream(Stage.DATASET)["dataset_dir"]
+    (tls,) = cfg.require("tls_reference_ply")
+    # holdout_only and diagnostic are not options here. Phase 2 is the claim-bearing path, and
+    # the flags that downgrade it exist for an operator who has decided to look at something
+    # else; a workflow that quietly chose the downgraded variant would report a weaker number
+    # under a stronger heading.
+    result = evaluate_geometry(surface_dir, dataset_dir, tls, True, cfg.max_dist_m, False)
+    rep = result.report
+    out = fresh_artifact_dir(ctx, "geometry")
+    write_json(out / "geometry.json", rep.model_dump(mode="json"))
+    return StageOutcome(
+        outputs={
+            "claim": rep.claim,
+            "chainage_range_m": list(rep.chainage_range_m) if rep.chainage_range_m else None,
+            "max_dist_m": rep.max_dist_m,
+            "accuracy_median_m": rep.accuracy.median_m,
+            "accuracy_p95_m": rep.accuracy.p95_m,
+            "completeness_median_m": rep.completeness.median_m,
+            "completeness_p95_m": rep.completeness.p95_m,
+            "chamfer_m": rep.chamfer_m,
+            "f_score": dict(rep.f_score),
+            "report_path": str((out / "geometry.json").resolve()),
+            "notes": list(result.notes),
+        },
+        command={
+            "call": "minegs.eval.geometry.evaluate.evaluate_geometry",
+            "pred": str(surface_dir),
+            "dataset_dir": str(dataset_dir),
+            "tls_ply": str(tls),
+            "holdout_only": True,
+            "max_dist_m": cfg.max_dist_m,
+            "diagnostic": False,
+        },
+    )
+
+
+def geometry_spec() -> StageSpec:
+    return StageSpec(stage=Stage.GEOMETRY, inputs=_geometry_inputs, run=_geometry_run)
+
+
+# ---------------------------------------------------------------- SECTIONS_VOLUME
+
+
+def _sections_inputs(ctx: StageContext) -> dict[str, Any]:
+    cfg = ctx.config
+    return {
+        **_evaluation_inputs(ctx),
+        "interval_m": cfg.interval_m,
+        "thickness_m": cfg.thickness_m,
+        "angle_bins": cfg.angle_bins,
+        "holdout_ranges_m": ctx.upstream(Stage.DATASET)["geometry_holdout_ranges_m"],
+    }
+
+
+def _sections_run(ctx: StageContext) -> StageOutcome:
+    from minegs.core.pointcloud import read_ply
+    from minegs.eval.geometry.evaluate import (
+        load_dataset_and_centerline,
+        resolve_prediction,
+        to_tls,
+    )
+    from minegs.eval.protocol import judge
+    from minegs.eval.sections import (
+        build_section_record,
+        check_claim_evidence,
+        check_section_record,
+        section_source,
+    )
+    from minegs.eval.volume import compare_to_reference, integrate_sections, plan_integration
+
+    cfg = ctx.config
+    surface_dir = Path(ctx.upstream(Stage.SURFACE)["surface_dir"])
+    dataset_dir = Path(ctx.upstream(Stage.DATASET)["dataset_dir"])
+    (tls,) = cfg.require("tls_reference_ply")
+    manifest, centerline = load_dataset_and_centerline(dataset_dir)
+    judgement = judge(manifest)
+    ranges = [tuple(r) for r in judgement.holdout_ranges_m]
+    if not ranges:
+        raise ContractError(
+            f"{manifest.dataset_id} declares no geometry holdout, so there is no held-out TLS to "
+            "validate the reconstruction against (§5)"
+        )
+
+    cut = {
+        "interval_m": cfg.interval_m,
+        "thickness_m": cfg.thickness_m,
+        "angle_bins": cfg.angle_bins,
+    }
+    # The prediction goes through the claim-path resolver: a surface that does not verify, or
+    # whose promotion does not re-derive, stops here rather than producing a comparison.
+    resolved = resolve_prediction(surface_dir, dataset_dir, manifest, diagnostic=False)
+    pred_points = to_tls(resolved.points, manifest)
+    pred = build_section_record(
+        pred_points.xyz,
+        section_source(resolved.surface, surface_dir),
+        dataset_dir,
+        manifest,
+        centerline,
+        **cut,
+    )
+    # The reference is the held-out TLS. It is a raw cloud and is recorded as one: it is the
+    # thing being compared *against*, and dressing it up as a reconstruction would make the
+    # section artifact say something false about where it came from.
+    ref_cloud = read_ply(tls)
+    if ref_cloud.frame != "TLS_GLOBAL":
+        raise ContractError(
+            f"{tls}: the TLS reference is in frame {ref_cloud.frame}, not TLS_GLOBAL; sections "
+            "of it would be cut along chainages of a different coordinate system"
+        )
+    ref = build_section_record(
+        ref_cloud.xyz, section_source(None, tls), dataset_dir, manifest, centerline, **cut
+    )
+
+    out = fresh_artifact_dir(ctx, "sections_volume")
+    pred_path, ref_path = out / "sections_predicted.json", out / "sections_reference.json"
+    pred.save(pred_path)
+    ref.save(ref_path)
+    for record in (pred, ref):
+        check_section_record(
+            record,
+            manifest.dataset_id,
+            dataset_identity(dataset_dir)["dataset_hash"],
+            dataset_dir,
+            manifest,
+            centerline,
+        )
+
+    validation = compare_to_reference(pred, ref, ranges)
+    write_json(out / "paired_validation.json", validation.model_dump(mode="json"))
+
+    # What the prediction alone would integrate over the holdout, and whether it could carry a
+    # volume_accuracy claim. Reported, not re-decided: `minegs eval volume` owns that gate and
+    # these are the inputs it reads (§Phase 1C).
+    predicted = integrate_sections(pred.series, pred.reference_axis, ranges=ranges)
+    write_json(out / "volume_predicted.json", predicted.model_dump(mode="json"))
+    evidence = check_claim_evidence(pred, manifest, centerline, dataset_dir, ranges)
+    coverage_complete = plan_integration(pred.series, ranges)[1].complete
+
+    v = validation.volume
+    return StageOutcome(
+        outputs={
+            "section_id_predicted": pred.section_id,
+            "section_id_reference": ref.section_id,
+            "sections_predicted_path": str(pred_path.resolve()),
+            "sections_reference_path": str(ref_path.resolve()),
+            "paired_validation_path": str((out / "paired_validation.json").resolve()),
+            "volume_predicted_path": str((out / "volume_predicted.json").resolve()),
+            "grid": dict(validation.grid),
+            "requested_ranges_m": [list(r) for r in ranges],
+            "paired_valid_count": validation.sections.paired_valid_count,
+            "section_mae_m2": validation.sections.mean_absolute_error_m2,
+            "predicted_volume_m3": v.predicted_volume_m3,
+            "reference_volume_m3": v.reference_volume_m3,
+            "absolute_error_m3": v.absolute_error_m3,
+            "coverage_fraction": v.coverage_fraction,
+            "predicted_only_volume_m3": predicted.volume_m3,
+            "predicted_only_coverage_fraction": predicted.coverage.coverage_fraction,
+            "volume_accuracy_available": evidence.refusal is None and coverage_complete,
+            "volume_accuracy_refusal": evidence.refusal
+            or (None if coverage_complete else "holdout coverage is incomplete"),
+            "max_point_gap_m": evidence.max_point_gap_m,
+        },
+        command={
+            "call": "minegs.eval.volume.paired.compare_to_reference",
+            "surface_dir": str(surface_dir),
+            "dataset_dir": str(dataset_dir),
+            "tls_reference_ply": str(tls),
+            **cut,
+            "ranges": [list(r) for r in ranges],
+        },
+    )
+
+
+def sections_volume_spec() -> StageSpec:
+    return StageSpec(stage=Stage.SECTIONS_VOLUME, inputs=_sections_inputs, run=_sections_run)

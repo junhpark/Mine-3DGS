@@ -35,15 +35,19 @@ from minegs.e2e.stages import (
     dataset_identity,
     dataset_spec,
     depth_spec,
+    geometry_spec,
     ingest_spec,
+    sections_volume_spec,
     staging_digest,
     surface_spec,
     train_spec,
 )
+from minegs.eval.volume import compare_to_reference
 from minegs.train.runner.base import RunStatus
 
 from e57_fakes import make_scan, pose_node
 from test_depth_render import StandInRenderer, make_run
+from test_section_volume import _series
 
 
 def blank_state(**over) -> WorkflowState:
@@ -507,14 +511,36 @@ def stand_in_trainer(run_cfg, runner_cfg):
 
 
 @pytest.fixture(scope="module")
-def chain(staging_small, build_config_small, tmp_path_factory):
-    """The whole Phase 0B -> 1B chain, driven by the workflow, with both seams substituted."""
+def tls_reference(staging_small, tmp_path_factory):
+    """The held-out TLS, in TLS_GLOBAL.
+
+    The synthetic survey's SOURCE frame is adopted as TLS_GLOBAL by the build config
+    (``explicit_identity``), so the survey cloud *is* the reference — the true tunnel the
+    reconstruction is measured against, and never an input to it.
+    """
+    from minegs.core.pointcloud import PointCloud, write_ply
+
+    src = staging_small.points_source
+    out = tmp_path_factory.mktemp("tls") / "tls_full.ply"
+    # float64: this survey's SOURCE frame carries a UTM-scale offset, and float32 would quantise
+    # it to half a metre. A real TLS_GLOBAL reference has the same problem and the same answer.
+    return write_ply(PointCloud(src.xyz, rgb=src.rgb, frame="TLS_GLOBAL"), out, xyz_dtype="f8")
+
+
+@pytest.fixture(scope="module")
+def chain(staging_small, build_config_small, tls_reference, tmp_path_factory):
+    """The whole chain, driven by the workflow, with both hardware seams substituted."""
     root = tmp_path_factory.mktemp("c3")
     cfg = e2e_config(
         staging_dir=str(staging_small.staging_dir),
         build_config=str(write_build_config(root, build_config_small, root / "conv.json")),
         dataset_dir=str(root / "dataset"),
+        tls_reference_ply=str(tls_reference),
         stride=2,
+        interval_m=1.0,
+        thickness_m=0.5,
+        angle_bins=72,
+        max_dist_m=1.0,
     )
     wf = Workflow(root / "wf", cfg)
     specs = {
@@ -523,10 +549,12 @@ def chain(staging_small, build_config_small, tmp_path_factory):
         Stage.TRAIN: train_spec(),
         Stage.DEPTH: depth_spec(),
         Stage.SURFACE: surface_spec(),
+        Stage.GEOMETRY: geometry_spec(),
+        Stage.SECTIONS_VOLUME: sections_volume_spec(),
     }
     state = wf.execute(
         specs,
-        through=Stage.SURFACE,
+        through=Stage.SECTIONS_VOLUME,
         renderer=StandInRenderer(depth_m=7.0),
         trainer=stand_in_trainer,
     )
@@ -627,8 +655,233 @@ def test_a_retrained_run_makes_the_depth_and_surface_stages_stale(chain):
     try:
         checkpoint.write_bytes(keep + b"another run's weights")
         wf = Workflow(chain.root / "wf")
-        assert wf.stale_stages(chain.specs) == [Stage.DEPTH, Stage.SURFACE]
+        # ...and it cascades: the surface, the geometry and the comparison all rest on it
+        assert wf.stale_stages(chain.specs) == [
+            Stage.DEPTH,
+            Stage.SURFACE,
+            Stage.GEOMETRY,
+            Stage.SECTIONS_VOLUME,
+        ]
         with pytest.raises(ContractError, match="checkpoint_sha256"):
             wf.execute(chain.specs, through=Stage.SURFACE)
     finally:
         checkpoint.write_bytes(keep)
+
+
+# ---------------------------------------------------------------- C4: paired TLS validation
+
+
+def paired_record(areas, *, section_id, kind="raw_cloud", interval_m=1.0, angle_bins=4, **over):
+    """A section artifact on a fixed grid, for comparing two of them directly."""
+    from minegs.core.provenance import ProvenanceRecord
+    from minegs.eval.sections import SectionRecord, SectionSource
+
+    source = (
+        SectionSource(kind="raw_cloud", point_sha256="a" * 64, point_path="/tmp/ref.ply")
+        if kind == "raw_cloud"
+        else SectionSource(
+            kind="surface",
+            surface_id="surface_x",
+            run_id="run_x",
+            depth_source="minegs_render",
+            point_sha256="b" * 64,
+            point_path="/tmp/surface",
+        )
+    )
+    fields = {
+        "dataset_id": "ds",
+        "dataset_hash": "h" * 64,
+        "reference_axis": "centerline:design:centerline.csv",
+        "reference_axis_sha256": "c" * 64,
+        **over,
+    }
+    return SectionRecord(
+        section_id=section_id,
+        source=source,
+        series=_series(areas, interval_m=interval_m, angle_bins=angle_bins),
+        parameters={"interval_m": interval_m, "start_m": None, "end_m": None},
+        provenance=ProvenanceRecord(),
+        **fields,
+    )
+
+
+def test_two_series_cut_on_different_grids_are_not_comparable():
+    """T6: 'the area at 22 m' means different things on two grids."""
+    pred = paired_record([10.0] * 5, section_id="p", kind="surface")
+    for field, value in (
+        ("reference_axis", "centerline:extracted:other.csv"),
+        ("dataset_hash", "d" * 64),
+    ):
+        ref = paired_record([10.0] * 5, section_id="r", **{field: value})
+        with pytest.raises(ContractError, match=f"disagree about {field}"):
+            compare_to_reference(pred, ref)
+
+    coarse = paired_record([10.0] * 3, section_id="r", interval_m=2.0)
+    with pytest.raises(ContractError, match="disagree about interval_m"):
+        compare_to_reference(pred, coarse)
+
+    short = paired_record([10.0] * 4, section_id="r")
+    with pytest.raises(ContractError, match="different chainages"):
+        compare_to_reference(pred, short)
+
+
+def test_section_errors_are_paired_station_by_station():
+    pred = paired_record([12.0, 11.0, 10.0, 9.0, 8.0], section_id="p", kind="surface")
+    ref = paired_record([10.0, 10.0, 10.0, 10.0, 10.0], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    s = v.sections
+    assert s.station_count == 5 and s.paired_valid_count == 5
+    assert [st.signed_error_m2 for st in s.stations] == [2.0, 1.0, 0.0, -1.0, -2.0]
+    assert s.mean_absolute_error_m2 == pytest.approx(1.2)
+    assert s.median_absolute_error_m2 == pytest.approx(1.0)
+    assert s.mean_signed_error_m2 == pytest.approx(0.0)
+    assert s.mean_relative_error == pytest.approx(0.12)
+
+
+def test_a_zero_reference_area_is_reported_not_divided_by():
+    pred = paired_record([10.0, 10.0, 10.0], section_id="p", kind="surface")
+    ref = paired_record([10.0, 0.0, 10.0], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    zero = v.sections.stations[1]
+    assert zero.absolute_error_m2 == pytest.approx(10.0)
+    assert zero.relative_error is None
+    assert "ratio is undefined" in zero.relative_error_reason
+    assert v.sections.relative_error_station_count == 2  # the other two
+
+
+def test_a_station_only_one_side_observed_is_not_paired():
+    pred = paired_record([10.0, None, 10.0, 10.0], section_id="p", kind="surface")
+    ref = paired_record([10.0, 10.0, None, 10.0], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    assert v.sections.paired_valid_count == 2
+    assert v.sections.missing_prediction_count == 1
+    assert v.sections.missing_reference_count == 1
+    assert v.sections.stations[1].absolute_error_m2 is None
+    assert v.sections.stations[1].ref_area_m2 == pytest.approx(10.0)
+
+
+def test_t7_neither_volume_is_integrated_across_a_missing_station():
+    """areas 10,10,-,10,10 on one side: two segments, and the reference follows the same cut."""
+    pred = paired_record([10.0, 10.0, None, 10.0, 10.0], section_id="p", kind="surface")
+    ref = paired_record([12.0, 12.0, 12.0, 12.0, 12.0], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    assert v.volume.integrated_intervals_m == [(0.0, 1.0), (3.0, 4.0)]
+    assert v.volume.missing_intervals_m == [(1.0, 3.0)]
+    assert v.volume.predicted_volume_m3 == pytest.approx(20.0)
+    assert v.volume.reference_volume_m3 == pytest.approx(24.0)  # over the same 2 m, not 4 m
+    assert v.volume.absolute_error_m3 == pytest.approx(4.0)
+    assert v.volume.coverage_fraction == pytest.approx(0.5)
+
+
+def test_t8_the_two_volumes_are_compared_over_the_common_domain_only():
+    """The rule the module exists for: differing coverages are not an error term.
+
+    The prediction reaches further than the reference. Integrating each over its own span and
+    subtracting would report 10 m3 of 'error' that is really 1 m of tunnel only one side saw.
+    """
+    pred = paired_record([10.0] * 5, section_id="p", kind="surface")
+    ref = paired_record([10.0, 10.0, 10.0, 10.0, None], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    assert v.volume.integrated_intervals_m == [(0.0, 3.0)]
+    assert v.volume.predicted_volume_m3 == pytest.approx(30.0)
+    assert v.volume.reference_volume_m3 == pytest.approx(30.0)
+    assert v.volume.absolute_error_m3 == pytest.approx(0.0)  # not 10.0
+    assert v.volume.prediction_only_intervals_m == [(3.0, 4.0)]
+    assert v.volume.reference_only_intervals_m == []
+    assert "common domain only" in " ".join(v.volume.notes)
+
+
+def test_coverage_is_measured_against_the_requested_holdout():
+    """A reconstruction that reaches half the holdout has half the coverage."""
+    pred = paired_record([10.0] * 11, section_id="p", kind="surface")
+    ref = paired_record([10.0] * 5 + [None] * 6, section_id="r")
+    v = compare_to_reference(pred, ref, ranges=[(0.0, 8.0)])
+
+    assert v.volume.requested_length_m == pytest.approx(8.0)
+    assert v.volume.common_covered_length_m == pytest.approx(4.0)
+    assert v.volume.coverage_fraction == pytest.approx(0.5)
+    assert v.volume.missing_intervals_m == [(4.0, 8.0)]
+
+
+def test_nothing_observed_by_both_sides_is_not_a_zero_error():
+    pred = paired_record([10.0, None, 10.0], section_id="p", kind="surface")
+    ref = paired_record([None, 10.0, None], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    assert v.volume.predicted_volume_m3 is None and v.volume.reference_volume_m3 is None
+    assert v.volume.absolute_error_m3 is None and v.volume.relative_error is None
+    assert "nothing the two volumes could be compared over" in " ".join(v.volume.notes)
+
+
+def test_a_zero_reference_volume_is_reported_not_divided_by():
+    pred = paired_record([10.0, 10.0], section_id="p", kind="surface")
+    ref = paired_record([0.0, 0.0], section_id="r")
+    v = compare_to_reference(pred, ref)
+
+    assert v.volume.reference_volume_m3 == pytest.approx(0.0)
+    assert v.volume.absolute_error_m3 == pytest.approx(10.0)
+    assert v.volume.relative_error is None
+    assert "ratio is undefined" in v.volume.relative_error_reason
+
+
+def test_the_sections_volume_stage_compares_the_run_against_held_out_tls(chain):
+    out = chain.state.stages[Stage.SECTIONS_VOLUME].outputs
+    holdout = chain.state.stages[Stage.DATASET].outputs["geometry_holdout_ranges_m"]
+
+    assert out["requested_ranges_m"] == holdout  # judge()'s, not the runner's
+    assert out["grid"]["interval_m"] == 1.0 and out["grid"]["angle_bins"] == 72
+    assert out["paired_valid_count"] > 0
+    assert out["predicted_volume_m3"] is not None and out["reference_volume_m3"] is not None
+    assert out["absolute_error_m3"] == pytest.approx(
+        abs(out["predicted_volume_m3"] - out["reference_volume_m3"])
+    )
+    for key in ("sections_predicted_path", "sections_reference_path", "paired_validation_path"):
+        assert Path(out[key]).is_file()
+
+
+def test_the_reference_sections_are_recorded_as_the_raw_cloud_they_are(chain):
+    """Dressing the TLS reference up as a reconstruction would make its record say something
+    false about where it came from."""
+    from minegs.eval.sections import SectionRecord
+
+    out = chain.state.stages[Stage.SECTIONS_VOLUME].outputs
+    ref = SectionRecord.load(out["sections_reference_path"])
+    pred = SectionRecord.load(out["sections_predicted_path"])
+
+    assert ref.source.kind == "raw_cloud" and not ref.supports_accuracy_claim
+    assert pred.source.kind == "surface" and pred.source.depth_source == "minegs_render"
+    assert pred.source.run_id == chain.state.stages[Stage.TRAIN].outputs["run_id"]
+
+
+def test_the_geometry_stage_carries_both_directions_and_the_real_claim(chain):
+    out = chain.state.stages[Stage.GEOMETRY].outputs
+    holdout = chain.state.stages[Stage.DATASET].outputs["geometry_holdout_ranges_m"]
+
+    assert out["claim"] == "geometry_accuracy"
+    assert out["chainage_range_m"] == [holdout[0][0], holdout[-1][1]]
+    for key in (
+        "accuracy_median_m",
+        "accuracy_p95_m",
+        "completeness_median_m",
+        "completeness_p95_m",
+        "chamfer_m",
+    ):
+        assert out[key] is not None
+    assert out["f_score"] and Path(out["report_path"]).is_file()
+
+
+def test_t5_the_geometry_numbers_are_measured_inside_the_holdout_only(chain):
+    """The stage does not offer --no-holdout-only: a claim path does not get to choose."""
+    import json as _json
+
+    rep = _json.loads(Path(chain.state.stages[Stage.GEOMETRY].outputs["report_path"]).read_text())
+    holdout = chain.state.stages[Stage.DATASET].outputs["geometry_holdout_ranges_m"]
+    assert rep["chainage_range_m"] == [holdout[0][0], holdout[-1][1]]
+    assert rep["claim"] == "geometry_accuracy"
+    command = chain.state.stages[Stage.GEOMETRY].command
+    assert command["holdout_only"] is True and command["diagnostic"] is False
