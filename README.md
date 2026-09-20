@@ -426,7 +426,8 @@ parameters · provenance`.
 | `reference_axis` | manifest 가 지금 선언하는 축 문자열 |
 | `reference_axis_sha256` | 축 CSV 파일 자체의 digest |
 | `series` 의 chainage 격자 | 지금의 centerline 과 기록된 parameters 로 다시 만든 station 격자 |
-| `source.surface_id` · `point_sha256` · `depth_source` | surface artifact 가 아직 디스크에 있다면 그것 (`check_surface` 포함) |
+| `source.surface_id` · `run_id` · `point_sha256` · `depth_source` | surface artifact 가 아직 디스크에 있다면 그것 (`check_surface` 포함) |
+| `source` 의 필드 존재 자체 | `kind` 가 요구하는 필드가 모두 채워져 있는가 (없으면 검사가 조용히 no-op 이 된다) |
 | (claim 경로만) `series` 의 면적·반경 자체 | 검증된 surface 에서 **다시 잘라** 재현되는가 |
 | (claim 경로만) surface 의 `depth_source` | surface 가 기록한 depth/run 디렉터리에서 **다시 유도**되는가 |
 | `series.frame` | record 의 `frame` (TLS_GLOBAL) |

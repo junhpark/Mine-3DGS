@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from minegs.core.config import VersionedModel
 from minegs.core.errors import ContractError
@@ -79,6 +79,39 @@ class SectionSource(_Strict):
     #: The path as the caller gave it. A convenience for a reader, and the handle that lets
     #: ``check_section_record`` re-verify the surface when it is still where it was.
     point_path: str | None = None
+
+    @model_validator(mode="after")
+    def _kind_carries_its_fields(self) -> SectionSource:
+        """Every field a check reads must be there, or the check silently does not happen.
+
+        ``run_id`` was compared against the surface only once it was known to be present;
+        nulling it in the JSON would otherwise turn an equality into a no-op. The same argument
+        holds for each of the others, so the shape is enforced rather than assumed.
+        """
+        surface_only = {
+            "surface_id": self.surface_id,
+            "run_id": self.run_id,
+            "depth_source": self.depth_source,
+        }
+        if self.kind == "surface":
+            blank = sorted(
+                k
+                for k, v in {
+                    **surface_only,
+                    "point_sha256": self.point_sha256,
+                    "point_path": self.point_path,
+                }.items()
+                if not v
+            )
+            if blank:
+                raise ValueError(f"a surface-backed section source must name {blank}")
+        else:
+            named = sorted(k for k, v in surface_only.items() if v is not None)
+            if named:
+                raise ValueError(f"a {self.kind} section source cannot name {named}")
+            if not self.point_sha256 or not self.point_path:
+                raise ValueError("a section source must name the cloud it was cut from")
+        return self
 
     @property
     def supports_accuracy_claim(self) -> bool:
@@ -279,6 +312,15 @@ def _check_surface_still_agrees(rec: SectionRecord, dataset_id: str, dataset_has
         raise ContractError(
             f"sections {rec.section_id} were cut from surface {rec.source.surface_id}, but "
             f"{path} now holds {surface.surface_id}"
+        )
+    # The run is the far end of the chain this whole phase exists to keep unbroken, and it was
+    # recorded without ever being compared: editing one line of sections.json attributed a
+    # volume measured on one run to another, with every other check still passing and the
+    # forged id travelling into the published report.
+    if surface.run_id != rec.source.run_id:
+        raise ContractError(
+            f"sections {rec.section_id} record run {rec.source.run_id!r}, but surface "
+            f"{surface.surface_id} belongs to run {surface.run_id!r}"
         )
     if surface.point_sha256 != rec.source.point_sha256:
         raise ContractError(

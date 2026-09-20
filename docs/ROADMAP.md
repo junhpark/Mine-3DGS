@@ -594,8 +594,11 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   dataset id/hash, 축 문자열, 축 CSV 의 digest, 그리고 **지금의 centerline 과 기록된 parameters
   로 다시 만든 station 격자**. 마지막 것이 점군 없이 할 수 있는 가장 강한 검사다 — 다른 축,
   다른 interval, 다른 sub-range 로 자른 시계열은 재유도를 통과하지 못한다. source surface 가
-  아직 디스크에 있으면 `check_surface` 로 다시 검증하고 `surface_id`·`point_sha256`·
-  `depth_source` 를 대조한다 (Phase 1B 가 checkpoint 에 대해 한 것과 같은 거래: 남아 있으면
+  아직 디스크에 있으면 `check_surface` 로 다시 검증하고 `surface_id`·**`run_id`**·
+  `point_sha256`·`depth_source` 를 대조한다 — `run_id` 는 chain 의 맨 끝이고, 기록만 되고
+  대조되지 않던 동안에는 sections.json 한 줄을 고쳐 A run 에서 측정한 체적을 B run 의 결과로
+  발행할 수 있었다. `SectionSource` 는 `kind` 가 요구하는 필드가 모두 채워져 있는지도 강제한다
+  (null 로 비우면 그 필드에 대한 검사가 조용히 no-op 이 되기 때문) (Phase 1B 가 checkpoint 에 대해 한 것과 같은 거래: 남아 있으면
   믿지 않고 확인하고, 사라졌으면 기록된 id 만 남는다).
 * **축 digest 가 따로 필요한 이유**: `DATASET_HASH_PATTERNS` 는 dataset 루트의
   `centerline.csv` 만 덮는다. manifest 가 다른 경로를 가리키면 dataset hash 는 축 편집을 보지
@@ -673,7 +676,8 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   미결 결정으로 남긴다** (Phase 1 G2).
 * **fail closed**: dataset id/hash 불일치 · 축 문자열/digest 불일치 · station 격자 불일치 ·
   parameters 와 series 불일치 · surface 가 record 와 달라짐 · claim 경로에서 surface 부재 ·
-  재현되지 않는 면적/반경/valid 플래그 · 재유도되지 않는 surface `depth_source` ·
+  재현되지 않는 면적/반경/valid 플래그 · surface 와 다른 `source.run_id` ·
+  `kind` 가 요구하는 `source` 필드 누락 · 재유도되지 않는 surface `depth_source` ·
   claim 경로에서 depth/run 디렉터리 부재 · 슬랩이 station 간격보다 넓음 · 서로 다른 축의 두
   시계열 차분 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
   `external_unverified` 로 claim 요청 · holdout 미선언 · holdout coverage 불완전 ·
@@ -874,6 +878,8 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | holdout coverage 가 불완전한 `volume_accuracy` | `ContractError` (exit 2) | 적분하지 못한 구간의 체적은 측정된 것이 아니다 | 실측 검증으로 최소 coverage 가 정해지면 |
 | dataset/축이 다른 section artifact | `ContractError` (exit 2) | chainage 는 다른 polyline 위에서 다른 뜻이다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
 | surface 에서 다시 잘랐을 때 재현되지 않는 면적/반경 | `ContractError` (exit 2) | 그 면적은 그 surface 에서 측정된 것이 아니다 | 해당 없음 (설계) |
+| surface 와 다른 `source.run_id` 를 기록한 section artifact | `ContractError` (exit 2) | 다른 run 은 약한 증거가 아니라 다른 artifact 의 identity 다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
+| `kind` 가 요구하는 필드를 null 로 비운 `SectionSource` | `ContractError` (exit 2) | 없는 필드에 대한 검사는 조용히 일어나지 않는다 | 해당 없음 (설계) |
 | `--thickness-m` > `--interval-m` 로 자른 section 의 claim | `ContractError` (exit 2) | 겹친 슬랩은 자기 형상이 없는 station 을 이웃의 점으로 채운다 | 해당 없음 (설계) |
 | `surface.json` 의 `depth_source` 만 고친 surface 의 claim | `ContractError` (exit 2) | 승격 판정은 읽는 것이 아니라 다시 유도하는 것이다 | 해당 없음 (설계) |
 | `depth_source` 재유도 불가 surface 로 `eval geometry` claim | `ContractError` (exit 2) | 같은 결함이므로 같은 게이트 (Phase 1A 경로) | 해당 없음 (설계) |

@@ -1097,3 +1097,51 @@ def test_a_claim_needs_the_depth_and_run_the_surface_was_fused_from(chain, tmp_p
     surface.parameters = gone
     reason = rederive_depth_source(surface, chain.dataset_dir)
     assert reason and "cannot be re-derived" in reason
+
+
+def test_a_volume_cannot_be_attributed_to_another_run(chain, tmp_path):
+    """`run_id` was recorded and never compared: the far end of the chain was unbound.
+
+    Everything else passes — dataset, axis, surface id, point digest, depth_source re-derived,
+    the sections re-cut from that surface, coverage complete — so one edited line attributed a
+    volume measured on one run to another, and the forged id travelled into the published
+    report. Wrong run is not weaker evidence, it is a different artifact's identity, so
+    --diagnostic does not excuse it either.
+    """
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    rec = cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert rec.source.run_id == "run_1c_full"
+    assert runner.invoke(app, volume_argv(sec, chain.dataset_dir, out)).exit_code == 0
+    assert volume_json(out)["source"]["run_id"] == "run_1c_full"
+
+    raw = json.loads(sec.read_text())
+    raw["source"]["run_id"] = "run_some_other_experiment"
+    sec.write_text(json.dumps(raw))
+    for argv in (
+        volume_argv(sec, chain.dataset_dir),
+        volume_argv(sec, chain.dataset_dir, diagnostic=True),
+    ):
+        r = runner.invoke(app, argv)
+        assert r.exit_code == 2, r.output
+        assert "run_some_other_experiment" in flat(r) and "belongs to run" in flat(r)
+
+
+def test_a_source_cannot_null_the_fields_its_checks_read(chain, tmp_path):
+    """Nulling `run_id` would turn the equality above into a no-op, so the shape is enforced."""
+    sec = tmp_path / "s.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    raw = json.loads(sec.read_text())
+
+    for field in ("run_id", "surface_id", "depth_source", "point_sha256", "point_path"):
+        edited = json.loads(json.dumps(raw))
+        edited["source"][field] = None
+        sec.write_text(json.dumps(edited))
+        with pytest.raises(ContractError, match="must name"):
+            load_section_input(sec)
+
+    # ...and the mirror: a raw cloud cannot dress itself in a surface's fields
+    edited = json.loads(json.dumps(raw))
+    edited["source"]["kind"] = "raw_cloud"
+    sec.write_text(json.dumps(edited))
+    with pytest.raises(ContractError, match="cannot name"):
+        load_section_input(sec)
