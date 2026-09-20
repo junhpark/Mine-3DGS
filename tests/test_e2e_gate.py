@@ -392,12 +392,22 @@ def cli(*args) -> object:
     return CliRunner().invoke(app, list(args))
 
 
+def said(result) -> str:
+    """The CLI's output with its line breaks flattened.
+
+    rich wraps to the console width, and the width depends on where the test ran: the same
+    refusal reads "...: no / workflow there" across two lines on a narrow runner and stays on
+    one line on a wide one. Asserting on the raw text tests the layout; match the words.
+    """
+    return " ".join(result.output.split())
+
+
 def test_status_says_where_the_workflow_is_without_touching_it(gate):
     before = (gate.root / "wf" / "workflow.json").read_text()
     result = cli("e2e", "status", "--work-dir", str(gate.root / "wf"))
 
     assert result.exit_code == 0, result.output
-    assert "complete through" in result.output and "report" in result.output
+    assert "complete through" in said(result) and "report" in said(result)
     assert (gate.root / "wf" / "workflow.json").read_text() == before
 
 
@@ -408,7 +418,7 @@ def test_report_regenerates_the_document_and_runs_no_stage(gate, tmp_path):
     assert result.exit_code == 0, result.output
     assert (tmp_path / "r" / "phase2_report.json").is_file()
     assert (tmp_path / "r" / "phase2_report.md").is_file()
-    assert "not_validated" in result.output and "pending" in result.output
+    assert "not_validated" in said(result) and "pending" in said(result)
     assert (gate.root / "wf" / "workflow.json").read_text() == before
 
 
@@ -416,7 +426,7 @@ def test_the_cli_offers_no_way_to_substitute_the_hardware():
     """The seams are reached from Python by a test that records it, never from the shell."""
     result = cli("e2e", "run", "--help")
     assert result.exit_code == 0
-    options = [word for word in result.output.split() if word.startswith("--")]
+    options = [word for word in said(result).split() if word.startswith("--")]
     for flag in ("--renderer", "--trainer", "--fake-renderer", "--stand-in", "--no-gpu"):
         assert flag not in options
 
@@ -424,7 +434,7 @@ def test_the_cli_offers_no_way_to_substitute_the_hardware():
 def test_reporting_on_a_directory_with_no_workflow_says_so(tmp_path):
     result = cli("e2e", "report", "--work-dir", str(tmp_path))
     assert result.exit_code == 2
-    assert "no workflow there" in result.output
+    assert "no workflow there" in said(result)
 
 
 def test_a_stage_name_that_is_not_a_stage_lists_the_ones_that_are(gate, tmp_path):
@@ -435,8 +445,8 @@ def test_a_stage_name_that_is_not_a_stage_lists_the_ones_that_are(gate, tmp_path
     )
 
     assert result.exit_code == 2
-    assert "is not a workflow stage" in result.output
-    assert "sections_volume" in result.output
+    assert "is not a workflow stage" in said(result)
+    assert "sections_volume" in said(result)
 
 
 def test_reopening_a_workflow_with_a_different_config_is_refused(gate, tmp_path):
@@ -448,7 +458,7 @@ def test_reopening_a_workflow_with_a_different_config_is_refused(gate, tmp_path)
     result = cli("e2e", "run", str(path), "--work-dir", str(gate.root / "wf"))
 
     assert result.exit_code == 2
-    assert "different workflow config" in result.output
+    assert "different workflow config" in said(result)
 
 
 def test_a_relative_path_in_a_config_is_read_against_the_config(tmp_path):
