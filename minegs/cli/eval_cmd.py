@@ -469,15 +469,29 @@ def sections(
 def _incomplete_coverage(cov, ranges) -> str:
     asked = ", ".join(f"{lo:g}-{hi:g} m" for lo, hi in ranges)
     unobserved = cov.requested_length_m - cov.covered_length_m
-    return (
+    head = (
         f"volume_accuracy is a claim about the whole declared holdout {asked}, and "
         f"{unobserved:.2f} m of {cov.requested_length_m:.2f} m of it "
         f"({(1 - cov.coverage_fraction) * 100:.1f}%) has no observed sections: "
         f"{cov.describe_gaps()}. "
         "The volume over a gap is not measured, and this project does not interpolate it or "
         "accept a coverage threshold it has not validated. Re-section over the holdout "
-        "(`--start-m`/`--end-m`) once the reconstruction covers it, or pass --diagnostic for "
-        "the partial volume with this coverage reported alongside it."
+        "(`--start-m`/`--end-m`) once the reconstruction covers it"
+    )
+    if cov.covered_length_m > 0:
+        return (
+            head + ", or pass --diagnostic for the partial volume with this coverage "
+            "reported alongside it."
+        )
+    # No two consecutive observed sections anywhere in the holdout, so there is no partial
+    # volume over it to offer -- promising one and then exiting on "nothing to integrate" was
+    # a remedy that did not work. The honest alternative is a different span, which is what
+    # --no-holdout-only asks for, and it is a diagnostic by construction.
+    return (
+        head + ". There is no partial volume over the holdout either: it holds "
+        f"{cov.valid_section_count} observed station(s) and a volume needs two consecutive "
+        "ones, so --diagnostic has nothing to compute there. Use --no-holdout-only for a "
+        "diagnostic volume over the span these sections do cover."
     )
 
 
@@ -602,11 +616,16 @@ def volume(
             # Decided before integrating, not after: a holdout with no two consecutive observed
             # sections has no volume to report at all, and it should reach the coverage refusal
             # (which says what is missing) rather than a bare "nothing to integrate".
-            coverage = plan_integration(ser, ranges)[1]
+            segments, coverage = plan_integration(ser, ranges)
             if not coverage.complete:
-                if not diagnostic:
-                    raise ContractError(_incomplete_coverage(coverage, ranges))
-                console.print(f"[yellow]diagnostic: {_incomplete_coverage(coverage, ranges)}[/]")
+                reason = _incomplete_coverage(coverage, ranges)
+                # --diagnostic buys the partial volume over the holdout -- but only when there
+                # is one. With no integrable pair in it the downgrade would fall through to
+                # `integrate_sections` and leave as a bare "nothing to integrate", so the
+                # refusal carries the remedy that works instead.
+                if not diagnostic or not segments:
+                    raise ContractError(reason)
+                console.print(f"[yellow]diagnostic: {reason}[/]")
                 # The holdout stays: the refusal above offers "the partial volume with this
                 # coverage reported alongside it", and quietly swapping in the whole drift
                 # would answer a different question than the one it just described.

@@ -644,7 +644,16 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   `coverage_fraction` 은 station 이 구간을 덮는지를, 이것은 그 아래에 무엇이라도 있는지를 말한다.
 * **각도 방향 보간도 보고**: `extract_sections` 는 빈 angle bin 을 `angle_bins//10` 까지 이웃에서
   보간하고 section 을 valid 로 둔다. 알고리즘 재설계는 범위 밖이므로 적분된 station 들의
-  `interpolated_bin_fraction` 을 coverage 블록에 싣는다.
+  `interpolated_bin_fraction` 을 coverage 블록에 싣는다. 이 값은 `empty_bins` 에서 계산되므로
+  claim 경로에서 `empty_bins`·`n_points` 도 재절단 결과와 대조한다 — 그러지 않으면 "벽의 몇
+  %가 지어낸 값인가" 를 생산자가 선언하게 된다. `parameters.point_count` 도 같은 이유로
+  surface 의 실제 점 개수와 대조한다.
+* **`radii_m` 길이는 `angle_bins` 와 같아야 한다** (`SectionSeries` validator): 짧은 리스트는
+  구조적으로 유효한 채 claim 경로의 `np.array` 에 도달해 numpy `ValueError` 로 exit 1 +
+  traceback 을 냈다. contract 거부가 있어야 할 자리다.
+* **holdout 에 연속 관측 station 이 2개 미만이면 `--diagnostic` 도 거부한다**: 그 구간에 대한
+  partial volume 자체가 없기 때문이다. 거부 메시지가 `--no-holdout-only` 를 안내한다 — 이전에는
+  없는 partial volume 을 약속하고 "nothing to integrate" 로 떨어졌다.
 * **gap-safe 적분** (`eval/volume/coverage.py`): 연속된 관측 station 의 run 안에서만 적분한다.
   `10, 10, -, 10, 10` 은 20 m³ 이지 40 m³ 가 아니다. gap 의 체적은 추정하지도 보간하지도
   않으므로 coverage 가 불완전한 수치는 항상 **과소** 추정이고, 그것이 안전한 방향이다.
@@ -879,6 +888,9 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | dataset/축이 다른 section artifact | `ContractError` (exit 2) | chainage 는 다른 polyline 위에서 다른 뜻이다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
 | surface 에서 다시 잘랐을 때 재현되지 않는 면적/반경 | `ContractError` (exit 2) | 그 면적은 그 surface 에서 측정된 것이 아니다 | 해당 없음 (설계) |
 | surface 와 다른 `source.run_id` 를 기록한 section artifact | `ContractError` (exit 2) | 다른 run 은 약한 증거가 아니라 다른 artifact 의 identity 다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
+| 재절단과 다른 `empty_bins`/`n_points`/`point_count` | `ContractError` (exit 2) | 보고되는 수치는 선언이 아니라 재유도의 결과여야 한다 | 해당 없음 (설계) |
+| `angle_bins` 와 길이가 다른 `radii_m` | `ContractError` (exit 2) | numpy ValueError 가 아니라 계약 위반이다 | 해당 없음 (설계) |
+| holdout 에 연속 관측 station 2개 미만 | `ContractError` (exit 2, `--diagnostic` 포함) | 그 구간에 대한 partial volume 이 존재하지 않는다 | 해당 없음 (설계) |
 | `kind` 가 요구하는 필드를 null 로 비운 `SectionSource` | `ContractError` (exit 2) | 없는 필드에 대한 검사는 조용히 일어나지 않는다 | 해당 없음 (설계) |
 | `--thickness-m` > `--interval-m` 로 자른 section 의 claim | `ContractError` (exit 2) | 겹친 슬랩은 자기 형상이 없는 station 을 이웃의 점으로 채운다 | 해당 없음 (설계) |
 | `surface.json` 의 `depth_source` 만 고친 surface 의 claim | `ContractError` (exit 2) | 승격 판정은 읽는 것이 아니라 다시 유도하는 것이다 | 해당 없음 (설계) |

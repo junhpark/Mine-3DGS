@@ -208,6 +208,33 @@ def test_t4_a_rendered_surface_with_complete_holdout_coverage_reaches_volume_acc
 # ---------------------------------------------------------------- T5: identity
 
 
+def test_t5_a_raw_records_dataset_is_checked_by_the_record_check_itself(chain, tmp_path):
+    """The same refusal on a record with no surface behind it.
+
+    On a surface-backed record `check_surface` is handed the record's own dataset id and hash
+    and raises a message naming them, so the dataset guards in `check_section_record` could be
+    deleted with the suite still green. A `raw_cloud` record re-verifies no surface, so only
+    `check_section_record` can refuse it — and its wording is what is asserted.
+    """
+    sec = tmp_path / "raw.json"
+    cut(chain.raw_ply, chain.dataset_dir, sec, interval_m=2, thickness_m=0.5, angle_bins=72)
+    real = json.loads(sec.read_text())
+
+    raw = json.loads(json.dumps(real))
+    raw["dataset_id"] = "some_other_dataset"
+    sec.write_text(json.dumps(raw))
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, diagnostic=True))
+    assert r.exit_code == 2, r.output
+    assert "were cut from dataset 'some_other_dataset'" in flat(r)
+
+    raw = json.loads(json.dumps(real))
+    raw["dataset_hash"] = "0" * 64
+    sec.write_text(json.dumps(raw))
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, diagnostic=True))
+    assert r.exit_code == 2, r.output
+    assert "the dataset — its centerline, its cameras or its images — changed" in flat(r)
+
+
 def test_t5_a_record_from_another_dataset_is_refused_even_diagnostically(chain, tmp_path):
     """Wrong dataset is not a weaker number, it is a different tunnel — so no flag excuses it."""
     sec = tmp_path / "full.json"
@@ -1145,3 +1172,96 @@ def test_a_source_cannot_null_the_fields_its_checks_read(chain, tmp_path):
     sec.write_text(json.dumps(edited))
     with pytest.raises(ContractError, match="cannot name"):
         load_section_input(sec)
+
+
+def test_a_holdout_with_nothing_to_integrate_names_a_remedy_that_works(chain, tmp_path):
+    """--diagnostic buys the partial volume over the holdout -- when there is one.
+
+    Sections cut entirely outside the holdout leave it with no integrable pair, so there is no
+    partial volume to offer. The refusal used to promise one anyway and then fall through to a
+    bare "nothing to integrate" at exit 2, which is a remedy that does not work.
+    """
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    r = runner.invoke(
+        app,
+        sections_argv(
+            chain.full,
+            chain.dataset_dir,
+            sec,
+            interval_m=1,
+            thickness_m=0.5,
+            angle_bins=72,
+            start_m=0,
+            end_m=10,
+        ),
+    )
+    assert r.exit_code == 0, r.output
+
+    for argv in (
+        volume_argv(sec, chain.dataset_dir),
+        volume_argv(sec, chain.dataset_dir, diagnostic=True),
+    ):
+        r = runner.invoke(app, argv)
+        assert r.exit_code == 2, r.output
+        assert "no partial volume over the holdout either" in flat(r)
+        assert "--no-holdout-only" in flat(r)
+        assert "nothing to integrate" not in flat(r)
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, out, no_holdout_only=True))
+    assert r.exit_code == 0, r.output
+    vol = volume_json(out)
+    assert vol["claim"] == "geometry_diagnostic" and vol["volume_m3"] > 0
+
+
+def test_a_ragged_radii_list_is_named_at_load_not_raised_by_numpy():
+    """A short radii_m used to reach np.array inside the claim path: exit 1 and a traceback."""
+    ser = _series([10.0, 10.0, 10.0], angle_bins=4)
+    raw = json.loads(ser.model_dump_json())
+    raw["sections"][1]["radii_m"] = raw["sections"][1]["radii_m"][:2]
+    with pytest.raises(ValueError, match="one wall radius per angle bin"):
+        SectionSeries.model_validate(raw)
+
+
+def test_a_ragged_radii_list_in_a_record_is_refused_by_the_cli(chain, tmp_path):
+    sec = tmp_path / "s.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    raw = json.loads(sec.read_text())
+    raw["series"]["sections"][3]["radii_m"] = raw["series"]["sections"][3]["radii_m"][:10]
+    sec.write_text(json.dumps(raw))
+    for argv in (
+        volume_argv(sec, chain.dataset_dir),
+        volume_argv(sec, chain.dataset_dir, diagnostic=True),
+    ):
+        r = runner.invoke(app, argv)
+        assert r.exit_code == 2, r.output  # a contract refusal, not exit 1 with a traceback
+        assert "one wall radius per angle bin" in flat(r)
+
+
+def test_the_point_count_a_record_names_is_the_surface_it_names(chain, tmp_path):
+    """Recorded, exported into volume.json, and free to check while the cloud is open."""
+    sec = tmp_path / "s.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    raw = json.loads(sec.read_text())
+    raw["parameters"]["point_count"] = 7
+    sec.write_text(json.dumps(raw))
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output
+    assert "were cut from 7 points" in flat(r)
+
+
+def test_the_interpolated_bin_fraction_is_re_derived_not_read(chain, tmp_path):
+    """It is the only thing making angle-bin imputation non-silent, so it cannot be declared."""
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    cut(chain.full, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert runner.invoke(app, volume_argv(sec, chain.dataset_dir, out)).exit_code == 0
+    assert volume_json(out)["coverage"]["interpolated_bin_fraction"] == pytest.approx(0.0)
+
+    raw = json.loads(sec.read_text())
+    for s in raw["series"]["sections"]:
+        if s["valid"]:
+            s["empty_bins"] = 7
+    sec.write_text(json.dumps(raw))
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output
+    assert "gives empty_bins=0" in flat(r) and "the record says 7" in flat(r)

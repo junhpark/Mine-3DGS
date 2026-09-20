@@ -221,6 +221,14 @@ def check_claim_evidence(
         return ClaimEvidence(stale)
     if pc.frame != "TLS_GLOBAL":
         pc = pc.transformed(manifest.T_tls_from_local, "TLS_GLOBAL")
+    want = rec.parameters.get("point_count")
+    if want is not None and want != len(pc):
+        # Recorded, exported into volume.json as part of "at what resolution the claim was
+        # made", and free to check here because the cloud is already open.
+        return ClaimEvidence(
+            f"sections {rec.section_id} were cut from {want} points, but surface "
+            f"{surface.surface_id} holds {len(pc)}"
+        )
     gap = _largest_unobserved_gap(centerline.project(pc.xyz)[0], ranges, rec.series)
     p = rec.parameters
     again = extract_sections(
@@ -276,6 +284,27 @@ def _compare_series(rec: SectionRecord, again) -> str | None:
             f"are observed at {flipped[:8]}. A station the surface does not support cannot be "
             "made observed by editing the series."
         )
+    # ``empty_bins`` is not decoration: it is what ``interpolated_bin_fraction`` is computed
+    # from, and that number is the only thing making angle-bin imputation non-silent on a claim.
+    # Read out of the JSON it would be the producer's word for how much of the wall was invented.
+    for name, now, then in (
+        (
+            "empty_bins",
+            [s.empty_bins for s in again.sections],
+            [s.empty_bins for s in rec.series.sections],
+        ),
+        (
+            "n_points",
+            [s.n_points for s in again.sections],
+            [s.n_points for s in rec.series.sections],
+        ),
+    ):
+        if now != then:
+            at = next(i for i, (a, b) in enumerate(zip(now, then, strict=True)) if a != b)
+            return (
+                f"{where}: re-cutting surface {rec.source.surface_id} gives {name}={now[at]!r} at "
+                f"station {rec.series.sections[at].chainage_m:g} m, the record says {then[at]!r}"
+            )
     for name, got, want in (
         ("area_m2", again.areas(), rec.series.areas()),
         ("radii_m", _radii(again), _radii(rec.series)),

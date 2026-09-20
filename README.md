@@ -428,7 +428,9 @@ parameters · provenance`.
 | `series` 의 chainage 격자 | 지금의 centerline 과 기록된 parameters 로 다시 만든 station 격자 |
 | `source.surface_id` · `run_id` · `point_sha256` · `depth_source` | surface artifact 가 아직 디스크에 있다면 그것 (`check_surface` 포함) |
 | `source` 의 필드 존재 자체 | `kind` 가 요구하는 필드가 모두 채워져 있는가 (없으면 검사가 조용히 no-op 이 된다) |
-| (claim 경로만) `series` 의 면적·반경 자체 | 검증된 surface 에서 **다시 잘라** 재현되는가 |
+| (claim 경로만) `series` 의 면적·반경·`empty_bins`·`n_points` | 검증된 surface 에서 **다시 잘라** 재현되는가 |
+| (claim 경로만) `parameters.point_count` | 그 surface 가 실제로 가진 점 개수 |
+| `radii_m` 의 길이 | `angle_bins` (없으면 claim 경로에서 numpy `ValueError` 로 터진다) |
 | (claim 경로만) surface 의 `depth_source` | surface 가 기록한 depth/run 디렉터리에서 **다시 유도**되는가 |
 | `series.frame` | record 의 `frame` (TLS_GLOBAL) |
 
@@ -476,7 +478,8 @@ record 가 기록한 parameters 로 **다시 자르고** 결과를 대조한다 
 | bare `SectionSeries` JSON (1C 이전) | `ContractError` — provenance 없음 | 경고 + `geometry_diagnostic` |
 | `raw_cloud` section artifact | `ContractError` — 어떤 복원에 대한 증거도 아님 | 경고 + `geometry_diagnostic` |
 | `external_unverified` surface 기반 | `ContractError` — depth 가 run 과 묶여 있지 않음 | 경고 + `geometry_diagnostic` |
-| `minegs_render` surface 기반, holdout coverage 불완전 | `ContractError` — 빠진 구간을 이름으로 보고 | 경고 + `geometry_diagnostic` (partial) |
+| `minegs_render` 기반, holdout coverage 불완전 (관측 쌍 있음) | `ContractError` — 빠진 구간을 이름으로 보고 | 경고 + holdout 에 대한 partial volume, `geometry_diagnostic` |
+| `minegs_render` 기반, holdout 에 연속 관측 station 2개 미만 | `ContractError` | `ContractError` — holdout 에 대한 partial volume 자체가 없다. `--no-holdout-only` 로 자른 구간의 diagnostic 을 낸다 |
 | `minegs_render` surface 기반, coverage 완전 | `volume_accuracy` | `volume_accuracy` |
 | 다른 dataset/축/변경된 surface | `ContractError` | `ContractError` (플래그로 면제되지 않음) |
 
