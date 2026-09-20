@@ -79,13 +79,20 @@ git_commit · minegs_version · tool_versions · runtime_env · failure_reason
 | `dataset` | staging digest + build config hash |
 | `train` | dataset_id + dataset_hash + profile + backend |
 | `depth` | run_id + dataset_hash + checkpoint sha256 |
-| `surface` | depth manifest id + run_id + dataset_hash |
-| `geometry` | surface_id + point_sha256 + dataset_hash + TLS reference digest |
-| `sections_volume` | surface_id + dataset_hash + section parameters + TLS reference digest |
+| `surface` | depth manifest id + **depth map bytes** (`depth_digest`) + run_id + dataset_hash |
+| `geometry` | **디스크에서 다시 읽어 검증한** surface_id + point_sha256 + depth_source + dataset_hash + TLS reference digest |
+| `sections_volume` | 위와 같음 + section parameters |
 | `report` | paired_validation.json digest + geometry report digest (+ `_upstream` 로 위 전부) |
 
 `ingest` 와 `dataset` 은 고정 경로에 publish 하므로, 이미 있는 artifact 를 교체하는 것은
 `--rebuild-from` 이 그 stage 를 포함할 때뿐이다. 평상시 실행은 덮어쓰지 않는다.
+
+재료는 **세상에서 다시 읽은 것**이어야 하고, 원장에서 복사한 것이면 안 된다. 원장에 적힌
+`point_sha256` 은 SURFACE stage 가 어떤 파일에 대해 한 *진술*이고, 그 진술이 아직 참이냐고
+원장에게 물으면 답은 언제나 "그렇다" 이기 때문이다. 그래서 evaluation 단계는 surface artifact
+를 `load_surface` + `check_surface` 로 다시 읽는다 — `minegs eval geometry` 가 적용하는 바로 그
+gate 다. 마찬가지로 manifest 의 digest 는 어떤 depth map 이 선언되었는지만 말하고 그 안에 무엇이
+있는지는 말하지 않으므로, SURFACE 는 map 자체를 `depth_digest` 로 덮는다.
 
 fingerprint 가 다르면 **fail closed** 다. 예전 SUCCESS 를 재사용하지 않고, 무엇이 움직였는지
 말한 뒤 명시적 rebuild 를 요구한다. E57 교체 · build config 변경 · dataset hash 변경 · run 교체 ·

@@ -579,13 +579,27 @@ def depth_spec() -> StageSpec:
 
 
 def _surface_inputs(ctx: StageContext) -> dict[str, Any]:
+    """The depth this surface is fused from — the maps themselves, not just their manifest.
+
+    Hashing ``depth_manifest.json`` says which maps were declared; it says nothing about what
+    is in them. A ``.npy`` edited in place left the manifest byte-identical, so the surface
+    stayed fresh, and the geometry and volume built on it stayed fresh with it. ``depth_digest``
+    is the same order-independent digest ``build_depth_surface`` records in the artifact, so
+    what the fingerprint covers is exactly what the surface consumed.
+    """
+    from minegs.eval.surface.depth import depth_digest
+    from minegs.ingest.common.colmap_io import read_model
+
     up = ctx.upstream(Stage.DEPTH)
     depth_dir = Path(up["depth_dir"])
+    dataset_dir = Path(ctx.upstream(Stage.DATASET)["dataset_dir"])
+    model = read_model(dataset_dir / "sparse" / "0")
     return {
         "depth_manifest_id": up["depth_manifest_id"],
         "depth_manifest_sha256": _digest_if_there(depth_dir / DEPTH_MANIFEST_FILE),
+        "depth_maps_sha256": depth_digest(depth_dir, model.images),
         "run_id": ctx.upstream(Stage.TRAIN)["run_id"],
-        **dataset_identity(ctx.upstream(Stage.DATASET)["dataset_dir"]),
+        **dataset_identity(dataset_dir),
         "stride": ctx.config.stride,
         "max_depth_m": ctx.config.max_depth_m,
     }
@@ -646,16 +660,39 @@ def surface_spec() -> StageSpec:
 
 
 def _evaluation_inputs(ctx: StageContext) -> dict[str, Any]:
-    """What both evaluation stages hang off: which surface, which dataset, which reference."""
-    surface = ctx.upstream(Stage.SURFACE)
+    """What both evaluation stages hang off: which surface, which dataset, which reference.
+
+    The surface is read back off disk and verified, not copied out of the ledger. Copying is
+    what a fingerprint exists to avoid: the recorded ``point_sha256`` is a statement the
+    SURFACE stage made about a file, and asking the ledger whether that file is still itself
+    can only ever get the answer yes. Replacing the published PLY therefore left every
+    evaluation fresh, and the geometry and volume numbers already in the report went on
+    describing a surface that was no longer there.
+
+    ``check_surface`` is the same gate ``minegs eval geometry`` applies, so a file that no
+    longer matches its record raises here and the stages that rest on it come out stale. The
+    depth those points were fused from reaches this through the chained upstream fingerprint,
+    which now covers the maps themselves.
+    """
+    from minegs.eval.surface.models import check_surface, load_surface
+
+    surface_dir = Path(ctx.upstream(Stage.SURFACE)["surface_dir"])
+    dataset_dir = Path(ctx.upstream(Stage.DATASET)["dataset_dir"])
     (tls,) = ctx.config.require("tls_reference_ply")
     ref = Path(tls)
     if not ref.is_file():
         raise ContractError(f"{ref}: no TLS reference cloud there")
+    ident = dataset_identity(dataset_dir)
+    record, points = load_surface(surface_dir)
+    check_surface(record, points, ident["dataset_id"], ident["dataset_hash"])
     return {
-        "surface_id": surface["surface_id"],
-        "point_sha256": surface["point_sha256"],
-        **dataset_identity(ctx.upstream(Stage.DATASET)["dataset_dir"]),
+        "surface_id": record.surface_id,
+        "point_sha256": record.point_sha256,
+        # Recorded here so an edited verdict moves the fingerprint too. Whether it still holds
+        # is re-derived rather than read, by the claim gate these stages run (§1C).
+        "depth_source": record.depth_source,
+        "surface_run_id": record.run_id,
+        **ident,
         "tls_reference_sha256": sha256_file(ref),
     }
 

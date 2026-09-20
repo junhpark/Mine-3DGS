@@ -220,7 +220,9 @@ minegs e2e status --work-dir work/wf
 다시 실행되지 않는다.
 
 `stale` 이 있으면 **그 stage 의 입력이 움직였다는 뜻**이다. E57 이 교체되었거나, build config 가
-바뀌었거나, dataset 이 다시 빌드되었거나, run 이 다시 학습되었거나, surface 가 다시 만들어졌다.
+바뀌었거나, dataset 이 다시 빌드되었거나, run 이 다시 학습되었거나, depth map 이나 surface 점군이
+바뀌었다. 판정은 원장에 적힌 값을 다시 읽는 것이 아니라 **디스크의 실물을 다시 읽어** 내린다 —
+depth 는 map 바이트까지, surface 는 published PLY 를 record 와 대조해서.
 minegs 는 조용히 재사용하지도, 조용히 다시 돌리지도 않는다. 무엇이 바뀌었는지 말하고 멈춘다.
 
 명시적으로 다시 만든다:
@@ -269,6 +271,7 @@ minegs e2e status --work-dir work/wf --json state.json
 | `... exists; pass --overwrite to replace it` / `already holds extraction output` | staging/dataset 디렉터리가 이미 있는데 이번 실행이 교체 의사를 밝히지 않았다 | `--rebuild-from ingest` 또는 `--rebuild-from dataset` 으로 다시 실행한다. 평상시 실행은 절대 덮어쓰지 않는다 |
 | `cannot report on this workflow` | 완료된 stage 의 입력이 움직였다 | §7 `--rebuild-from`, 또는 run 이 이미 쓴 report 를 그대로 읽는다 |
 | `not the numbers this workflow produced` | report 가 인용하는 artifact 가 stage 기록과 다르다 | 파일을 고치지 말고 해당 stage 를 다시 돌린다 |
+| `surface ... hashes to ..., but the record says ...` | published surface PLY 가 record 와 다르다 | surface 를 다시 만든다 (`--rebuild-from surface`) |
 
 실패한 stage 는 고친 뒤 그냥 다시 `run` 하면 된다 (실패한 stage 는 재사용 대상이 아니다).
 

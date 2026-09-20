@@ -668,3 +668,101 @@ def test_real_gpu_execution_is_decided_by_the_run_s_own_evidence():
     assert _real_gpu_execution(blank, substituted=False) is False
     # And a substituted one is False whatever the host happens to have.
     assert _real_gpu_execution(real, substituted=True) is False
+
+
+# ---------------------------------------------------------------- review round: currentness
+
+
+def test_b3_a_replaced_surface_makes_the_evaluations_stale(gate, tmp_path):
+    """The evaluations hang off the surface *file*, not off the ledger's memory of it.
+
+    Copying `point_sha256` out of the SURFACE record asked the ledger whether its own statement
+    was still true, which it always is. So replacing the published PLY left geometry, sections
+    and volume all fresh, and `minegs e2e report` went on publishing numbers about a surface
+    that was no longer on disk.
+    """
+    from minegs.core.pointcloud import PointCloud
+
+    (ply,) = Path(outputs(gate, Stage.SURFACE)["surface_dir"]).glob("*.ply")
+    original = ply.read_bytes()
+    out = tmp_path / "moved"
+    try:
+        cloud = read_ply(ply)
+        write_ply(
+            PointCloud(cloud.xyz + np.array([0.0, 0.0, 0.5]), rgb=cloud.rgb, frame=cloud.frame),
+            ply,
+            xyz_dtype="f8",
+        )
+        stale = Workflow(gate.root / "wf").stale_stages(default_specs())
+        assert stale == [Stage.GEOMETRY, Stage.SECTIONS_VOLUME, Stage.REPORT]
+
+        result = cli("e2e", "report", "--work-dir", str(gate.root / "wf"), "--out", str(out))
+        assert result.exit_code == 2
+        assert not (out / "phase2_report.json").exists()
+    finally:
+        ply.write_bytes(original)
+    assert Workflow(gate.root / "wf").stale_stages(default_specs()) == []
+
+
+def test_b3_a_changed_depth_map_makes_the_surface_stale(gate, tmp_path):
+    """One `.npy` edited in place leaves `depth_manifest.json` byte-identical.
+
+    Hashing the manifest says which maps were declared; it says nothing about what is in them.
+    """
+    depth_dir = Path(outputs(gate, Stage.DEPTH)["depth_dir"])
+    npy = sorted(depth_dir.glob("*.npy"))[0]
+    manifest = depth_dir / "depth_manifest.json"
+    manifest_digest = sha256_file(manifest)
+    original = npy.read_bytes()
+    out = tmp_path / "doubled"
+    try:
+        np.save(npy, np.load(npy) * 2.0)
+        assert sha256_file(manifest) == manifest_digest  # untouched, which was the whole hole
+
+        stale = Workflow(gate.root / "wf").stale_stages(default_specs())
+        assert stale == [Stage.SURFACE, Stage.GEOMETRY, Stage.SECTIONS_VOLUME, Stage.REPORT]
+
+        result = cli("e2e", "report", "--work-dir", str(gate.root / "wf"), "--out", str(out))
+        assert result.exit_code == 2
+        assert not (out / "phase2_report.json").exists()
+    finally:
+        npy.write_bytes(original)
+    assert Workflow(gate.root / "wf").stale_stages(default_specs()) == []
+
+
+def test_b3_a_surface_edited_to_agree_with_itself_is_still_a_different_surface(gate, tmp_path):
+    """Rewriting the record to match the new points passes `check_surface` — and still moves.
+
+    The digest the evaluations hang off is the one in the record, so a consistent forgery
+    changes it. Consistency is not identity.
+    """
+    from minegs.core.pointcloud import PointCloud
+    from minegs.eval.surface.models import load_surface
+
+    surface_dir = Path(outputs(gate, Stage.SURFACE)["surface_dir"])
+    (ply,) = surface_dir.glob("*.ply")
+    surface_json = surface_dir / "surface.json"
+    keep_ply, keep_json = ply.read_bytes(), surface_json.read_text()
+    try:
+        cloud = read_ply(ply)
+        write_ply(
+            PointCloud(cloud.xyz + np.array([0.0, 0.0, 0.5]), rgb=cloud.rgb, frame=cloud.frame),
+            ply,
+            xyz_dtype="f8",
+        )
+        forged = json.loads(keep_json)
+        forged["point_sha256"] = sha256_file(ply)
+        surface_json.write_text(json.dumps(forged, indent=2))
+        # It now verifies: the record and the file agree with each other.
+        record, points = load_surface(surface_dir)
+        assert record.point_sha256 == sha256_file(points)
+
+        assert Workflow(gate.root / "wf").stale_stages(default_specs()) == [
+            Stage.GEOMETRY,
+            Stage.SECTIONS_VOLUME,
+            Stage.REPORT,
+        ]
+    finally:
+        ply.write_bytes(keep_ply)
+        surface_json.write_text(keep_json)
+    assert Workflow(gate.root / "wf").stale_stages(default_specs()) == []
