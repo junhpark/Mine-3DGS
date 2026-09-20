@@ -164,8 +164,15 @@ def _training(state: WorkflowState, train: dict[str, Any]) -> TrainingSummary:
     env = dict(rec.runtime_env or {})
     notes: list[str] = []
     if env.get("reason"):
+        # The stage's own words for why gpu_model and cuda_version are null.
         notes.append(env["reason"])
-    if train and not train.get("real_gpu_execution"):
+    # Said once. The stage already says it when it is the stage that knows; this is the
+    # fallback for a ledger that recorded the substitution without a reason beside it.
+    if (
+        train
+        and not train.get("real_gpu_execution")
+        and "substitut" not in (env.get("reason") or "")
+    ):
         notes.append(
             "the training backend was substituted; these weights were not produced by a real "
             "gsplat run on a real GPU"
