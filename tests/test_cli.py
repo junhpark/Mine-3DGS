@@ -59,22 +59,29 @@ def test_cli_phase0a_gate(tmp_path):
         ],
     )
     assert r.exit_code == 0, r.output
-    r = runner.invoke(
-        app,
-        [
-            "eval",
-            "volume",
-            str(sec),
-            str(ds),
-            "--design-radius-m",
-            "2.4",
-            "--out",
-            str(tmp_path / "vol.json"),
-        ],
-    )
+    volume_argv = [
+        "eval",
+        "volume",
+        str(sec),
+        str(ds),
+        "--design-radius-m",
+        "2.4",
+        "--out",
+        str(tmp_path / "vol.json"),
+    ]
+    # Since Phase 1C a volume_accuracy claim needs sections cut from a verified surface. These
+    # were cut from raw/tls_full.ply, which is the TLS reference itself: the dataset protocol
+    # allows the claim, the *input* is what cannot carry it (§1C).
+    r = runner.invoke(app, volume_argv)
+    assert r.exit_code == 2, r.output
+    assert "raw point cloud" in r.output and "--diagnostic" in r.output
+    r = runner.invoke(app, [*volume_argv, "--diagnostic"])
     assert r.exit_code == 0, r.output
     vol = json.loads((tmp_path / "vol.json").read_text())["volume"]
-    assert vol["claim"] == "volume_accuracy" and vol["valid_section_count"] > 20
+    assert vol["claim"] == "geometry_diagnostic" and vol["valid_section_count"] > 20
+    # ...and the diagnostic number still says exactly which spans it integrated.
+    assert vol["coverage"]["coverage_fraction"] == pytest.approx(1.0)
+    assert vol["segments"] and not vol["coverage"]["missing_intervals_m"]
     # A bare PLY is a diagnostic input since Phase 1A: claim-bearing geometry needs a surface
     # artifact (§1.7), and init_points.ply is TLS initialisation, not reconstructed surface.
     r = runner.invoke(

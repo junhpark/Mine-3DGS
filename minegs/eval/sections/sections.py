@@ -10,7 +10,7 @@ than ``max_missing_bins`` are empty — missing sections are *reported*, not int
 from __future__ import annotations
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from minegs.core.centerline import Centerline
 
@@ -47,6 +47,23 @@ class SectionSeries(BaseModel):
 
     def valid_count(self) -> int:
         return sum(s.valid for s in self.sections)
+
+    @model_validator(mode="after")
+    def _radii_match_the_bins(self) -> SectionSeries:
+        """One wall radius per angle bin, per section.
+
+        ``radii_m`` is a bare ``list[float | None]``, so a series read back with a short one is
+        structurally valid and then meets ``np.array(...)`` inside the claim path, where a ragged
+        nested list raises a numpy ``ValueError`` — exit 1 and a traceback where a contract
+        refusal belongs. Checked here so every reader of a series gets the same answer.
+        """
+        bad = [s.chainage_m for s in self.sections if len(s.radii_m) != self.angle_bins]
+        if bad:
+            raise ValueError(
+                f"sections at {bad[:6]} m carry a radii_m list that is not {self.angle_bins} "
+                "long; a section has one wall radius per angle bin"
+            )
+        return self
 
 
 def polygon_area(radii: np.ndarray, angles: np.ndarray) -> float:

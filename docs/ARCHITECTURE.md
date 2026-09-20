@@ -70,7 +70,7 @@ minegs/
       raw/           E57, mp4, 설계 중심선
       dataset/       ← 계약 (§3)
       runs/<run_id>/     ckpt, point_cloud/*.ply (LOCAL_METRIC), log, run.json
-      eval/<eval_id>/    mesh, geometry.json, sections.json, volume.json, eval.json
+      eval/<eval_id>/    mesh, geometry.json, sections.json (SectionRecord), volume.json, eval.json
       export/<id>/       .spz (.splat 은 legacy, 선택)
 ```
 
@@ -319,12 +319,26 @@ artifact 는 자기 ID 가 무엇을 가리키는지도 말할 수 없다. hash 
 
 * **형상**: 양방향 — TLS→GS(accuracy) 와 GS→TLS(completeness) 를 따로. 대칭 Chamfer,
   median, P90/P95, RMSE. 한 방향만 보면 큰 hole 을 놓친다.
-* **단면**: 중심선 따라 일정 간격 단면 → A(s).
+* **단면**: 중심선 따라 일정 간격 단면 → A(s). 단면은 **artifact** 로 남긴다
+  (`SectionRecord`): 어느 dataset 의, 어느 verified surface 에서, 어느 run 에서, 어떤
+  depth provenance 로, 어느 reference axis 를 따라, 어떤 parameters 로 잘랐는가.
+  기록한 것은 평가 직전에 전부 지금의 dataset·축·surface 에 대해 다시 대조한다.
 * **체적**: 기본 ∫A(s)ds (여굴·미굴 산정 관행), 보조 닫힌 메시 체적.
   `volume.json` 필수 항목: `start_chainage, end_chainage, section_interval,
-  valid_section_count, missing_section_count, reference_axis`.
+  valid_section_count, missing_section_count, reference_axis`, 그리고 coverage —
+  `requested/integrated/missing_intervals_m`, `covered/requested_length_m`,
+  `coverage_fraction`, `segments[]`.
+* **결측은 적분하지 않는다**: 적분은 연속된 관측 station 의 run 안에서만 일어난다.
+  결측 구간은 interval 로 보고하고 보간하지 않으므로, coverage 가 불완전한 체적은 항상
+  과소 추정이다. 서로 다른 holdout 구간 사이도 잇지 않는다. `integrate_sections` ·
+  `compare_to_design` · `diff_sections` 가 같은 helper 를 쓴다.
+* **`volume_accuracy` 는 surface provenance 를 요구한다** (§5, §1.7): protocol 허용 +
+  section artifact + 지금의 dataset/축/surface 와 일치 + `depth_source = minegs_render` +
+  선언된 holdout 으로 제한된 적분 + 그 구간의 완전한 coverage. 임의 점군·외부 depth·
+  bare series·불완전 coverage 는 diagnostic 으로만 계산한다.
 * **설계 대비**: 설계 프로파일이 있으면 Design vs TLS vs 3DGS 를 동일 단면에서 비교해
-  overbreak / underbreak / reconstruction error 를 분리한다.
+  overbreak / underbreak / reconstruction error 를 분리한다. 여굴·미굴 체적도 같은
+  integration segment 를 쓴다.
 * **change**: 두 epoch 의 동일 chainage 구간 차분 → 차분 체적 가설 검증.
   단일 manifest 로는 주장할 수 없다 (§5, pair protocol = Phase 7).
 

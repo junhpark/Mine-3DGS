@@ -575,10 +575,132 @@ TSDF(`eval/surface/tsdf.py`) 와 mesh 재구성은 여전히 미구현이고, Op
 Phase 1A/1B 는 **artifact 경계와 증거 경로**를 닫았을 뿐이다. 3DGS 형상이 정확하다거나 surface 가
 과학적으로 검증되었다는 주장은 하지 않는다.
 
-**이 Phase 에서 갚을 기술 부채**: 현재 `integrate_sections` 는 invalid section 을 제거한 뒤
-양쪽 valid section 사이를 그대로 사다리꼴 적분한다. 큰 결측 구간을 가로질러 적분하면 체적이
-과대·과소 평가된다. 수정 방향 — 연속된 valid segment 별로만 적분, coverage fraction 기록,
-missing interval 명시, coverage 가 부족하면 volume accuracy claim 자체를 거부.
+#### Phase 1C — section/volume evidence boundary & gap-safe integration (구현, 실데이터 미검증)
+
+Phase 1 section/volume evidence boundary: **implemented and structurally tested. Real-data
+scientific validation remains NOT VALIDATED.**
+
+Phase 1A·1B 는 `run → rendered depth → surface` 까지만 닫았다. `eval volume` 은 dataset
+manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 manifest 는 *데이터셋* 이
+그 주장을 지탱할 수 있다고 말할 뿐 누가 넣은 어떤 구름인지는 말하지 않는다. 그래서
+`raw/tls_full.ply` 로 자른 단면이 복원으로 자른 단면과 같은 주장에 도달했다. 1C 는 체인을
+`→ sections → volume` 까지 연장하고, 위에 적어 둔 적분 부채를 함께 갚는다.
+
+* **`SectionRecord`** (`eval/sections/models.py`, schema 1.0): `section_id · dataset_id ·
+  dataset_hash · source{kind, surface_id, run_id, depth_source, point_sha256, point_path} ·
+  reference_axis · reference_axis_sha256 · frame · unit · series · parameters · provenance`.
+  `SectionSeries` 는 그대로 기하 컨테이너로 남고, record 가 그 위에 provenance 를 얹는다.
+* **기록한 것은 전부 대조한다** (`check_section_record`, `--diagnostic` 여부와 무관):
+  dataset id/hash, 축 문자열, 축 CSV 의 digest, 그리고 **지금의 centerline 과 기록된 parameters
+  로 다시 만든 station 격자**. 마지막 것이 점군 없이 할 수 있는 가장 강한 검사다 — 다른 축,
+  다른 interval, 다른 sub-range 로 자른 시계열은 재유도를 통과하지 못한다. source surface 가
+  아직 디스크에 있으면 `check_surface` 로 다시 검증하고 `surface_id`·**`run_id`**·
+  `point_sha256`·`depth_source` 를 대조한다 — `run_id` 는 chain 의 맨 끝이고, 기록만 되고
+  대조되지 않던 동안에는 sections.json 한 줄을 고쳐 A run 에서 측정한 체적을 B run 의 결과로
+  발행할 수 있었다. `SectionSource` 는 `kind` 가 요구하는 필드가 모두 채워져 있는지도 강제한다
+  (null 로 비우면 그 필드에 대한 검사가 조용히 no-op 이 되기 때문) (Phase 1B 가 checkpoint 에 대해 한 것과 같은 거래: 남아 있으면
+  믿지 않고 확인하고, 사라졌으면 기록된 id 만 남는다).
+* **축 digest 가 따로 필요한 이유**: `DATASET_HASH_PATTERNS` 는 dataset 루트의
+  `centerline.csv` 만 덮는다. manifest 가 다른 경로를 가리키면 dataset hash 는 축 편집을 보지
+  못하고, chainage 는 다른 polyline 위에서 다른 뜻이 된다.
+* **`volume_accuracy` 는 일곱 가지가 동시에 성립할 때만**: protocol 허용 · bare series 가 아닌
+  section artifact · record 가 지금의 dataset/축/surface 와 일치 · `source.kind == "surface"` 이고
+  `depth_source == "minegs_render"` · **series 를 그 surface 에서 다시 잘라 재현 가능** ·
+  슬랩이 station 간격보다 넓지 않음 · 적분이 선언된 holdout 으로 제한됨 · 그 구간의 coverage 가
+  완전함. 하나라도 빠지면 거부하고, `--diagnostic` 이면 `geometry_diagnostic` 으로 계산한다
+  (이 경우에도 holdout 은 유지한다 — 전 구간은 `--no-holdout-only` 의 몫이다).
+* **surface 의 `depth_source` 도 claim 경로에서 다시 유도한다** (`rederive_depth_source`,
+  `eval geometry` 와 `eval sections`/`eval volume` 모두):
+  그 값은 fusion 시점에 한 번 정해져 record 에 쓰이고 `check_surface` 는 점군 digest 만 다시
+  본다. 그래서 `surface.json` 의 문자열 한 줄을 고치면 `external_unverified` surface 가
+  승격되고 section record 가 그대로 물고 내려왔다 (적대적 탐침이 재현). claim 경로는 surface 가
+  기록한 depth/run 디렉터리에 대해 Phase 1B promotion 을 다시 돌리고 manifest id 까지 대조한다.
+  이를 위해 `build_depth_surface` 가 `parameters` 에 두 경로를 절대경로로 남긴다. 디렉터리가
+  없으면 재유도가 불가능하므로 claim 은 거부다 (`--diagnostic` 은 동작하며, 그때는 **다시 유도된
+  값** 을 쓴다 — 선언된 값이 아니라).
+  같은 이유로 `eval geometry` 의 claim 경로에도 적용했다. Phase 1A 범위지만 결함이 같고,
+  `raw/tls_full.ply` 를 surface 로 위장해 `geometry_accuracy` 0.0 mm 를 얻는 것이 감사에서
+  재현되었다. Phase 1C 의 volume 경로만 닫고 geometry 경로를 열어 두는 것은 방어할 수 없다.
+* **면적은 claim 경로에서 다시 계산한다** (`reproducibility_refusal`): identity 검사는 record 를
+  옳은 dataset·축·surface 에 묶지만 면적이 그 surface 에서 나왔다는 것은 말하지 않는다 —
+  series 가 record 안에 있으므로 `area_m2` 편집이나 invalid station 뒤집기는 identity 검사를
+  전부 통과한다. 그래서 surface 점군을 `check_surface` 로 읽어 TLS_GLOBAL 로 옮기고 기록된
+  parameters 로 다시 잘라 station 별 valid·면적·반경을 대조한다 (상대오차 1e-9, 부동소수
+  표현용). diagnostic 경로에서는 하지 않는다: 전체 재추출 비용이 들고, 생산자의 선언이라는
+  것이 diagnostic 의 뜻이다. surface 가 사라졌으면 claim 은 강등이 아니라 거부다.
+* **raw PLY 워크플로는 깨지 않는다**: `eval sections` 는 여전히 PLY 를 받고, `kind="raw_cloud"`
+  로 기록하고 경고한다. 금지하는 것은 임의 PLY 가 아니라 임의 PLY 가 scientific claim 으로
+  승격되는 경로다. 1C 이전의 bare `SectionSeries` JSON 도 계속 읽히며 diagnostic 전용이다.
+* **`--no-holdout-only`**: `eval geometry` 와 같은 강등. `volume_accuracy` 는 정의상 holdout 에
+  대한 주장이고 전 구간 적분은 run 이 학습에 쓴 형상을 다시 재는 것이므로, 경고와 함께
+  `geometry_diagnostic` 으로 보고한다.
+* **station 이 빠진 것도 gap 이다**: NaN 규칙이 보는 것은 "있는데 invalid" 뿐이므로, 행이
+  지워지면 이웃이 붙어 사다리꼴이 구멍을 가로지른다. 시계열이 선언한 station 간격보다 넓은
+  step 은 gap 으로 처리하고, `diff_sections` 의 "한쪽 epoch 에만 있는 station" 도 같다.
+* **슬랩이 station 간격보다 넓으면 claim 불가**: 이웃 슬랩이 겹쳐 자기 형상이 없는 station 이
+  이웃의 점으로 채워진다. 품질 임계값이 아니라 `A(s_i)` 가 `s_i` 에서의 측정이기 위한 조건이다.
+* **격자가 부풀릴 수 없는 수치**: claim 경로는 surface 를 다시 읽으므로 점군에서
+  `max_point_gap_m` (주장 구간 안에서 복원된 점이 없는 가장 긴 구간) 을 계산해 싣는다.
+  `coverage_fraction` 은 station 이 구간을 덮는지를, 이것은 그 아래에 무엇이라도 있는지를 말한다.
+* **각도 방향 보간도 보고**: `extract_sections` 는 빈 angle bin 을 `angle_bins//10` 까지 이웃에서
+  보간하고 section 을 valid 로 둔다. 알고리즘 재설계는 범위 밖이므로 적분된 station 들의
+  `interpolated_bin_fraction` 을 coverage 블록에 싣는다. 이 값은 `empty_bins` 에서 계산되므로
+  claim 경로에서 `empty_bins`·`n_points` 도 재절단 결과와 대조한다 — 그러지 않으면 "벽의 몇
+  %가 지어낸 값인가" 를 생산자가 선언하게 된다. `parameters.point_count` 도 같은 이유로
+  surface 의 실제 점 개수와 대조한다.
+* **`radii_m` 길이는 `angle_bins` 와 같아야 한다** (`SectionSeries` validator): 짧은 리스트는
+  구조적으로 유효한 채 claim 경로의 `np.array` 에 도달해 numpy `ValueError` 로 exit 1 +
+  traceback 을 냈다. contract 거부가 있어야 할 자리다.
+* **holdout 에 연속 관측 station 이 2개 미만이면 `--diagnostic` 도 거부한다**: 그 구간에 대한
+  partial volume 자체가 없기 때문이다. 거부 메시지가 `--no-holdout-only` 를 안내한다 — 이전에는
+  없는 partial volume 을 약속하고 "nothing to integrate" 로 떨어졌다.
+* **gap-safe 적분** (`eval/volume/coverage.py`): 연속된 관측 station 의 run 안에서만 적분한다.
+  `10, 10, -, 10, 10` 은 20 m³ 이지 40 m³ 가 아니다. gap 의 체적은 추정하지도 보간하지도
+  않으므로 coverage 가 불완전한 수치는 항상 **과소** 추정이고, 그것이 안전한 방향이다.
+  서로 다른 holdout 구간 사이도 같은 이유로 잇지 않는다 (겹치거나 맞닿으면 union 후 각각 독립).
+  관측 station 이 하나뿐인 run 은 길이 0 이라 적분에 기여하지 않으며, 그 station 은 관측됨으로
+  세고 주변은 missing 으로 센다.
+* **coverage 는 요청 구간 기준**: 시계열이 holdout 중간에서 끝나면 coverage 는 절반이지 "짧은
+  갱도의 완전 coverage" 가 아니다. `VolumeReport.coverage` 에 `requested/integrated/missing
+  _intervals_m · requested/covered_length_m · coverage_fraction · valid/missing_section_count ·
+  missing_chainages_m` 이 실리고, `segments[]` 의 합이 `volume_m3` 와 정확히 같다.
+  `DesignComparison` 도 같은 coverage 블록과 segment 별 over/underbreak 를 싣는다.
+* **`integrate_sections` · `compare_to_design` · `diff_sections` 가 같은 helper 를 쓴다.**
+  `diff_sections` 는 directive 가 명시한 두 함수 밖이지만, 같은 사다리꼴 버그를 그대로 두면 이
+  PR 의 정의 자체가 저장소 안에서 거짓이 된다. 셋이 "어느 구간이 관측되었는가" 에 대해
+  갈라지지 않는 것이 요점이다.
+* **임의 임계값을 만들지 않는다**: 80 %/90 % 같은 coverage threshold 는 도입하지 않는다. claim
+  은 "요청한 holdout 을 전부 적분할 수 있어야 한다" 로 두고, 실측 검증으로 허용 가능한 최소
+  coverage 가 정해지면 그때 별도 결정으로 완화한다. 1e-9 m 의 epsilon 은 부동소수 표현 오차용
+  이지 coverage 허용치가 아니다.
+* **남아 있는 결정 — 최소 section 해상도**: coverage 는 station 격자에 대한 진술이고 격자는
+  사용자가 고른다. `--interval-m 6 --start-m 20 --end-m 26` 처럼 holdout 양 끝에 맞춘 거친
+  격자는, 1 m 격자라면 거부될 4 m 짜리 무관측 구간을 지나쳐 `volume_accuracy` 에 도달한다
+  (`tests/test_section_volume.py::test_a_coarse_station_grid_reports_how_little_of_the_span_it_sampled`
+  가 이 동작을 고정한다). 게이트로 막으려면 최대 section interval 이라는 숫자가 필요한데,
+  그것이 바로 이 directive 가 금지한 종류의 임의 임계값이다. 그래서 막는 대신 드러낸다:
+  `coverage.sampled_length_m` / `sampled_fraction` (적분 구간 중 슬랩이 실제로 들여다본 길이)
+  과 `section_parameters` 가 report 에 실리고, CLI 가 claim 줄 바로 아래에 출력한다. 위 예시는
+  `sampled 0.50 m of that (8.3%)` 로 보고된다. **최소 coverage 와 함께 실측 검증 뒤에 정할
+  미결 결정으로 남긴다** (Phase 1 G2).
+* **fail closed**: dataset id/hash 불일치 · 축 문자열/digest 불일치 · station 격자 불일치 ·
+  parameters 와 series 불일치 · surface 가 record 와 달라짐 · claim 경로에서 surface 부재 ·
+  재현되지 않는 면적/반경/valid 플래그 · surface 와 다른 `source.run_id` ·
+  `kind` 가 요구하는 `source` 필드 누락 · 재유도되지 않는 surface `depth_source` ·
+  claim 경로에서 depth/run 디렉터리 부재 · 슬랩이 station 간격보다 넓음 · 서로 다른 축의 두
+  시계열 차분 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
+  `external_unverified` 로 claim 요청 · holdout 미선언 · holdout coverage 불완전 ·
+  중복 chainage · 연속 관측 station 2개 미만 · 축 범위 밖 station 요청 · 면적은 있는데 반경이
+  없는 section · 잘못된 형태의 적분 구간.
+* **알려진 한계**: claim 경로는 면적을 다시 계산하지만 diagnostic 경로는 하지 않고, surface 가
+  사라진 record 도 하지 못한다 (그 경우 claim 자체가 거부된다). 재현 대조도 서명은 아니다:
+  surface 점군 자체를 바꾸고 record 를 그에 맞춰 다시 만들면 전부 일관된다 —
+  `DepthManifest` 와 같은 경계이고, 사고를 막는 경계이지 서명이 아니다. `eval change` 는
+  dataset 을 받지 않으므로 아무것도 대조하지 않고, 그래서 결과가 영구히
+  `geometry_diagnostic` 이다.
+
+구조적 검증만이다 (`tests/test_section_volume.py`). 실제 갱도에서 단면·체적이 정확하다는 주장은
+하지 않는다.
 
 **Gate**: G1 (합성 known geometry) + G2 (실제 holdout 형상 평가, 양방향 지표,
 section/volume 리포트 일관성).
@@ -759,6 +881,27 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | holdout 구간에 점이 없는 reference/prediction | `ContractError` (exit 2) | 빈 cloud 에 대한 accuracy/completeness 는 수치가 아니라 입력 누락이다 | 해당 없음 (설계) |
 | run 의 최종 checkpoint 가 아닌 manifest | `ContractError` (exit 2) | 다른 모델을 기술하면서 나머지 검사를 통과한다 | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 원시 PLY | `ContractError` (exit 2) | 가우시안 중심은 표면이 아니다 (§1A) | 해당 없음 (설계) |
+| claim 을 담는 `eval volume` 에 bare `SectionSeries` JSON | `ContractError` (exit 2) | provenance 가 없어 대조할 것이 하나도 없다 | 해당 없음 (설계) |
+| claim 을 담는 `eval volume` 에 `raw_cloud` section artifact | `ContractError` (exit 2) | 임의 점군은 어떤 복원에 대한 증거도 아니다 | 해당 없음 (설계) |
+| claim 을 담는 `eval volume` 에 `external_unverified` 기반 section | `ContractError` (exit 2) | surface 의 depth 가 run 과 묶여 있지 않다 | 해당 없음 (설계) |
+| holdout coverage 가 불완전한 `volume_accuracy` | `ContractError` (exit 2) | 적분하지 못한 구간의 체적은 측정된 것이 아니다 | 실측 검증으로 최소 coverage 가 정해지면 |
+| dataset/축이 다른 section artifact | `ContractError` (exit 2) | chainage 는 다른 polyline 위에서 다른 뜻이다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
+| surface 에서 다시 잘랐을 때 재현되지 않는 면적/반경 | `ContractError` (exit 2) | 그 면적은 그 surface 에서 측정된 것이 아니다 | 해당 없음 (설계) |
+| surface 와 다른 `source.run_id` 를 기록한 section artifact | `ContractError` (exit 2) | 다른 run 은 약한 증거가 아니라 다른 artifact 의 identity 다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
+| 재절단과 다른 `empty_bins`/`n_points`/`point_count` | `ContractError` (exit 2) | 보고되는 수치는 선언이 아니라 재유도의 결과여야 한다 | 해당 없음 (설계) |
+| `angle_bins` 와 길이가 다른 `radii_m` | `ContractError` (exit 2) | numpy ValueError 가 아니라 계약 위반이다 | 해당 없음 (설계) |
+| holdout 에 연속 관측 station 2개 미만 | `ContractError` (exit 2, `--diagnostic` 포함) | 그 구간에 대한 partial volume 이 존재하지 않는다 | 해당 없음 (설계) |
+| `kind` 가 요구하는 필드를 null 로 비운 `SectionSource` | `ContractError` (exit 2) | 없는 필드에 대한 검사는 조용히 일어나지 않는다 | 해당 없음 (설계) |
+| `--thickness-m` > `--interval-m` 로 자른 section 의 claim | `ContractError` (exit 2) | 겹친 슬랩은 자기 형상이 없는 station 을 이웃의 점으로 채운다 | 해당 없음 (설계) |
+| `surface.json` 의 `depth_source` 만 고친 surface 의 claim | `ContractError` (exit 2) | 승격 판정은 읽는 것이 아니라 다시 유도하는 것이다 | 해당 없음 (설계) |
+| `depth_source` 재유도 불가 surface 로 `eval geometry` claim | `ContractError` (exit 2) | 같은 결함이므로 같은 게이트 (Phase 1A 경로) | 해당 없음 (설계) |
+| 서로 다른 reference axis 의 두 시계열 차분 | `ContractError` (exit 2) | 다른 polyline 위의 chainage 를 빼면 좌표계 차이가 나온다 | 해당 없음 (설계) |
+| 시계열에서 아예 빠진 station | gap 으로 처리 (적분 경계) | 이웃이 붙어 사다리꼴이 구멍을 가로지른다 | 해당 없음 (설계) |
+| claim 경로에서 source surface 부재 | `ContractError` (exit 2) | 검증할 수 없는 증거 위의 주장은 주장이 아니다 (`--diagnostic` 은 동작) | 해당 없음 (설계) |
+| station 격자가 지금의 축에서 재유도되지 않는 section artifact | `ContractError` (exit 2) | 그 시계열은 이 축을 따라 잘린 것이 아니다 | 해당 없음 (설계) |
+| record 를 만든 뒤 내용이 바뀐 source surface | `ContractError` (exit 2) | 디스크에 남아 있으면 믿지 않고 다시 검증한다 | 해당 없음 (설계) |
+| 결측 구간을 가로지르는 체적 적분 | segment 별 적분 + missing interval 보고 | 결측 형상은 결측으로 보고한다, 사다리꼴로 대체하지 않는다 | 해당 없음 (설계) |
+| `--no-holdout-only` 에 `volume_accuracy` | claim 을 `geometry_diagnostic` 으로 강등 + 경고 | 학습에 쓴 형상을 다시 재는 수치다 | 해당 없음 (설계) |
 | claim 을 담는 `eval geometry` 에 `external_unverified` surface | `ContractError` (exit 2) | 외부 depth 는 기록된 run 과 묶여 있지 않다 | Phase 1B (`minegs_render`) |
 | surface.json 과 내용이 다른 `point_file` | `ContractError` (exit 2) | record 는 surface 가 아니다 | 해당 없음 (설계) |
 | camera 해상도와 다른 depth map | `ContractError` (exit 2) | intrinsics 불일치는 조용히 기하를 틀리게 한다 | 해당 없음 (설계) |
