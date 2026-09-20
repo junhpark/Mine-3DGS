@@ -571,7 +571,7 @@ def volume(
             # inside the record, so an edited area, or an invalid station flipped to a plausible
             # number to close a gap, satisfies every one of them. A claim re-derives instead,
             # and comes back with the one coverage number the station grid cannot flatter.
-            evidence = check_claim_evidence(rec, m, cl, j.holdout_ranges_m)
+            evidence = check_claim_evidence(rec, m, cl, dataset_dir, j.holdout_ranges_m)
             if evidence.refusal is not None:
                 if not diagnostic:
                     raise ContractError(evidence.refusal)

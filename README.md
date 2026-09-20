@@ -421,6 +421,7 @@ parameters · provenance`.
 | `series` 의 chainage 격자 | 지금의 centerline 과 기록된 parameters 로 다시 만든 station 격자 |
 | `source.surface_id` · `point_sha256` · `depth_source` | surface artifact 가 아직 디스크에 있다면 그것 (`check_surface` 포함) |
 | (claim 경로만) `series` 의 면적·반경 자체 | 검증된 surface 에서 **다시 잘라** 재현되는가 |
+| (claim 경로만) surface 의 `depth_source` | surface 가 기록한 depth/run 디렉터리에서 **다시 유도**되는가 |
 | `series.frame` | record 의 `frame` (TLS_GLOBAL) |
 
 축 digest 가 따로 필요한 이유: `DATASET_HASH_PATTERNS` 는 dataset 루트의 `centerline.csv` 만
@@ -450,6 +451,13 @@ record 가 기록한 parameters 로 **다시 자르고** 결과를 대조한다 
 그리고 각도 bin 별 반경까지. 재현 슬랙은 1e-9 상대오차 (부동소수 표현용이지 기하 허용치가
 아니다).
 
+* **surface 의 `depth_source` 도 다시 유도한다.** Phase 1A/1B 는 그 값을 fusion 시점에 한 번
+  정하고 record 에 쓴다. `check_surface` 는 점군 digest 를 다시 확인하지만 이 필드는 확인한
+  적이 없어서, `surface.json` 의 문자열 한 줄을 `external_unverified` → `minegs_render` 로
+  고치면 승격되고 section record 가 그것을 그대로 물고 내려온다. 그래서 claim 경로에서는
+  surface 가 기록한 depth 디렉터리와 run 디렉터리에 대해 Phase 1B promotion
+  (`_depth_provenance` — manifest↔run, checkpoint, renderer, pin, view 집합, 파일별 digest)
+  을 **다시 돌리고** manifest id 까지 대조한다. 두 디렉터리가 없으면 claim 은 거부다.
 * diagnostic 경로에서는 하지 않는다. 전체 재추출 비용이 들고, diagnostic 수치가 생산자의
   선언이라는 것이 바로 "diagnostic" 의 뜻이다.
 * surface 가 사라졌으면 claim 은 **거부**한다 (강등이 아니다). 검증할 수 없는 증거 위의 주장은

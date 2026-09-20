@@ -606,6 +606,13 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   슬랩이 station 간격보다 넓지 않음 · 적분이 선언된 holdout 으로 제한됨 · 그 구간의 coverage 가
   완전함. 하나라도 빠지면 거부하고, `--diagnostic` 이면 `geometry_diagnostic` 으로 계산한다
   (이 경우에도 holdout 은 유지한다 — 전 구간은 `--no-holdout-only` 의 몫이다).
+* **surface 의 `depth_source` 도 claim 경로에서 다시 유도한다** (`rederive_depth_source`):
+  그 값은 fusion 시점에 한 번 정해져 record 에 쓰이고 `check_surface` 는 점군 digest 만 다시
+  본다. 그래서 `surface.json` 의 문자열 한 줄을 고치면 `external_unverified` surface 가
+  승격되고 section record 가 그대로 물고 내려왔다 (적대적 탐침이 재현). claim 경로는 surface 가
+  기록한 depth/run 디렉터리에 대해 Phase 1B promotion 을 다시 돌리고 manifest id 까지 대조한다.
+  이를 위해 `build_depth_surface` 가 `parameters` 에 두 경로를 절대경로로 남긴다. 디렉터리가
+  없으면 재유도가 불가능하므로 claim 은 거부다 (`--diagnostic` 은 동작).
 * **면적은 claim 경로에서 다시 계산한다** (`reproducibility_refusal`): identity 검사는 record 를
   옳은 dataset·축·surface 에 묶지만 면적이 그 surface 에서 나왔다는 것은 말하지 않는다 —
   series 가 record 안에 있으므로 `area_m2` 편집이나 invalid station 뒤집기는 identity 검사를
@@ -661,7 +668,8 @@ manifest 의 `judge()` 만 통과하면 `volume_accuracy` 를 부여했고, 그 
   미결 결정으로 남긴다** (Phase 1 G2).
 * **fail closed**: dataset id/hash 불일치 · 축 문자열/digest 불일치 · station 격자 불일치 ·
   parameters 와 series 불일치 · surface 가 record 와 달라짐 · claim 경로에서 surface 부재 ·
-  재현되지 않는 면적/반경/valid 플래그 · 슬랩이 station 간격보다 넓음 · 서로 다른 축의 두
+  재현되지 않는 면적/반경/valid 플래그 · 재유도되지 않는 surface `depth_source` ·
+  claim 경로에서 depth/run 디렉터리 부재 · 슬랩이 station 간격보다 넓음 · 서로 다른 축의 두
   시계열 차분 · bare series 로 claim 요청 · `raw_cloud` 로 claim 요청 ·
   `external_unverified` 로 claim 요청 · holdout 미선언 · holdout coverage 불완전 ·
   중복 chainage · 연속 관측 station 2개 미만 · 축 범위 밖 station 요청 · 면적은 있는데 반경이
@@ -862,6 +870,7 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | dataset/축이 다른 section artifact | `ContractError` (exit 2) | chainage 는 다른 polyline 위에서 다른 뜻이다 (`--diagnostic` 도 면제 아님) | 해당 없음 (설계) |
 | surface 에서 다시 잘랐을 때 재현되지 않는 면적/반경 | `ContractError` (exit 2) | 그 면적은 그 surface 에서 측정된 것이 아니다 | 해당 없음 (설계) |
 | `--thickness-m` > `--interval-m` 로 자른 section 의 claim | `ContractError` (exit 2) | 겹친 슬랩은 자기 형상이 없는 station 을 이웃의 점으로 채운다 | 해당 없음 (설계) |
+| `surface.json` 의 `depth_source` 만 고친 surface 의 claim | `ContractError` (exit 2) | 승격 판정은 읽는 것이 아니라 다시 유도하는 것이다 | 해당 없음 (설계) |
 | 서로 다른 reference axis 의 두 시계열 차분 | `ContractError` (exit 2) | 다른 polyline 위의 chainage 를 빼면 좌표계 차이가 나온다 | 해당 없음 (설계) |
 | 시계열에서 아예 빠진 station | gap 으로 처리 (적분 경계) | 이웃이 붙어 사다리꼴이 구멍을 가로지른다 | 해당 없음 (설계) |
 | claim 경로에서 source surface 부재 | `ContractError` (exit 2) | 검증할 수 없는 증거 위의 주장은 주장이 아니다 (`--diagnostic` 은 동작) | 해당 없음 (설계) |

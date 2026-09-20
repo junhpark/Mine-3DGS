@@ -339,7 +339,10 @@ def build_depth_surface(
 
     lo, hi = pc.xyz.min(axis=0), pc.xyz.max(axis=0)
     parameters = {
-        "depth_dir": str(depth_dir),
+        # Resolved, so a later claim path can find the evidence from any working directory.
+        # These two are what makes ``depth_source`` re-derivable rather than a stored verdict.
+        "depth_dir": str(depth_dir.resolve()),
+        "run_dir": str(run_dir.resolve()),
         "stride": int(stride),
         "max_depth_m": None if max_depth is None else float(max_depth),
         "expected_views": len(model.images),
@@ -372,3 +375,69 @@ def build_depth_surface(
         )
         rec.save(tmp / SURFACE_FILE)
     return rec, out_dir
+
+
+def rederive_depth_source(surface, dataset_dir: str | Path) -> str | None:
+    """Re-run the Phase 1B promotion for a published surface. ``None`` if it still holds.
+
+    ``depth_source`` is decided once, when the surface is fused, and then written into the
+    record. ``check_surface`` re-reads the points and checks their digest — it has never
+    re-checked *this* field, so editing one string in ``surface.json`` turned an
+    ``external_unverified`` surface into a claim-capable one, and the section record downstream
+    copied the lie forward. Two lines and no depth rendered by minegs.
+
+    So a claim re-derives it from the evidence the record names: the depth directory and the run
+    directory it was fused from, both recorded as absolute paths. What runs here is the same
+    ``_depth_provenance`` the fuser ran — the manifest against the run, the checkpoint, the
+    renderer, the pinned versions, the view set and every per-map digest — plus the manifest id,
+    so a different manifest dropped into the same directory is not the one this surface used.
+
+    A surface whose evidence has been moved or deleted cannot be re-derived, and that is a
+    refusal: the whole point is that the claim rests on evidence somebody can check.
+    """
+    from minegs.core.manifest import Manifest
+    from minegs.core.provenance import sha256_tree
+    from minegs.eval.surface.models import CLAIM_CAPABLE_DEPTH_SOURCES
+    from minegs.ingest.common.colmap_io import read_model
+    from minegs.train.runner.base import DATASET_HASH_PATTERNS
+
+    if surface.depth_source not in CLAIM_CAPABLE_DEPTH_SOURCES:
+        return (
+            f"surface {surface.surface_id} was fused from {surface.depth_source} depth, which "
+            "carries no evidence about the run it names"
+        )
+    dataset_dir = Path(dataset_dir)
+    where = {k: surface.parameters.get(k) for k in ("depth_dir", "run_dir")}
+    missing = [k for k, v in where.items() if not v or not Path(v).is_dir()]
+    if missing:
+        return (
+            f"surface {surface.surface_id} records {where} and {missing} is not there, so its "
+            "depth_source cannot be re-derived. A claim re-runs the promotion rather than "
+            "reading the verdict out of surface.json; restore the artifacts it was fused from, "
+            "rebuild the surface, or pass --diagnostic."
+        )
+    manifest = Manifest.load_dataset(dataset_dir)
+    model = read_model(dataset_dir / "sparse" / "0")
+    dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
+    run_dir = Path(where["run_dir"])
+    run = check_run(run_dir, manifest.dataset_id, dataset_hash)
+    if run.run_id != surface.run_id:
+        return (
+            f"surface {surface.surface_id} names run {surface.run_id}, but {run_dir} now holds "
+            f"run {run.run_id}"
+        )
+    source, rendered = _depth_provenance(
+        Path(where["depth_dir"]), run, run_dir, manifest.dataset_id, dataset_hash, model
+    )
+    if source not in CLAIM_CAPABLE_DEPTH_SOURCES:
+        return (
+            f"surface {surface.surface_id} records depth_source={surface.depth_source!r}, but "
+            f"re-deriving it from {where['depth_dir']} gives {source!r}"
+        )
+    recorded = surface.parameters.get("depth_manifest_id")
+    if rendered is not None and recorded and rendered.manifest_id != recorded:
+        return (
+            f"surface {surface.surface_id} was fused from depth manifest {recorded}, but "
+            f"{where['depth_dir']} now holds {rendered.manifest_id}"
+        )
+    return None

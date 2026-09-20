@@ -985,3 +985,46 @@ def test_interpolated_wall_bins_are_reported_on_the_claim(chain, tmp_path):
     ser.sections[1].empty_bins = 1
     cov = summarise_coverage(ser, integration_segments(ser), None)
     assert cov.interpolated_bin_fraction == pytest.approx(1 / 12)
+
+
+def test_editing_depth_source_in_surface_json_does_not_reach_a_claim(chain, tmp_path):
+    """Two lines, no depth rendered by minegs: flip the string in surface.json and section it.
+
+    `check_surface` re-reads the points and checks their digest; it has never re-checked
+    `depth_source`, so the section record copied the promoted value forward and every identity
+    check downstream agreed with it. A claim re-derives the verdict from the depth directory and
+    the run directory the surface names.
+    """
+    from minegs.eval.surface.models import SURFACE_FILE, SurfaceRecord
+
+    promoted = tmp_path / "ext"
+    shutil.copytree(chain.external, promoted)
+    rec = SurfaceRecord.load(promoted / SURFACE_FILE)
+    assert rec.depth_source == "external_unverified"
+    rec.depth_source = "minegs_render"
+    rec.save(promoted / SURFACE_FILE)
+
+    sec, out = tmp_path / "s.json", tmp_path / "v.json"
+    srec = cut(promoted, chain.dataset_dir, sec, interval_m=1, thickness_m=0.5, angle_bins=72)
+    assert srec.supports_accuracy_claim  # the label made it this far...
+
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir))
+    assert r.exit_code == 2, r.output  # ...and no further
+    assert "re-deriving it" in flat(r) or "cannot be re-derived" in flat(r)
+    r = runner.invoke(app, volume_argv(sec, chain.dataset_dir, out, diagnostic=True))
+    assert r.exit_code == 0 and volume_json(out)["claim"] == "geometry_diagnostic"
+
+
+def test_a_claim_needs_the_depth_and_run_the_surface_was_fused_from(chain, tmp_path):
+    """The re-derivation is not optional: without the evidence there is no verdict to re-run."""
+    from minegs.eval.surface.depth import rederive_depth_source
+    from minegs.eval.surface.models import load_surface
+
+    surface, _ = load_surface(chain.full)
+    assert rederive_depth_source(surface, chain.dataset_dir) is None
+
+    gone = dict(surface.parameters)
+    gone["depth_dir"] = str(tmp_path / "not_here")
+    surface.parameters = gone
+    reason = rederive_depth_source(surface, chain.dataset_dir)
+    assert reason and "cannot be re-derived" in reason

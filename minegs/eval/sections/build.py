@@ -134,9 +134,9 @@ def build_section_record(
     )
 
 
-def require_reproducible_sections(rec: SectionRecord, manifest, centerline) -> None:
+def require_reproducible_sections(rec: SectionRecord, manifest, centerline, dataset_dir) -> None:
     """``reproducibility_refusal`` as an assertion, for callers that are not the CLI."""
-    reason = reproducibility_refusal(rec, manifest, centerline)
+    reason = reproducibility_refusal(rec, manifest, centerline, dataset_dir)
     if reason is not None:
         raise ContractError(reason)
 
@@ -155,12 +155,14 @@ class ClaimEvidence:
     max_point_gap_m: float | None = None
 
 
-def reproducibility_refusal(rec: SectionRecord, manifest, centerline) -> str | None:
+def reproducibility_refusal(rec: SectionRecord, manifest, centerline, dataset_dir) -> str | None:
     """``check_claim_evidence``'s verdict alone, for callers that do not want the numbers."""
-    return check_claim_evidence(rec, manifest, centerline).refusal
+    return check_claim_evidence(rec, manifest, centerline, dataset_dir).refusal
 
 
-def check_claim_evidence(rec: SectionRecord, manifest, centerline, ranges=None) -> ClaimEvidence:
+def check_claim_evidence(
+    rec: SectionRecord, manifest, centerline, dataset_dir, ranges=None
+) -> ClaimEvidence:
     """Why these sections cannot carry a claim, or ``None`` if they can. Claim path only.
 
     Everything else in ``check_section_record`` ties the record to the right dataset, the right
@@ -177,6 +179,7 @@ def check_claim_evidence(rec: SectionRecord, manifest, centerline, ranges=None) 
     is still there: a claim whose evidence has been archived is a claim nothing can check, which
     is a refusal rather than something to wave through.
     """
+    from minegs.eval.surface.depth import rederive_depth_source
     from minegs.eval.surface.models import check_surface, find_surface, load_surface
 
     src = rec.source
@@ -205,6 +208,17 @@ def check_claim_evidence(rec: SectionRecord, manifest, centerline, ranges=None) 
         )
     surface, points = load_surface(path)
     pc = check_surface(surface, points, rec.dataset_id, rec.dataset_hash)
+    if surface.depth_source != src.depth_source:
+        return ClaimEvidence(
+            f"sections {rec.section_id} record depth_source={src.depth_source!r}, but surface "
+            f"{surface.surface_id} is {surface.depth_source!r}"
+        )
+    # ...and the surface's own verdict is re-derived rather than read: `depth_source` is
+    # decided once at fusion and never re-checked, so editing that one string in surface.json
+    # promoted an external surface and the section record copied it forward.
+    stale = rederive_depth_source(surface, dataset_dir)
+    if stale is not None:
+        return ClaimEvidence(stale)
     if pc.frame != "TLS_GLOBAL":
         pc = pc.transformed(manifest.T_tls_from_local, "TLS_GLOBAL")
     gap = _largest_unobserved_gap(centerline.project(pc.xyz)[0], ranges, rec.series)
