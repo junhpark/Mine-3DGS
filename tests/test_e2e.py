@@ -1073,8 +1073,14 @@ def test_an_edited_paired_validation_makes_the_report_stale(chain, tmp_path):
                 renderer=StandInRenderer(depth_m=7.0),
                 trainer=stand_in_trainer,
             )
-        # And the report the edit was trying to reach reads the edited file, not a cached number.
-        assert build_report(wf.state).volume.predicted_volume_m3 == 1.0
+        # And the report the edit was trying to reach refuses it outright. This assertion used
+        # to say the opposite -- that `build_report` read the edited 1.0 back -- which is
+        # exactly the hole an independent review found: `minegs e2e report` runs no stage, so
+        # it reached this call without passing the staleness gate above, and published a Phase
+        # 2 report carrying the edited volume. The report now checks the file against the
+        # digest the stage recorded for it.
+        with pytest.raises(ContractError, match="not the numbers this workflow produced"):
+            build_report(wf.state)
     finally:
         paired.write_text(original)
 
@@ -1099,11 +1105,73 @@ def test_the_report_stage_refuses_a_paired_validation_that_is_not_there(chain, t
 
 
 def test_the_runtime_table_sums_only_the_stages_this_workflow_ran(chain):
+    """Every stage that ran, the report stage included.
+
+    It used to be excluded because it could not be known: the document was written from inside
+    the stage, before the stage had an elapsed time. The finalising write happens after the
+    record is closed, so the total is now the whole workflow rather than the whole workflow
+    minus the part that was writing the number down.
+    """
     report = Phase2Report.load(chain.state.stages[Stage.REPORT].outputs["report_json_path"])
     measured = [
         chain.state.stages[s].elapsed_seconds
         for s in STAGE_ORDER
-        if chain.state.stages[s].elapsed_seconds is not None and s is not Stage.REPORT
+        if chain.state.stages[s].elapsed_seconds is not None
     ]
+    assert chain.state.stages[Stage.REPORT].elapsed_seconds is not None
     assert report.runtime.total_seconds == pytest.approx(sum(measured), abs=1e-6)
     assert report.runtime.dataset_seconds == chain.state.stages[Stage.DATASET].elapsed_seconds
+
+
+def test_a_partial_workflow_is_still_reported_not_refused(chain, tmp_path):
+    """The new currency gate is about artifacts that moved, not about stages that never ran.
+
+    A partial report is what an operator wants to look at after a failure, and refusing to
+    build one would make the command useless exactly when it matters.
+    """
+    from minegs.e2e.report import report_from_workflow
+
+    root = tmp_path / "partial"
+    root.mkdir()
+    state = WorkflowState.load(chain.root / "wf" / "workflow.json")
+    for stage in (Stage.GEOMETRY, Stage.SECTIONS_VOLUME, Stage.REPORT):
+        state.stages[stage] = StageRecord(stage=stage)
+    state.save(root / "workflow.json")
+
+    report = Phase2Report.load(report_from_workflow(root, tmp_path / "out"))
+
+    assert report.maturity.structural_status == "incomplete"
+    assert any("sections_volume=pending" in n for n in report.maturity.notes)
+    assert report.volume.predicted_volume_m3 is None
+    assert report.reconstruction.surface_id  # what did complete is still reported
+
+
+def test_a_report_that_cannot_be_finalised_fails_the_stage(chain, tmp_path):
+    """The finalising write is part of the stage, so its failure is the stage's failure.
+
+    A ledger claiming a stage succeeded when the artifact that stage exists to produce was
+    never finished is the one outcome worse than a stage that says it stopped.
+    """
+    from minegs.e2e.stages import report_spec
+
+    root = tmp_path / "wf"
+    root.mkdir()
+    (root / "workflow.json").write_text((chain.root / "wf" / "workflow.json").read_text())
+    wf = Workflow(root)
+    wf.state.stages[Stage.REPORT] = StageRecord(stage=Stage.REPORT)
+    wf.save()
+
+    def explode(ctx, outcome):
+        raise ContractError("the disk filled up")
+
+    specs = dict(default_specs())
+    spec = report_spec()
+    specs[Stage.REPORT] = StageSpec(
+        stage=spec.stage, inputs=spec.inputs, run=spec.run, finalise=explode
+    )
+    with pytest.raises(ContractError, match="the disk filled up"):
+        wf.execute(specs, renderer=StandInRenderer(depth_m=7.0), trainer=stand_in_trainer)
+
+    reloaded = WorkflowState.load(root / "workflow.json")
+    assert reloaded.stages[Stage.REPORT].status is StageStatus.FAILED
+    assert "the disk filled up" in reloaded.stages[Stage.REPORT].failure_reason

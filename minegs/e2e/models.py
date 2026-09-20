@@ -135,8 +135,11 @@ class WorkflowState(VersionedModel):
     SCHEMA_VERSION: ClassVar[str] = "1.0"
 
     workflow_id: str = Field(min_length=1)
-    #: The survey this workflow is of. Set by the INGEST stage and never rewritten: a workflow
-    #: is about one E57, and pointing an existing ledger at another file is a new workflow.
+    #: The survey this workflow is of, lifted out of the INGEST stage that established it: a
+    #: workflow is about one E57, and that is a fact about the workflow rather than about one
+    #: of its stages. It is rewritten only when INGEST is explicitly rebuilt — which is the
+    #: documented remedy for a replaced survey, and the one case where this ledger is meant to
+    #: come to describe different bytes.
     source_sha256: str | None = None
     created_at: str
     updated_at: str

@@ -149,6 +149,10 @@ def _ingest_run(ctx: StageContext) -> StageOutcome:
         vendor_manifest=cfg.vendor_manifest,
         images_dir=cfg.images_dir,
         compute_hash=True,
+        # Only when `--rebuild-from ingest` asked for it. The extractor refuses an occupied
+        # staging tree because two runs' scans cannot be told apart afterwards, and that
+        # refusal is right on every run except this one -- which is why the flag exists.
+        overwrite=ctx.rebuilding,
         max_scan_points=cfg.max_scan_points,
     )
     if manifest.source_sha256 and inv.file.sha256 and manifest.source_sha256 != inv.file.sha256:
@@ -188,6 +192,7 @@ def _ingest_run(ctx: StageContext) -> StageOutcome:
             "mapping": cfg.mapping,
             "vendor_manifest": cfg.vendor_manifest,
             "images_dir": cfg.images_dir,
+            "overwrite": ctx.rebuilding,
         },
     )
 
@@ -281,7 +286,13 @@ def _dataset_run(ctx: StageContext) -> StageOutcome:
         spec, staging, calibrate_camera_convention, load_staging
     )
 
-    result = build_dataset(staging, dataset_dir, spec, config_path=build_config)
+    # Same rule as ingest: an existing dataset is refused unless this execution's
+    # `--rebuild-from dataset` said to replace it. The builder's own foreign-file and
+    # ownership checks still run, so this asks it to replace what it made, not to delete a
+    # directory blind.
+    result = build_dataset(
+        staging, dataset_dir, spec, config_path=build_config, overwrite=ctx.rebuilding
+    )
     out = Path(result.dataset_dir)
 
     # The same three checks the operator runs by hand, in the same order, against the same
@@ -326,6 +337,7 @@ def _dataset_run(ctx: StageContext) -> StageOutcome:
             "staging": str(staging),
             "out": str(dataset_dir),
             "config": str(build_config),
+            "overwrite": ctx.rebuilding,
         },
     )
 
@@ -429,7 +441,7 @@ def _train_run(ctx: StageContext) -> StageOutcome:
             "checkpoint_sha256": _digest_if_there(checkpoint),
             "staged": dict(record.staged or {}),
             "frame_of_outputs": record.frame_of_outputs,
-            "real_gpu_execution": ctx.trainer is None,
+            "real_gpu_execution": _real_gpu_execution(record, substituted=ctx.trainer is not None),
             **dataset_identity(dataset_dir),
         },
         command={
@@ -457,6 +469,22 @@ def _default_trainer(run_cfg: Any, runner_cfg: Any) -> Path:
             load_record(handle.run_dir).failure_reason or f"run finished {status.value}"
         )
     return Path(handle.run_dir)
+
+
+def _real_gpu_execution(record: Any, substituted: bool) -> bool:
+    """Whether a real GPU trained this run, decided by what the run recorded about the machine.
+
+    The question being asked was the weaker one -- "was the test seam left alone" -- which is
+    nearly right on the local path, since `LocalRunner` refuses to start without CUDA. But the
+    report's claim is about hardware, and a claim about hardware is answered by the hardware's
+    own evidence (§0D.2 D2-2), not by which code path this process happened to take. A
+    substituted trainer is False whatever the host has; a real one with nothing recorded about
+    a GPU is False too, because nothing establishes that one was there.
+    """
+    if substituted:
+        return False
+    evidence = dict(getattr(record, "runtime", None) or {})
+    return bool(evidence.get("gpu_model")) or evidence.get("torch_cuda_available") is True
 
 
 def _training_env(record: Any, substituted: bool) -> dict[str, Any]:
@@ -769,7 +797,7 @@ def _sections_run(ctx: StageContext) -> StageOutcome:
         )
 
     validation = compare_to_reference(pred, ref, ranges)
-    write_json(out / "paired_validation.json", validation.model_dump(mode="json"))
+    paired_path = write_json(out / "paired_validation.json", validation.model_dump(mode="json"))
 
     # What the prediction alone would integrate over the holdout, and whether it could carry a
     # volume_accuracy claim. Reported, not re-decided: `minegs eval volume` owns that gate and
@@ -786,7 +814,10 @@ def _sections_run(ctx: StageContext) -> StageOutcome:
             "section_id_reference": ref.section_id,
             "sections_predicted_path": str(pred_path.resolve()),
             "sections_reference_path": str(ref_path.resolve()),
-            "paired_validation_path": str((out / "paired_validation.json").resolve()),
+            "paired_validation_path": str(paired_path.resolve()),
+            # The report reads this file rather than the ledger, so the ledger has to be able
+            # to say whether it is still the file this stage wrote (§P2 C5).
+            "paired_validation_sha256": sha256_file(paired_path),
             "volume_predicted_path": str((out / "volume_predicted.json").resolve()),
             "grid": dict(validation.grid),
             "requested_ranges_m": [list(r) for r in ranges],
@@ -872,8 +903,26 @@ def _report_run(ctx: StageContext) -> StageOutcome:
     )
 
 
+def _report_finalise(ctx: StageContext, outcome: StageOutcome) -> None:
+    """Write the report again, now that the ledger this report describes is finished.
+
+    The first write happens inside the stage, where the stage can only describe itself as
+    ``running``; the final ledger says ``succeeded``, and a reader comparing the two found the
+    workflow's own account of itself disagreeing with the workflow. Same id, same directory,
+    same inputs -- only the row that could not be known yet changes.
+    """
+    from minegs.e2e.report import build_report, write_report
+
+    write_report(
+        build_report(ctx.state, report_id=outcome.outputs["report_id"]),
+        Path(outcome.outputs["report_json_path"]).parent,
+    )
+
+
 def report_spec() -> StageSpec:
-    return StageSpec(stage=Stage.REPORT, inputs=_report_inputs, run=_report_run)
+    return StageSpec(
+        stage=Stage.REPORT, inputs=_report_inputs, run=_report_run, finalise=_report_finalise
+    )
 
 
 def default_specs() -> dict[Stage, StageSpec]:

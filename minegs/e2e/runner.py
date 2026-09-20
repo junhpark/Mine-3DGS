@@ -177,6 +177,11 @@ class StageContext:
     #: accept. Neither is allowed to mean "trust this because we made it".
     renderer: Any = None
     trainer: Any = None
+    #: True only when this execution's ``--rebuild-from`` covers this stage. A stage that
+    #: publishes into a fixed directory reads it to decide whether it may replace what is
+    #: there: an ordinary run never may, because an artifact nobody asked to destroy is
+    #: evidence. Stating the intent is what makes the destruction visible.
+    rebuilding: bool = False
 
     def upstream(self, stage: Stage) -> dict[str, Any]:
         """The outputs of an earlier stage, refusing if it has not produced any."""
@@ -200,6 +205,11 @@ class StageSpec:
     stage: Stage
     inputs: Callable[[StageContext], dict[str, Any]]
     run: Callable[[StageContext], StageOutcome]
+    #: Called once the record is final, for a stage whose artifact describes the ledger it is
+    #: in. Only the report needs it: written from inside ``run`` it would have to guess its own
+    #: outcome, and a document that predicts its result is exactly what this project does not
+    #: write. Raising here fails the stage rather than leaving a success nobody completed.
+    finalise: Callable[[StageContext, StageOutcome], None] | None = None
 
 
 class Workflow:
@@ -235,7 +245,13 @@ class Workflow:
 
     # ---------------------------------------------------------------- execution
 
-    def _context(self, stage: Stage, renderer: Any = None, trainer: Any = None) -> StageContext:
+    def _context(
+        self,
+        stage: Stage,
+        renderer: Any = None,
+        trainer: Any = None,
+        rebuilding: bool = False,
+    ) -> StageContext:
         return StageContext(
             stage=stage,
             config=self.config,
@@ -243,6 +259,7 @@ class Workflow:
             state=self.state,
             renderer=renderer,
             trainer=trainer,
+            rebuilding=rebuilding,
         )
 
     def resolve_inputs(
@@ -289,8 +306,16 @@ class Workflow:
         so the CLI can say what is happening during a run measured in hours; it is told, never
         asked, and returning from it cannot change what the workflow does.
         """
+        # The stages this execution was told to destroy and rebuild. A stage that publishes
+        # into a fixed directory -- the staging tree, the dataset -- refuses to write over one
+        # that is already there, which is correct on every run except the one that asked for
+        # it. Without this, `--rebuild-from ingest` cleared the ledger and then failed on the
+        # staging tree it had just declared void, so the remedy the workflow prints for a stale
+        # E57 did not work.
+        rebuilding: set[Stage] = set()
         if rebuild_from is not None:
             self._clear_from(rebuild_from)
+            rebuilding = set(STAGE_ORDER[STAGE_ORDER.index(rebuild_from) :])
         wanted = [s for s in STAGE_ORDER if STAGE_ORDER.index(s) <= STAGE_ORDER.index(through)]
         cache: dict[Stage, dict[str, Any]] = {}
         for stage in wanted:
@@ -300,7 +325,14 @@ class Workflow:
                 on_stage("start", self.state.stages[stage])
             # Dropped after each stage runs: the stage that just executed changed the world its
             # successors read, so a cached answer from before it would describe the old one.
-            rec = self._one(specs, stage, cache, renderer=renderer, trainer=trainer)
+            rec = self._one(
+                specs,
+                stage,
+                cache,
+                renderer=renderer,
+                trainer=trainer,
+                rebuilding=stage in rebuilding,
+            )
             if on_stage is not None:
                 on_stage("end", rec)
             cache.clear()
@@ -313,10 +345,11 @@ class Workflow:
         cache: dict[Stage, dict[str, Any]],
         renderer: Any,
         trainer: Any,
+        rebuilding: bool = False,
     ) -> StageRecord:
         spec = specs[stage]
         rec = self.state.stages[stage]
-        ctx = self._context(stage, renderer=renderer, trainer=trainer)
+        ctx = self._context(stage, renderer=renderer, trainer=trainer, rebuilding=rebuilding)
         inputs = self.resolve_inputs(stage, specs, cache)
         fp = fingerprint(inputs)
 
@@ -354,7 +387,23 @@ class Workflow:
         rec.outputs = dict(outcome.outputs)
         rec.command = dict(outcome.command)
         rec.runtime_env = dict(outcome.runtime_env)
+        if stage is Stage.INGEST:
+            # The survey's identity is the workflow's, not one stage's: `WorkflowState` declares
+            # it (§P2 §3) and everything downstream is evidence about it. Lifted here rather
+            # than left only in the stage's outputs, where the contract said it would not be.
+            self.state.source_sha256 = outcome.outputs.get("source_sha256")
         self.save()
+        if spec.finalise is not None:
+            # After the record is final, so an artifact that describes this ledger describes
+            # the finished one. A failure here is this stage's failure: a success nobody
+            # completed is worse than a stage that says it stopped.
+            try:
+                spec.finalise(ctx, outcome)
+            except BaseException as e:
+                rec.status = StageStatus.FAILED
+                rec.failure_reason = f"{type(e).__name__}: {e}"
+                self.save()
+                raise
         return rec
 
     def _clear_from(self, stage: Stage) -> None:

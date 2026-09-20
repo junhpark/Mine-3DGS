@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from minegs.core.errors import ContractError
-from minegs.core.provenance import make_id, stamp
+from minegs.core.provenance import make_id, sha256_file, stamp
 from minegs.e2e.models import (
     REPORT_JSON_FILE,
     REPORT_MD_FILE,
@@ -55,6 +55,7 @@ __all__ = [
     "build_report",
     "render_markdown",
     "report_from_workflow",
+    "require_current",
     "write_report",
 ]
 
@@ -70,23 +71,59 @@ def _out(state: WorkflowState, stage: Stage) -> dict[str, Any]:
     return dict(rec.outputs) if rec.usable else {}
 
 
-def _load(path: str | None) -> dict[str, Any]:
+def _load(path: str | None, sha256: str | None) -> dict[str, Any]:
+    """Read an artifact the report quotes from, against the digest the stage recorded.
+
+    The report is the one place that reads a stage's *output* file rather than the ledger, and
+    a number a report prints is the number people act on. Without this the shortest path to a
+    false Phase 2 report was to edit the JSON and regenerate: every contract upstream still
+    held, and the document came out with the edited volume in it.
+
+    So the file is compared to what the stage that wrote it recorded. A ledger that recorded no
+    digest cannot answer the question and is refused rather than trusted -- an artifact nothing
+    can vouch for is not evidence, and a partial workflow says so by having no path here at all.
+    """
     if not path:
         return {}
     p = Path(path)
-    return json.loads(p.read_text()) if p.is_file() else {}
+    if not p.is_file():
+        raise ContractError(
+            f"{p}: the stage that produced this recorded it here, and it is gone. The report "
+            "quotes this file rather than recomputing it, so there is nothing to report."
+        )
+    if not sha256:
+        raise ContractError(
+            f"{p}: the ledger records no digest for it, so the report cannot tell whether this "
+            "is still the file the stage wrote. Re-run that stage (`--rebuild-from "
+            "sections_volume`) to record one."
+        )
+    digest = sha256_file(p)
+    if digest != sha256:
+        raise ContractError(
+            f"{p} hashes to {digest[:12]}, but the stage that wrote it recorded {sha256[:12]}. "
+            "These are not the numbers this workflow produced, and a report of them would be a "
+            "report of nothing. Re-run the stage rather than editing its output."
+        )
+    return json.loads(p.read_text())
 
 
-def build_report(state: WorkflowState) -> Phase2Report:
-    """Aggregate the ledger and the artifacts it points at. Reads; never recomputes."""
+def build_report(state: WorkflowState, report_id: str | None = None) -> Phase2Report:
+    """Aggregate the ledger and the artifacts it points at. Reads; never recomputes.
+
+    *report_id* rewrites an existing document rather than minting a new one. The report stage
+    uses it to write itself a second time once its own record is final: a document written from
+    inside the stage can only describe that stage as ``running``, and a Phase 2 report is read
+    as the workflow's final account of itself. Writing it once and then saying what happened is
+    the only way to have that account be true without predicting it.
+    """
     ingest, dataset = _out(state, Stage.INGEST), _out(state, Stage.DATASET)
     train, depth = _out(state, Stage.TRAIN), _out(state, Stage.DEPTH)
     surface, geometry = _out(state, Stage.SURFACE), _out(state, Stage.GEOMETRY)
     sv = _out(state, Stage.SECTIONS_VOLUME)
-    paired = _load(sv.get("paired_validation_path"))
+    paired = _load(sv.get("paired_validation_path"), sv.get("paired_validation_sha256"))
 
     return Phase2Report(
-        report_id=make_id("phase2"),
+        report_id=report_id or make_id("phase2"),
         workflow_id=state.workflow_id,
         generated_at=now_iso(),
         source=_source(ingest),
@@ -544,6 +581,29 @@ def write_report(report: Phase2Report, out_dir: str | Path) -> tuple[Path, Path]
     return json_path, md_path
 
 
+def require_current(work_dir: str | Path) -> None:
+    """Refuse when a completed stage's inputs have moved since it ran.
+
+    The same question ``minegs e2e run`` asks before reusing a stage, asked by the command that
+    reuses *all* of them. Without it the two halves of the CLI disagreed about the same
+    workflow: execution stopped on a replaced E57 and regeneration quietly published a report
+    about it.
+    """
+    from minegs.e2e.runner import Workflow
+    from minegs.e2e.stages import default_specs
+
+    stale = Workflow(work_dir).stale_stages(default_specs())
+    if stale:
+        raise ContractError(
+            "cannot report on this workflow: "
+            + ", ".join(s.value for s in stale)
+            + " completed against inputs that have since moved, so their artifacts describe "
+            "something that is no longer there. Re-run them (`minegs e2e run <config> "
+            f"--work-dir {work_dir} --rebuild-from {stale[0].value}`), or read the report the "
+            "run itself wrote."
+        )
+
+
 def report_from_workflow(work_dir: str | Path, out_dir: str | Path | None = None) -> Path:
     """Regenerate the report from artifacts that already exist. Runs no stage.
 
@@ -560,5 +620,11 @@ def report_from_workflow(work_dir: str | Path, out_dir: str | Path | None = None
     # A workflow that stopped part-way is reported, not refused: a partial report is exactly
     # what an operator wants to look at after a failure, and `_maturity` names every stage that
     # did not complete rather than leaving the reader to infer it from a blank table.
+    #
+    # A workflow whose completed stages no longer describe what is on disk is a different
+    # thing, and it is refused. Regenerating is cheap and runs no stage, which is exactly what
+    # makes it the easy way to launder a moved input into a fresh document: the expensive path
+    # would have stopped, so this one has to as well.
+    require_current(work)
     report = build_report(WorkflowState.load(state_path))
     return write_report(report, out_dir or (work / "report"))[0]

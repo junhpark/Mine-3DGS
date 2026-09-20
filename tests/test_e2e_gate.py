@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 from minegs.core.errors import ContractError
 from minegs.core.pointcloud import PointCloud, read_ply, write_ply
+from minegs.core.provenance import sha256_file
 from minegs.core.synthetic_staging import StagingSpec, generate_staging
 from minegs.e2e.models import STAGE_ORDER, Phase2Report, Stage, StageRecord, StageStatus
 from minegs.e2e.runner import E2EConfig, StageContext, Workflow
@@ -118,6 +119,10 @@ def reopened(gate, tmp_path: Path) -> Workflow:
 
 def outputs(gate, stage: Stage) -> dict:
     return dict(gate.state.stages[stage].outputs)
+
+
+def outputs_of(wf: Workflow, stage: Stage) -> dict:
+    return dict(wf.state.stages[stage].outputs)
 
 
 # ---------------------------------------------------------------- the chain itself
@@ -470,3 +475,196 @@ def test_a_relative_path_in_a_config_is_read_against_the_config(tmp_path):
 
     assert cfg.source_e57 == str(tmp_path / "survey.e57")
     assert np.isclose(cfg.interval_m, 1.0)  # untouched defaults stay defaults
+
+
+# ---------------------------------------------------------------- review round: B1
+
+
+def test_b1_report_regeneration_refuses_an_edited_artifact(gate, tmp_path):
+    """The cheap command must not be the way round the expensive one's gate.
+
+    Regenerating runs no stage, so before this it was the shortest path to a false Phase 2
+    report: edit the volume in `paired_validation.json`, run `minegs e2e report`, and a fresh
+    document came out carrying the edited number with every upstream contract still intact.
+    """
+    from minegs.e2e.report import build_report
+
+    paired = Path(outputs(gate, Stage.SECTIONS_VOLUME)["paired_validation_path"])
+    original = paired.read_text()
+    out = tmp_path / "tampered"
+    try:
+        edited = json.loads(original)
+        edited["volume"]["predicted_volume_m3"] = 1.0
+        paired.write_text(json.dumps(edited))
+        result = cli("e2e", "report", "--work-dir", str(gate.root / "wf"), "--out", str(out))
+
+        assert result.exit_code == 2
+        assert not (out / "phase2_report.json").exists()
+        assert not (out / "phase2_report.md").exists()
+        # Two gates catch it and the outer one answers first here: the edit moved the report
+        # stage's recorded inputs, so the workflow is not current. The inner gate is what
+        # catches it when the report stage never completed, and it names the file.
+        assert "cannot report on this workflow" in said(result)
+        with pytest.raises(ContractError, match="not the numbers this workflow produced"):
+            build_report(gate.state)
+    finally:
+        paired.write_text(original)
+
+
+def test_b1_report_regeneration_refuses_a_workflow_whose_inputs_moved(gate, tmp_path):
+    """Execution stops on a replaced survey; regeneration cannot quietly publish about it."""
+    out = tmp_path / "stale"
+    original = gate.survey.e57.read_bytes()
+    try:
+        gate.survey.e57.write_bytes(original + b"a different survey")
+        result = cli("e2e", "report", "--work-dir", str(gate.root / "wf"), "--out", str(out))
+
+        assert result.exit_code == 2
+        assert "completed against inputs that have since moved" in said(result)
+        assert "--rebuild-from ingest" in said(result)
+        assert not (out / "phase2_report.json").exists()
+    finally:
+        gate.survey.e57.write_bytes(original)
+
+
+def test_b1_a_workflow_that_has_not_moved_still_regenerates(gate, tmp_path):
+    """The gate is on artifacts that moved, not on regenerating at all."""
+    out = tmp_path / "clean"
+    result = cli("e2e", "report", "--work-dir", str(gate.root / "wf"), "--out", str(out))
+
+    assert result.exit_code == 0, said(result)
+    assert (out / "phase2_report.json").is_file() and (out / "phase2_report.md").is_file()
+
+
+def test_b1_an_artifact_with_no_recorded_digest_is_refused_not_trusted(gate):
+    """A ledger that cannot answer "is this still the file" is not a ledger that says yes."""
+    from minegs.e2e.report import build_report
+
+    state = gate.state.model_copy(deep=True)
+    outs = dict(state.stages[Stage.SECTIONS_VOLUME].outputs)
+    del outs["paired_validation_sha256"]
+    state.stages[Stage.SECTIONS_VOLUME].outputs = outs
+
+    with pytest.raises(ContractError, match="records no digest for it"):
+        build_report(state)
+
+
+# ---------------------------------------------------------------- review round: B2
+
+
+def rebuildable(survey, root: Path) -> tuple[Workflow, E2EConfig]:
+    """A real ingest + dataset in directories of their own, ready to be rebuilt over."""
+    cfg = E2EConfig(
+        source_e57=str(survey.e57),
+        staging_dir=str(root / "staging"),
+        build_config=str(gate_build_config(root, survey.centerline, root / "convention.json")),
+        dataset_dir=str(root / "dataset"),
+        tls_reference_ply=str(survey.tls),
+    )
+    wf = Workflow(root / "wf", cfg)
+    wf.execute(default_specs(), through=Stage.DATASET)
+    return wf, cfg
+
+
+def test_b2_rebuild_from_ingest_replaces_the_staging_tree(survey, tmp_path):
+    """The remedy the workflow prints for a stale E57 has to actually run.
+
+    `_clear_from` voids the ledger, but the staging tree stays on disk and the extractor
+    refuses an occupied one — so the rebuild stopped on the artifact it had just declared void.
+    """
+    root = tmp_path / "wk"
+    root.mkdir()
+    wf, _ = rebuildable(survey, root)
+    before = outputs_of(wf, Stage.INGEST)["staging_digest"]
+
+    state = Workflow(root / "wf").execute(
+        default_specs(), through=Stage.DATASET, rebuild_from=Stage.INGEST
+    )
+
+    assert state.stages[Stage.INGEST].status is StageStatus.SUCCEEDED
+    assert state.stages[Stage.DATASET].status is StageStatus.SUCCEEDED
+    assert state.stages[Stage.INGEST].command["overwrite"] is True
+    # A re-extraction is a new extraction -- the 0B artifacts carry their own provenance -- so
+    # the tree is a different tree, and the dataset built on it says so rather than carrying
+    # the digest of the tree that is gone.
+    after = state.stages[Stage.INGEST].outputs["staging_digest"]
+    assert after != before
+    assert state.stages[Stage.DATASET].inputs["staging_digest"] == after
+    assert Workflow(root / "wf").stale_stages(default_specs()) == []
+
+
+def test_b2_rebuild_from_dataset_rebuilds_the_dataset(survey, tmp_path):
+    """The same for a changed build config, which is the ordinary reason to rebuild one."""
+    root = tmp_path / "wk"
+    root.mkdir()
+    rebuildable(survey, root)
+
+    state = Workflow(root / "wf").execute(
+        default_specs(), through=Stage.DATASET, rebuild_from=Stage.DATASET
+    )
+
+    assert state.stages[Stage.INGEST].status is StageStatus.REUSED
+    assert state.stages[Stage.DATASET].status is StageStatus.SUCCEEDED
+    assert state.stages[Stage.DATASET].command["overwrite"] is True
+    assert state.stages[Stage.DATASET].outputs["golden_gate_passed"] is True
+
+
+def test_b2_an_ordinary_run_never_replaces_an_artifact_it_did_not_make(survey, tmp_path):
+    """Overwriting is what `--rebuild-from` is for, and it is the only thing that does it."""
+    root = tmp_path / "wk"
+    root.mkdir()
+    rebuildable(survey, root)
+
+    # A second workflow pointed at the same directories, with no rebuild intent stated.
+    second = tmp_path / "second"
+    second.mkdir()
+    cfg = E2EConfig(
+        source_e57=str(survey.e57),
+        staging_dir=str(root / "staging"),
+        build_config=str(gate_build_config(second, survey.centerline, second / "conv.json")),
+        dataset_dir=str(root / "dataset"),
+        tls_reference_ply=str(survey.tls),
+    )
+    with pytest.raises(ContractError, match="already holds extraction output"):
+        Workflow(second / "wf", cfg).execute(default_specs(), through=Stage.INGEST)
+
+
+# ---------------------------------------------------------------- review round: the rest
+
+
+def test_the_report_describes_the_ledger_it_is_filed_in(gate):
+    """A workflow's final account of itself cannot disagree with the workflow."""
+    report = Phase2Report.load(outputs(gate, Stage.REPORT)["report_json_path"])
+    rows = {row["stage"]: row for row in report.stages}
+
+    for stage in STAGE_ORDER:
+        assert rows[stage.value]["status"] == gate.state.stages[stage].status.value
+    assert rows["report"]["status"] == "succeeded"
+    assert rows["report"]["elapsed_seconds"] is not None
+
+
+def test_the_workflow_records_the_survey_it_is_of(gate):
+    """`WorkflowState.source_sha256` is declared by the contract; it has to be written."""
+    from minegs.e2e.models import WorkflowState
+
+    state = WorkflowState.load(gate.root / "wf" / "workflow.json")
+    assert state.source_sha256 == outputs(gate, Stage.INGEST)["source_sha256"]
+    assert state.source_sha256 == sha256_file(gate.survey.e57)
+
+
+def test_real_gpu_execution_is_decided_by_the_run_s_own_evidence():
+    """Not by which code path this process took: the claim is about hardware."""
+    from types import SimpleNamespace
+
+    from minegs.e2e.stages import _real_gpu_execution
+
+    real = SimpleNamespace(runtime={"gpu_model": "NVIDIA RTX 6000", "torch_cuda_available": True})
+    blank = SimpleNamespace(runtime={})
+    torch_only = SimpleNamespace(runtime={"torch_cuda_available": True})
+
+    assert _real_gpu_execution(real, substituted=False) is True
+    assert _real_gpu_execution(torch_only, substituted=False) is True
+    # A real trainer that recorded nothing about a GPU establishes no GPU.
+    assert _real_gpu_execution(blank, substituted=False) is False
+    # And a substituted one is False whatever the host happens to have.
+    assert _real_gpu_execution(real, substituted=True) is False

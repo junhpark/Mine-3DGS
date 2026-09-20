@@ -84,6 +84,9 @@ git_commit · minegs_version · tool_versions · runtime_env · failure_reason
 | `sections_volume` | surface_id + dataset_hash + section parameters + TLS reference digest |
 | `report` | paired_validation.json digest + geometry report digest (+ `_upstream` 로 위 전부) |
 
+`ingest` 와 `dataset` 은 고정 경로에 publish 하므로, 이미 있는 artifact 를 교체하는 것은
+`--rebuild-from` 이 그 stage 를 포함할 때뿐이다. 평상시 실행은 덮어쓰지 않는다.
+
 fingerprint 가 다르면 **fail closed** 다. 예전 SUCCESS 를 재사용하지 않고, 무엇이 움직였는지
 말한 뒤 명시적 rebuild 를 요구한다. E57 교체 · build config 변경 · dataset hash 변경 · run 교체 ·
 surface 교체 중 하나라도 있으면 downstream evidence 는 stale 이다.
@@ -119,6 +122,18 @@ GPU 가 한 번도 돌지 않은 채로 Phase 2 report 를 만들어 내는 길�
 maturity · stages`.
 
 채울 수 없는 값은 **null + 이유** 다. 그럴듯한 값을 넣지 않는다.
+
+report 는 원장(ledger)에서 읽지 않고 stage 의 **출력 파일**을 인용하는 유일한 지점이다
+(`paired_validation.json`). 그래서 그 파일은 stage 가 기록한 digest 와 대조된다. digest 가
+기록되지 않은 원장은 "맞다" 고 답할 수 없으므로 신뢰하지 않고 거부한다.
+
+report 재생성(`minegs e2e report`)은 stage 를 실행하지 않지만, 완료된 stage 가 전부 여전히
+current 인지 먼저 확인하고 아니면 거부한다. 실행이 거부하는 상태에서 문서만 새로 만들 수 있으면
+그것이 stale evidence 를 세탁하는 가장 짧은 경로가 되기 때문이다.
+
+`report` stage 의 문서는 자기 record 가 확정된 뒤 한 번 더 쓰인다. stage 안에서 쓴 문서는 자기
+자신을 `running` 으로밖에 적을 수 없고, 최종 원장은 `succeeded` 라서 workflow 의 최종 진술이
+workflow 와 어긋나기 때문이다. 결과를 예측해서 적는 대신, 쓰고 나서 무슨 일이 있었는지 적는다.
 
 ## 5. Paired TLS validation (신규)
 

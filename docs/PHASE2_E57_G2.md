@@ -194,6 +194,14 @@ minegs e2e report --work-dir work/wf --out report/ep1
 
 **stage 를 하나도 실행하지 않는다.** 제목 한 줄을 고치려고 training 을 다시 하지 않는다.
 
+다만 **공짜는 아니다.** report 재생성은 먼저 완료된 stage 들의 입력 identity 를 다시 읽어
+대조하고, 하나라도 움직였으면 거부한다 (§7 의 `stale` 과 같은 판정이다). 큰 E57 이면 여기서
+source digest 를 다시 계산하는 비용이 든다. 값싼 명령이 비싼 명령의 gate 를 우회하는 길이 되면
+안 되기 때문이다 — 실행이 멈추는 입력 위에서 문서만 새로 찍어내는 것이 바로 그 우회다.
+
+같은 이유로 `paired_validation.json` 을 손으로 고친 뒤 report 를 다시 만들 수 없다. 그 파일은
+stage 가 기록한 digest 와 대조되고, 다르면 거부된다.
+
 ---
 
 ## 7. 완료된 stage 에서 이어 하기
@@ -223,6 +231,13 @@ minegs e2e run workflow.yaml --work-dir work/wf --rebuild-from depth
 
 그 stage 와 **그 뒤 전부**가 비워지고 다시 실행된다. 무엇이 다시 만들어졌는지가 원장에 남는다.
 
+`--rebuild-from ingest` / `--rebuild-from dataset` 은 기존 staging tree 와 dataset 디렉터리를
+**교체한다.** 이 교체는 `--rebuild-from` 이 그 stage 를 포함할 때만 일어난다 — 평상시 `run` 은
+이미 있는 artifact 를 절대 덮어쓰지 않는다. 아무도 파괴를 요청하지 않은 artifact 는 증거이고,
+파괴 의사를 말하게 하는 것이 그 파괴를 보이게 하는 유일한 방법이다. (하위 builder 의 foreign
+file · ownership 보호는 그대로 동작한다. 디렉터리를 무조건 지우는 것이 아니라, 자기가 만든 것을
+교체하라고 요청하는 것이다.)
+
 > 이것은 training resume 이 아니다. 이미 성공한 TRAIN stage 를 다시 돌리지 않고 그 run artifact
 > 에서 DEPTH 부터 이어 간다는 뜻이다. gsplat training 자체의 중단 후 재개는 여전히 미구현이고
 > fail closed 다 (Phase 0D.3).
@@ -251,6 +266,9 @@ minegs e2e status --work-dir work/wf --json state.json
 | `not the points this surface was built from` | surface PLY 가 record 와 다르다 | 손으로 고치지 말고 surface 를 다시 만든다 |
 | `nothing to compare` | TLS reference 가 holdout 구간을 덮지 않는다 | reference 의 구간·원점을 확인한다 |
 | `stage ... completed against different inputs` | stale | §7 `--rebuild-from` |
+| `... exists; pass --overwrite to replace it` / `already holds extraction output` | staging/dataset 디렉터리가 이미 있는데 이번 실행이 교체 의사를 밝히지 않았다 | `--rebuild-from ingest` 또는 `--rebuild-from dataset` 으로 다시 실행한다. 평상시 실행은 절대 덮어쓰지 않는다 |
+| `cannot report on this workflow` | 완료된 stage 의 입력이 움직였다 | §7 `--rebuild-from`, 또는 run 이 이미 쓴 report 를 그대로 읽는다 |
+| `not the numbers this workflow produced` | report 가 인용하는 artifact 가 stage 기록과 다르다 | 파일을 고치지 말고 해당 stage 를 다시 돌린다 |
 
 실패한 stage 는 고친 뒤 그냥 다시 `run` 하면 된다 (실패한 stage 는 재사용 대상이 아니다).
 
