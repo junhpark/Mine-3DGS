@@ -19,11 +19,27 @@ Everything in the record is re-checked against the world before a claim uses it
 that axis would produce today, and, when it is still on disk, the surface artifact itself. A
 record is a statement about things that exist elsewhere, and an unchecked statement is a label.
 
-What this cannot do, stated plainly: the *areas* are their producer's declaration. Recomputing
-them needs the point cloud, which a volume evaluation is not given. Digests and the station
-grid tie a record to this dataset, this axis and this surface; a file crafted to be
-self-consistent is not distinguishable from a real one. A boundary against accident, not a
-signature — the same boundary ``DepthManifest`` draws.
+Where those checks stop, stated plainly: they are about identity, and identity is not
+arithmetic. They never open an ``area_m2``. Digests and the station grid tie a record to this
+dataset, this axis and this surface, and that is all they do — so a record whose areas were
+edited, or crafted to be self-consistent, passes every one of them. A boundary against
+accident, not a signature: the same boundary ``DepthManifest`` draws, and the reason a
+diagnostic number is allowed to be its producer's word.
+
+A claim is held to more, and that work lives one module over. On the claim path
+``check_claim_evidence`` (``minegs/eval/sections/build.py``) re-reads the surface this record
+names, verifies its points against their own record, re-derives its Phase 1B promotion rather
+than reading the recorded verdict, and cuts the sections again with the parameters this record
+carries: the station count, which stations are observed, ``empty_bins``, ``n_points``, the
+areas and the per-bin radii must all come back. The areas therefore *are* recomputed before a
+``volume_accuracy`` claim — from the surface artifact, which is what a volume evaluation is
+given, not from a cloud it was never handed — and a self-consistent forgery does not survive
+it.
+
+That costs a full re-extraction, so it happens on the claim path only, and it needs the surface
+still on disk. When the surface is gone the claim is refused rather than taken on the record's
+word, and a bare ``SectionSeries``, carrying no record at all, never reaches the claim path to
+begin with.
 """
 
 from __future__ import annotations
