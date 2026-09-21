@@ -554,6 +554,65 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
   그 격자에 떨어지지 않으면 coverage 는 완전해질 수 없고, 거부 메시지가 재단(re-section)을
   안내한다.
 
+## E57 end-to-end workflow (Phase 2)
+
+Phase 0B–1C 가 닫아 둔 계약을 E57 하나로 관통시키는 thin orchestration 이다. 계약은
+[docs/PHASE2_CONTRACT.md](docs/PHASE2_CONTRACT.md), 실제 GPU 장비에서의 실행 절차는
+[docs/PHASE2_E57_G2.md](docs/PHASE2_E57_G2.md).
+
+```bash
+# 전부
+minegs e2e run workflow.yaml --work-dir work/wf
+
+# 끊어서 (각 stage 가 몇 시간짜리일 수 있다)
+minegs e2e run workflow.yaml --work-dir work/wf --through dataset
+minegs e2e status --work-dir work/wf            # 어디까지 됐고, 지금 돌리면 무엇이 거부되는가
+minegs e2e run workflow.yaml --work-dir work/wf --rebuild-from depth
+
+# 이미 있는 artifact 에서 문서만 다시 만든다 (stage 를 하나도 실행하지 않는다)
+minegs e2e report --work-dir work/wf --out report/ep1
+```
+
+stage 는 `ingest → dataset → train → depth → surface → geometry → sections_volume → report`
+이고, 순서는 `minegs/e2e/models.py` 의 `STAGE_ORDER` 하나로만 선언된다.
+
+**재사용 규칙.** stage 마다 자기가 실제로 의존한 identity 를 **세상에서 다시 읽어** digest 하고,
+앞 stage 의 fingerprint 를 사슬로 엮어 함께 기록한다. 그래서 E57 교체·build config 변경·dataset
+hash 변경·run 교체·surface 교체 중 하나만 있어도 그 뒤가 전부 stale 이 된다. stale 한 stage 는
+조용히 재사용하지도, 조용히 다시 돌리지도 않는다 — 무엇이 움직였는지 말하고 멈춘다.
+`--rebuild-from` 이 명시적 답이고, 무엇이 다시 만들어졌는지는 원장에 남는다.
+
+이것은 **training resume 이 아니다.** 이미 성공한 TRAIN stage 를 다시 돌리지 않고 그 run
+artifact 에서 DEPTH 부터 이어 간다는 뜻이다 (gsplat training 자체의 재개는 Phase 0D.3, 여전히
+fail closed).
+
+**paired TLS validation.** 복원과 held-out TLS 를 **같은 section grid** 에서 station 단위로
+pair 하고, 체적은 **공통 적분 구간** 에서만 비교한다. 서로 다른 coverage 에서 잰 100 m³ 와
+102 m³ 를 빼는 것은 오차가 아니라 서로 다른 갱도 구간에 대한 두 숫자이고, 복원이 덜 덮을수록
+작아진다. 결측을 가로지르는 사다리꼴은 없다 (Phase 1C helper 재사용, 새 적분 구현 없음).
+
+**report.** `phase2_report.json` 이 machine-readable source of truth, `phase2_report.md` 가 그
+표현이다. report 는 집계만 한다 — 다시 계산하지 않고, 못 채운 값은 **null + 이유**이며,
+maturity status 를 올리지 않는다.
+
+**CLI 에 trainer/renderer 를 대체하는 flag 는 없다.** 그 seam 은 Python 에서 structural gate 가
+잡고, 잡았다는 사실을 stage 와 report 양쪽에 기록한다 (`real_gpu_execution`,
+`real_renderer_execution`).
+
+### 지금 검증된 것과 아닌 것
+
+`tests/test_e2e_gate.py` 는 **테스트 시점에 쓴 실제 E57 파일**에서 inventory·추출·camera
+convention 측정·dataset·golden gate·run 검증·depth manifest·surface promotion·geometry·section
+record·paired validation·report 까지 실제 production 함수를 관통한다. 대체되는 것은 선언된 두
+hardware seam — **trainer 와 renderer** — 뿐이다.
+
+그래서 이것은 **control path 와 evidence path 의 검증이지 G2 가 아니다.** 합성 renderer 결과를
+G2 라고 부르지 않는다.
+
+> Phase 2 E57 end-to-end workflow is implemented and structurally tested.
+> Real-data scientific validation remains NOT VALIDATED.
+> Phase 2 G2 remains PENDING.
+
 ## 평가 주장 게이트 (§5)
 
 `minegs eval protocol <dataset>` 이 manifest 의 `split`/`initialization` 만 보고 주장 가능 범위를 판정한다.
@@ -576,7 +635,7 @@ area     10  10   -  10  10      →  V = 10 + 10 = 20 m³   (40 이 아니다)
 | 0C Metric dataset golden gate | **implementation complete, G1 structurally tested** — 합성 staging → `from-e57` → 재투영 Golden Gate 가 CI 에서 돈다. **G2: DEFERRED / NOT VALIDATED** (실제 E57 미실행) |
 | 0D Local GS baseline | **0D.1 resume safety contract** + **0D.2 local GPU baseline execution contract: implemented + structurally tested** — gsplat v1.5.3 training resume 은 unsupported 이고 fail closed; 성공한 run 은 checkpoint·PLY·step 진행·frame invariant 를 모두 통과한 것만 기록된다. **실제 GPU baseline 미실행** → 0D 전체 **NOT COMPLETE** (ROADMAP §Phase 0D) |
 | 1 Metric surface & evaluation | **1A metric surface artifact + depth fusion**, **1B metric depth rendering**, **1C section/volume evidence boundary: implemented + structurally tested** — 학습된 run → 렌더 depth + manifest → 검증된 surface artifact → section artifact → gap-safe 체적 → claim. 검증된 manifest 가 있을 때만 `minegs_render` 이고, 외부 depth·원시 PLY·bare series 는 diagnostic 전용이다. 결측 구간을 가로지르는 적분은 없다. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), **TSDF/mesh: NOT IMPLEMENTED**, 실측 데이터 과학적 검증: **NOT VALIDATED** |
-| 2 E57 end-to-end MVP (v0.1) | 미착수 |
+| 2 E57 end-to-end MVP (v0.1) | **implemented + structurally tested** — `minegs e2e run` / `status` / `report` 가 E57 한 개를 ingest→dataset→train→depth→surface→geometry→단면/체적→report 로 관통한다. stage 마다 입력 identity 를 다시 읽어 대조하므로 움직인 입력 위에 조용히 쌓지 않는다. 복원과 held-out TLS 를 같은 grid 에서 pair 하고 공통 구간에서만 체적을 비교한다. structural gate 는 테스트 시점에 쓴 실제 E57 에서 돌지만 **trainer·renderer 는 대체**되고 그 사실이 report 에 남는다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** ([runbook](docs/PHASE2_E57_G2.md)) |
 | 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |
 | 4 Advanced GS / heavy | 미착수 — `depth_loss`·`normalize_world_space` 를 여기서 설계 |
 | 5 장거리 갱도 · 청킹 | 예약만 (manifest.chunks) |

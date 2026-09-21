@@ -3,7 +3,7 @@ from __future__ import annotations
 import typer
 
 import minegs
-from minegs.cli import dataset, eval_cmd, ingest, sync, train, viz
+from minegs.cli import dataset, e2e_cmd, eval_cmd, ingest, sync, train, viz
 
 app = typer.Typer(
     name="minegs",
@@ -22,6 +22,11 @@ app.add_typer(
     eval_cmd.app,
     name="eval",
     help="protocol / register / render-depth / surface-depth / geometry / sections / volume / change / render",
+)
+app.add_typer(
+    e2e_cmd.app,
+    name="e2e",
+    help="one E57 survey through the whole chain: run / status / report",
 )
 app.add_typer(viz.app, name="viz", help="viewer / overlay / export")
 app.add_typer(sync.app, name="sync", help="rclone push (dataset only) / pull (runs)")
