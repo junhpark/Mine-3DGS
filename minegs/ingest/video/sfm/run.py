@@ -110,8 +110,32 @@ def run_sfm(
         )
     if overwrite and out.exists():
         shutil.rmtree(out)
+    started_empty = not out.exists() or not any(out.iterdir())
     out.mkdir(parents=True, exist_ok=True)
 
+    try:
+        return _reconstruct(rec_fs, fs_dir, out, backend, mapper, options, component, executor)
+    except BaseException:
+        # A reconstruction that never happened must not leave a directory that refuses the
+        # retry. The rig config is written before the backend runs, so a missing COLMAP used
+        # to leave exactly enough behind for the next attempt to be refused for "mixing two
+        # runs" — when there had been no run at all. Only a directory this call created, and
+        # only after a failure, and the exception goes on.
+        if started_empty:
+            shutil.rmtree(out, ignore_errors=True)
+        raise
+
+
+def _reconstruct(
+    rec_fs: Any,
+    fs_dir: Path,
+    out: Path,
+    backend: str,
+    mapper: str,
+    options: SfMOptions | None,
+    component: str | None,
+    executor: SfmExecutor | None,
+) -> tuple[SfmRecord, Path]:
     opts = options or SfMOptions()
     images_dir = rec_fs.image_root(fs_dir)
 

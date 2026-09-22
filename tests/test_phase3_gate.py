@@ -820,3 +820,53 @@ def test_t30_two_paths_evaluated_over_different_holdouts_are_not_compared(gate, 
         require_same_holdout(tls_ctx, img_ctx)
     with pytest.raises(ContractError, match="declares none"):
         require_same_holdout(tls_ctx, {**img_ctx, "holdout_ranges_m": []})
+
+
+def test_a_360_survey_delivered_as_a_folder_of_panoramas_still_gets_its_ring(scene, tmp_path):
+    """What the source *is* decides how frames arrive; `--kind` says what the pictures are.
+
+    Reading the directory case off `--kind` meant a 360 capture that arrived already extracted
+    — a camera's own export, or someone else's `ffmpeg` — could only be ingested as
+    `image_set`, which drops the ring crops that are the entire 360 path.
+    """
+    from minegs.cli.main import app
+    from minegs.ingest.video.models import check_frameset, load_frameset
+    from typer.testing import CliRunner
+
+    out = tmp_path / "fs"
+    result = CliRunner().invoke(
+        app,
+        [
+            "ingest",
+            "video",
+            "frameset",
+            str(scene.survey.frames_dir),
+            str(out),
+            "--kind",
+            "video360",
+            "--n-yaw",
+            "4",
+            "--fov-deg",
+            "90",
+            "--size",
+            "32",
+            "--pano-source",
+            "Configured",
+            "--blur",
+            "0.0",
+            "--hamming",
+            "0",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    rec, root = load_frameset(out)
+    check_frameset(rec, root)
+    assert rec.kind == "video360"
+    assert rec.extraction.method == "none"  # nothing was decoded; the frames were handed over
+    assert len(rec.crops) == 4 * len(rec.selection.decisions)
+
+    missing = CliRunner().invoke(
+        app, ["ingest", "video", "frameset", str(tmp_path / "nope"), str(tmp_path / "x")]
+    )
+    assert missing.exit_code != 0
+    assert "neither a video file nor a directory" in missing.output

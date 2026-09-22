@@ -526,11 +526,21 @@ def video_frameset(
                 source=pano_source,
                 vendor=pano_vendor,
             )
+        # What the source *is* decides how the frames arrive; `kind` says what the pictures
+        # are. Reading the directory case off `kind` meant a 360 survey delivered as a folder
+        # of panoramas — already extracted, or exported by the camera — could only be ingested
+        # as `image_set`, which throws away the ring crops that are the whole 360 path.
+        if source.is_dir():
+            video, image_dir = None, source
+        elif source.is_file():
+            video, image_dir = source, None
+        else:
+            raise ContractError(f"{source}: neither a video file nor a directory of images")
         rec, root = build_frameset(
             out_dir,
             kind=kind,  # type: ignore[arg-type]
-            video=None if kind == "image_set" else source,
-            image_dir=source if kind == "image_set" else None,
+            video=video,
+            image_dir=image_dir,
             fps=fps,
             scale_width=scale_width,
             start_s=start_s,
