@@ -26,7 +26,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 0D | Local GS Baseline | **0D.1 resume safety contract** 및 **0D.2 local GPU baseline execution contract** implemented + structurally tested. **실제 GPU baseline 미실행**. 0D 전체는 **NOT COMPLETE** (§0D) |
 | 1 | Metric Surface & Evaluation | **1A metric surface artifact + depth fusion** 및 **1B metric depth rendering: implemented + structurally tested** (§1). 검증된 depth manifest 가 있을 때만 `minegs_render` → `geometry_accuracy`; 외부 depth 는 diagnostic 전용. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), TSDF/mesh: NOT IMPLEMENTED, 실측 과학적 검증: NOT VALIDATED |
 | 2 | E57 End-to-End MVP | **implemented + structurally tested** — E57 한 개를 ingest→dataset→train→depth→surface→geometry→section/volume→report 로 관통하는 단일 orchestration (`minegs e2e`), stage checkpoint, paired TLS validation, Phase 2 report. 합성 structural gate 는 실제 E57 파일에서 돌지만 **trainer/renderer 는 대체**된다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** (§2) |
-| 3 | Image / 360 Independent Reconstruction | 부분 implemented (커맨드 빌더·rig·정합), 미검증 |
+| 3 | Image / 360 Independent Reconstruction | **부분 implemented, 미검증** — frame 추출, blur/중복 선별 지표, ring crop 기하, COLMAP rig config, SfM 명령 구성과 실행 경로, 정합 수학(Umeyama·SE3 ICP·diagnostics)은 존재한다. 다만 **SfM 은 한 번도 실행된 적이 없고**(CI 에 COLMAP 없음, 테스트는 명령 문자열만 검사), **360 영상 crop 생성 경로·mask 생산 경로·image-only dataset 빌더·SfM/정합의 영속 증거(artifact)는 없다**. 계약 freeze: [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) (C0) |
 | 4 | Advanced GS / Heavy Profile | 미착수 — `depth_loss` 는 여기서 설계 |
 | 5 | Long Tunnel & Chunking | 예약만 (manifest.chunks) |
 | 6 | RunPod / Reproducible Compute | **미구현, fail-closed** |
@@ -764,6 +764,18 @@ metric dataset 계약으로 변환.
 
 **Gate (G2)**: 독립 영상/360 재구성을 TLS reference 에 등록하고 정량 검증.
 TLS-assisted GS 와 image-only GS 의 metric accuracy 비교가 가능해야 한다.
+
+**계약**: [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) 가 구현 전 freeze 다 — reality audit,
+SfM frame(`SFM_INTERNAL`) 결정, TLS registration/evaluation leakage 규칙, provenance artifact,
+fail-closed 목록, 3A/3B/3C 분할.
+
+**현재 상태 (C0 reality audit, `main @ ad39f4d`)**: 재사용 가능한 것은 frame 선별 지표, ring crop
+기하와 리샘플(E57 파노라마 경로에서 이미 production), COLMAP rig 구성, SfM 명령 골격, 정합 수학
+전체다. 없는 것은 360 **영상**용 crop 생성 경로, mask 생산 경로(`write_mask` 호출자 없음),
+image-only dataset 빌더(`materialize.py` 가 `source="tls"` 를 하드코딩), 그리고 SfM·정합 결과의
+영속 증거다 — `SfMResult` 는 프로세스와 함께 사라지고 registration 결과는 사람이 manifest 에
+복사해 넣는다. 조용한 degrade 도 남아 있다: `sparse/0` 하드코딩, RANSAC 전체 fallback,
+타깃 없을 때의 identity Sim3, 미수렴 ICP 반환. Phase 3 는 이것들을 fail-closed 로 바꾼다.
 
 ### Phase 4 — Advanced GS / Heavy Profile
 
