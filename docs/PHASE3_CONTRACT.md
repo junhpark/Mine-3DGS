@@ -69,10 +69,12 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 
 | capability | 상태 | 근거 (file:line) |
 |---|---|---|
-| ffmpeg frame 추출 | **CLI-wired** (command builder 만 테스트됨) | `cli/ingest.py:428` → `ingest/video/frames.py:33 extract_frames` 가 실제 `subprocess.run`; 테스트는 `tests/test_train_ingest_viz.py:334` 의 argv 문자열 검사뿐 |
+| ffmpeg frame 추출 | **CLI-wired** (command builder 만 테스트됨) | `cli/ingest.py:428` → `ingest/video/frames.py:34 extract_frames` 가 실제 `subprocess.run`; 테스트는 `tests/test_train_ingest_viz.py:334` 의 argv 문자열 검사뿐. CLI 는 `--fps` 만 노출한다 — `pattern`·`scale_width`·`start_s`·`duration_s` (`frames.py:16-19`) 는 도달 불가라 긴 4K 영상을 자르거나 줄일 수 없다. ffmpeg `-y` 라서 fps 를 바꿔 같은 디렉토리에 다시 추출하면 프레임이 말없이 섞인다 |
 | ffprobe | **implemented not wired** | `frames.py:44 probe_command` — 호출자 없음 |
 | blur / dHash 중복 선별 | **structurally tested** | `dedup_blur.py:20 blur_score`, `:27 dhash`; `cli/ingest.py:447` 이 `select_frames` 실행 후 결정을 JSON 으로 씀. 지표 자체는 `tests/test_train_ingest_viz.py:329` 가 실제로 계산 |
-| 선별 결정의 identity | **없음** | `cli/ingest.py:458` 이 `dataclass.__dict__` 를 그대로 dump. 원본 video digest·fps·추출 설정 없음, record id 없음 |
+| 선별 결정의 identity | **없음** | `cli/ingest.py:458` 이 `dataclass.__dict__` 를 그대로 dump. 원본 video digest·fps·임계값·추출 설정 없음, record id 없음. `--out` 없이 쓰면 콘솔 한 줄 뒤에 JSON 이 붙어 stdout 이 파싱되지 않는다 |
+| 선별 결과의 소비 | **없음** | `FrameDecision` 을 읽는 코드가 저장소에 없다. `select` 는 아무것도 지우지도 옮기지도 않고, `sfm` 은 디렉토리의 **모든** 이미지를 feature-extract 한다 — 현재 이 단계는 파이프라인에 아무 효과가 없는 보고서다 |
+| 선별의 파일 탐색 | **조용한 누락** | `cli/ingest.py:458` 의 glob 은 비재귀·대소문자 구분(`*.png`, `*.jpg`)이다. `.jpeg`/`.JPG` 는 말없이 빠지고, 링 crop 이 만들 `p0y00/` 같은 하위 디렉토리 구조에서는 `kept 0 / 0` 을 찍고 **exit 0** 으로 끝난다 |
 | equirect → pinhole crop 리샘플 | **structurally tested (E57 경로에서 production-wired)** | `ingest/common/equirect.py:74 crop_equirect`; 실제 사용처는 `dataset/materialize.py:347` (E57 파노라마) |
 | **video 360 ring crop 생성 경로** | **없음** | `crop_equirect` 를 부르는 video 경로가 없다. `minegs ingest video` 에 crop 명령이 없음 |
 | ring crop 기하 (`RingCropSpec`) | **structurally tested** | `equirect.py:23`, `:60 R_scanner_from_cam`; `core/synthetic.py:143`, `dataset/materialize.py:347` 이 사용 |
@@ -81,7 +83,11 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 | mask 생성 (nadir / box) | **implemented not wired** | `video/masks.py:14, 23, 33` 은 배열을 만들고 `:40 write_mask` 가 파일을 쓰지만 **`write_mask` 호출자가 저장소에 하나도 없다**. `nadir_mask_for_crop` 은 테스트에서만 불린다 (`tests/…:322`) |
 | mask → COLMAP 전달 | **CLI-wired** | `sfm/colmap_incremental.py:29` 이 `--ImageReader.mask_path` 를 붙이고 `cli/ingest.py:491 --masks` 로 전달됨. 즉 **소비 경로는 있고 생산 경로가 없다** |
 | COLMAP feature/matcher/mapper 명령 구성 | **structurally tested (문자열만)** | `sfm/colmap_incremental.py:8 _common`, `:48`; `sfm/colmap_global.py:15`; 테스트 `tests/…:338` 은 `"global_mapper" in cmd` 수준의 문자열 검사 |
-| COLMAP 실행 | **CLI-wired, 테스트 없음** | `sfm/base.py:41 run` 이 `subprocess.run(..., check=True)` 로 실제 실행하고 `sfm.log` 에 명령을 남김. CI 에 COLMAP 이 없어 **한 번도 실행된 적 없음** |
+| COLMAP 실행 | **배선은 있으나 한 번도 실행된 적 없음** | `sfm/base.py:43 run` 이 `subprocess.run(..., check=True)` 로 실제 실행하고 `sfm.log` 에 명령을 남긴다(`ab` 모드라 재실행이 구분 없이 덧붙는다). CI·docker·이 작업 환경 어디에도 COLMAP 이 없어 `base.py:52` 이후 한 줄도 실행된 적이 없다. 첫 실제 실행에서 걸릴 것으로 보이는 두 곳: `base.py:53` 이 `work_dir` 만 만들고 mapper 의 `--output_path`(=`work_dir/sparse`) 를 만들지 않는다; `sequential_matcher` 에 `--SequentialMatching.loop_detection 1` 만 주고 vocab tree 경로가 없다 |
+| `--mapper` 값 검증 | **fail-open** | `sfm/base.py:80-88 get_sfm_backend` 은 `"global"` 만 보고 나머지는 전부 incremental 로 떨어뜨린다. `--mapper globl` 이 경고 없이 incremental 을 돌린다 |
+| `SfMOptions.mapper` | **dead field** | 어떤 backend 도 `opts.mapper` 를 읽지 않는다. 실제 선택은 `get_sfm_backend` 의 인자로 이뤄진다 (`cli/ingest.py:498`) |
+| SfM 옵션 노출 범위 | **CLI 도달 불가** | `camera_model`, `camera_params`, `matcher`, `use_gpu`, `extra` (`base.py:18-24`) 에 CLI 옵션이 없다 — matcher 는 항상 sequential, `use_gpu` 는 `Dockerfile.cpu` 가 있어도 항상 `1` |
+| GLUEMAP 도달성 | **CLI 도달 불가** | `cli/ingest.py:498` 이 backend 이름을 `"colmap"` 으로 고정한다. ROADMAP 의 fail-closed 행이 설명하는 거부를 사용자가 실제로 유발할 수 없다 |
 | 다중 sparse model 처리 | **미정의 (fail-open)** | `base.py:58` 과 `colmap_global.py:43` 이 `sparse/0` 을 하드코딩한다. COLMAP 이 분리된 component 를 여러 개 낼 때 조용히 0 번을 집는다 |
 | `SfMResult` | **휘발성 (증거 아님)** | `sfm/base.py:29` — `sparse_dir`, `n_registered`, `n_points`, `backend`, `log` 뿐인 in-memory dataclass. 디스크에 남는 것은 COLMAP 산출물과 `sfm.log` 뿐이고, backend 버전·옵션·입력 이미지 집합·모델 digest·frame 의미는 **아무 데도 기록되지 않는다** |
 | GLUEMAP | **placeholder only** | `sfm/gluemap.py:14` → `NotYetImplementedError` |
@@ -89,11 +95,16 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 | Umeyama Sim3 | **structurally tested** | `eval/register/sim3.py:11`; `tests/test_eval.py:87` 이 scale 1.02 복원을 검사 |
 | RANSAC 대응 정합 | **structurally tested, fail-open 잔존** | `register/initial_alignment.py:35`; inlier 가 3 개 미만이면 `:60` 에서 **전체 점으로 되돌아가 fit** 한다 (조용한 degrade) |
 | SE(3) ICP | **structurally tested** | `register/rigid_icp.py:24`; `umeyama(..., with_scale=False)` (`:58`) 이므로 **scale 을 바꾸지 않는다**. 다만 `converged=False` 여도 결과를 반환한다 (호출자가 판정해야 함) |
-| registration diagnostics | **structurally tested** | `register/diagnostics.py:38 diagnose`; `rmse_m` 는 **inlier 에 대해서만** 계산된다 (`:52`) — inlier_ratio 를 함께 보지 않으면 의미가 없다 |
-| registration → manifest | **수작업** | `cli/eval_cmd.py:152` 의 도움말이 그대로 말한다: *"registration JSON (paste into manifest.registration)"*. SfM 모델·source cloud·TLS 파일과의 결속이 없다 |
+| registration diagnostics | **사실상 미검증** | `register/diagnostics.py:38 diagnose` 를 "완벽한 정합"(rmse 0, inlier 1.0) 을 돌려주는 상수 stub 으로 바꿔도 **640 개 테스트가 전부 통과한다**. `tests/test_eval.py:108` 의 단언(`inlier_ratio > 0.99`, `scale == 1.0`)이 상수로 충족되기 때문이다. 또 `rmse_m` 는 **inlier 에 대해서만** 계산되므로 (`:52`) inlier_ratio 없이는 의미가 없다 |
+| **`minegs eval register` 자체** | **깨져 있음 (모든 호출이 실패)** | `cli/eval_cmd.py:180` 의 `T = res.T @ T0` 는 `SE3 @ Sim3` 다. `core/frames.py:182 SE3.__matmul__` 은 SE3 가 아니면 `NotImplemented` 를 돌려주고 `Sim3` 에는 `__rmatmul__` 이 없다 → **`TypeError` 로 종료, 출력 파일 없음**. 타깃을 주는 분기(`align_correspondences` → Sim3)와 안 주는 분기(`Sim3.identity()`)가 **둘 다** 여기로 온다. 이 저장소의 유일한 정합 CLI 는 한 번도 동작한 적이 없다 (실제 실행으로 확인: exit 1, `reg.json` 미생성) |
+| registration → manifest | **수작업, 게다가 도달 불가** | `cli/eval_cmd.py:152` 의 도움말이 그대로 말한다: *"registration JSON (paste into manifest.registration)"*. 위 버그 때문에 붙여넣을 JSON 자체가 생성되지 않는다 |
+| registration 의 **적용** | **없음** | `Registration.sim3` (`core/manifest.py:147`) 과 `Scale.factor` (`:135`) 는 **호출자가 0 건**이다. `manifest.registration` 은 게이트 토큰으로 읽히고(`protocol.py:75`, `manifest.py:320-322`) 보고될 뿐, **어떤 좌표도 이 변환으로 옮겨지지 않는다** |
 | target 없는 registration | **fail-open** | `cli/eval_cmd.py:174` — 타깃이 없으면 노란 경고를 찍고 **`Sim3.identity()` 로 진행**한다. 즉 "이미 metric 이라고 가정" |
 | registration support 기록 | **없음** | `diagnose` 는 `n_source` 만 남긴다. **어느 TLS 기하를 정합 근거로 썼는지 남지 않는다** |
-| video source 의 claim 차단 | **structurally tested** | `eval/protocol.py:75-83` — `source in ("video","video360")` 인데 `registration` 이 없거나 품질 지표가 0 이면 metric claim 거부 |
+| crop 레이아웃 정합성 | **모순, 검사 없음** | `rig.py:34` 의 기본 prefix 는 `p0y00/` 같은 **디렉토리**인데, 저장소의 유일한 crop 생산자(`dataset/materialize.py:348`)는 `{station}_{view}.png` 를 **한 디렉토리에 평평하게** 쓴다. 게다가 `colmap_incremental.py:20-21` 은 `--ImageReader.single_camera_per_folder 1` 을 항상 준다. 셋이 서로 맞지 않는데 아무도 확인하지 않는다 |
+| `write_mask` 의 `images_dir` | **무시됨** | `video/masks.py:40` 의 시그니처에 있지만 본문(`:42-45`)이 쓰지 않는다. 호출자도 없는 함수의 무시되는 파라미터 |
+| COLMAP 포맷 적합성 | **검증 없음** | 테스트의 모든 `cameras.txt`/`images.txt`/`rigs.txt` 는 `colmap_io.py:173 write_model` 이 쓰고 `:278 read_model` 이 되읽는다. 서로만 맞는 한 쌍이어도 통과한다 — 진짜 COLMAP 이 읽어 준 적은 없다 |
+| video source 의 claim 차단 | **부분 검증** | `eval/protocol.py:75-83` — `source in ("video","video360")` 인데 `registration` 이 없거나 품질 지표가 0 이면 metric claim 거부. 테스트는 `reg is None` 분기(`tests/test_eval.py:81-84`)만 덮고, **품질 지표가 0 인 분기(`:81-83`)는 테스트가 없다** |
 | image-only dataset 빌더 | **없음** | 유일한 실빌더는 `cli/dataset.py:258 from-e57`. `dataset/materialize.py:755` 이 `initialization.source="tls"` 를, `:768` 이 `source="tls"` 를 **하드코딩**한다 |
 | SfM frame 의 표현 | **없음** | `core/frames.py:23 Frame` 은 `SOURCE / TLS_GLOBAL / LOCAL_METRIC / BACKEND_INTERNAL` 뿐. ARCHITECTURE §3 은 SOURCE 를 "스캐너 로컬 / SfM 임의" 로 설명하지만, SOURCE → TLS_GLOBAL 의 문 (`dataset/build_config.py:30 SourceFrameConfig`) 은 `se3()` (`:60`) 를 돌려준다 — **구조적으로 scale 을 담을 수 없다** |
 | manifest 의 registration/scale 어휘 | **이미 존재** | `core/manifest.py:138 Registration`, `:32 DatasetSource = "tls"\|"video"\|"video360"`, `ScaleBasis = "tls_pose"\|"sim3_to_tls"\|"known_target"`, `InitSource = "tls"\|"sfm_sparse"\|"random"` |
@@ -107,9 +118,10 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 * **COLMAP rig**: `rig_from_ring` / `rig_config_json` (`rig.py`).
 * **COLMAP 명령 구성과 실행 골격**: `sfm/base.py`, `colmap_incremental.py`, `colmap_global.py`.
   mask 전달(`--ImageReader.mask_path`)과 rig 구성(`rig_configurator`)이 이미 들어 있다.
-* **정합 수학 전부**: `umeyama`, `align_correspondences`, `icp_point_to_point`, `diagnose` —
-  실제 로직이고 `tests/test_eval.py:87,97` 이 합성 데이터로 검증한다. Phase 3 는 여기에 **게이트와
-  provenance 를 씌우는 것**이지 다시 구현하는 것이 아니다.
+* **정합 수학**: `umeyama`, `align_correspondences`, `icp_point_to_point` — 실제 로직이고
+  `tests/test_eval.py:87,97` 이 합성 데이터로 검증한다. Phase 3 는 여기에 **게이트와 provenance 를
+  씌우는 것**이지 다시 구현하는 것이 아니다. **단 `diagnose` 는 예외다** — 상수 stub 으로 바꿔도
+  테스트가 통과하므로, 재사용하되 먼저 실제 테스트를 붙여야 한다.
 * **manifest 어휘**: `Registration`, `ScaleBasis`, `InitSource.sfm_sparse`, `DatasetSource.video*` —
   schema 를 새로 만들 필요가 없다.
 * **claim 경계**: `eval/protocol.py:75` 의 video 규칙, 그리고 Phase 1A/1B/1C 의 surface/section/volume
@@ -122,7 +134,14 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 * `write_mask` — 호출자 없음. `probe_command` — 호출자 없음. `GLUEMAP` — `NotYetImplementedError`.
 * `SfMBackend.run` — 실행 경로는 있으나 **한 번도 실행된 적이 없고** 테스트가 없다. COLMAP 4.x 플래그
   (`global_mapper`, `rig_configurator`, `--FeatureExtraction.use_gpu`, `--SequentialMatching.loop_detection`)
-  는 **문자열로만** 검증되어 있다. 실제 COLMAP 과의 호환성은 Phase 3 에서 처음 확인된다.
+  는 **문자열로만** 검증되어 있다. 실제 COLMAP 과의 호환성은 Phase 3 에서 처음 확인된다. 이미 눈에
+  보이는 두 곳(`--output_path` 디렉토리 미생성, vocab tree 없는 `loop_detection`)은 3A 에서 먼저 고친다.
+* **`minegs eval register` 는 깨져 있다.** `SE3 @ Sim3` 타입 오류로 모든 호출이 실패한다
+  (`cli/eval_cmd.py:180`). 실제 실행으로 확인했다. 즉 "정합 결과를 손으로 manifest 에 붙여 넣는다" 는
+  현재 상태조차 성립하지 않는다 — 붙여 넣을 파일이 만들어지지 않는다.
+* **정합 결과를 적용하는 코드가 없다.** `Registration.sim3` 과 `Scale.factor` 는 호출자가 0 건이다.
+  오늘의 `manifest.registration` 은 claim 게이트의 토큰이지 좌표를 옮기는 변환이 아니다.
+* `diagnose` 는 상수 stub 으로 바꿔도 전체 테스트가 통과한다. 테스트가 있는 것과 검증되는 것은 다르다.
 * video → 360 crop 경로 자체가 없다.
 * image-only dataset 빌더가 없다.
 * registration 결과를 manifest 로 옮기는 자동 경로가 없다 (복사/붙여넣기).
@@ -203,6 +222,62 @@ Phase 3 는 **두 모델을 모두 허용하되, 어느 쪽인지 artifact 가 �
 
 이 결정은 Phase 3B 에서 코드가 된다. 새 알고리즘은 없다: `diagnose` 가 이미 내는 숫자에 **support
 기록과 겹침 판정**을 붙이고, `eval/protocol.py:75` 의 video 규칙을 확장하는 일이다.
+
+#### AD-2.1 — 지금 코드에 있는 leakage 경로 (Phase 3B 가 닫아야 할 목록)
+
+오늘 **활성** 인 누수는 없다. image-only dataset 빌더가 아예 없기 때문이다. 아래는 전부 **잠재**이고,
+Phase 3B 가 그 빌더를 쓰는 순간 실제가 된다. 감사에서 확인한 것만 적는다.
+
+1. **`source="tls"` 하드코딩이 video 게이트를 통째로 우회한다.** `dataset/materialize.py:755`·`:768`.
+   Phase 3 가 새 빌더 대신 `from-e57` 를 재사용하면 manifest 가 `source="tls"` 라고 말하게 되고,
+   그러면 `core/manifest.py:320` 과 `eval/protocol.py:74-83` 의 **video 정합 요구가 둘 다 적용되지
+   않는다**. image-only 재구성이 정합 기록 없이 metric claim 을 받는다. 가장 먼저 닫아야 할 하나.
+2. **holdout 선언 요구가 `sfm_sparse` 에서 건너뛰어진다.** `eval/protocol.py:109` 는
+   `if missing and init.source == "tls"` 다. image-only dataset 은 `init.source="sfm_sparse"` 이므로
+   holdout 구간을 init 제외 목록에 선언하지 않아도 거부되지 않는다.
+3. **정합 기준이 학습 초기화 클라우드를 가리키고 있다.** `configs/dataset/video.yaml:28` 과
+   `video360.yaml:36` 의 `register.reference_tls` 는 동반 TLS dataset 의 **`init_points.ply`** —
+   즉 그 TLS 모델을 학습 초기화한 바로 그 점들이다. 아직 아무도 읽지 않지만, 쓰인 대로 배선하면
+   평가용이 아니라 학습 초기화 기하에 정합하게 된다. 정합 기준은 **평가측 TLS 산출물**이어야 한다.
+4. **init 파일 경로가 자유롭고 dataset hash 밖으로 나갈 수 있다.** `manifest.initialization.file` 은
+   dataset 디렉토리에 붙는 임의 상대경로이고 `core/manifest.py:363` 은 존재 여부만 본다. 반면
+   `train/runner/base.py:35` 의 dataset hash 는 리터럴 `init_points.ply` 만 glob 한다. `../raw/tls_full.ply`
+   를 가리키면 학습 초기화로 읽히면서 dataset hash 에는 잡히지 않는다.
+5. **init 클라우드의 출처를 확인하는 코드가 없다.** `sfm_sparse` 라고 선언하고 TLS PLY 를 놓아도
+   모든 소비자가 믿는다 (`golden_gate.py:218-233` 은 frame 과 bbox 만, `train/staging.py:113` 은
+   frame 이 `UNKNOWN` 이어도 통과).
+6. **`sparse/0/points3D.txt` 는 오늘 TLS 기하의 두 번째 사본이다** (`materialize.py:675-686`), 그리고
+   manifest 에는 points3D 의 출처를 적는 칸이 없다. image-only 경로에서는 여기가 SfM 구조여야 한다.
+7. **staging 은 언제나 init 파일로 points3D 를 대체한다** (`train/staging.py:111`, `use_init_points` 는
+   CLI 에서 끌 수 없다). 반대로 끄면 `init_source="points3D.txt"` 로 기록되는데, 이 저장소가 만들 수
+   있는 모든 dataset 에서 그 파일도 TLS 다 — 즉 "TLS 로 초기화하지 않았다" 고 기록된 run 이 TLS 로
+   초기화된다.
+8. **평가 기준 클라우드의 identity 가 어디에도 안 남는다.** `eval/geometry/evaluate.py` 는 `--tls-ply`
+   를 자유 경로로 받아 frame 과 chainage 만 보고, `GeometryReport` 에 기준 파일의 해시가 없다. 그래서
+   같은 `raw/tls_full.ply` 가 정합 대상이자 평가 기준이어도 **어느 쪽 artifact 에도 흔적이 없다.**
+9. **정합 support 를 적을 칸이 없다.** `diagnose` 는 `n_source` 만 남기고 (`diagnostics.py:52-62`),
+   `Registration` 은 `extra="forbid"` 라 손으로 붙여 넣어도 support 를 표현할 수 없다.
+10. **SfM 출력 디렉토리가 dataset 의 `sparse/0` 과 형태가 같다.** `sfm/base.py:59` 가 만드는
+    `work_dir/sparse/0/*.txt` 는 `core/manifest.py` 가 LOCAL_METRIC 이라고 선언하는 레이아웃과
+    구별되지 않는다. **임의 scale 임을 말하는 표지가 없다** — AD-1 이 필요한 이유다.
+11. **360 crop 의 convention 이 기본값으로 E57 을 사칭한다.** `equirect.py:75` 의 `conv` 기본값은
+    `PanoConvention()` 이고 그 `source` 는 문자열 `"E57Embedded"` 다. 보정 없이 만든 video crop 이
+    E57 에서 온 것처럼 manifest 에 기록되고, `fix_intrinsics: true` 와 고정 rig 외부파라미터까지
+    더해지면 **아무도 측정하지 않은 기하 구속**이 SfM 에 주어진다. golden gate 는 spherical 경로에서
+    orientation 채점을 건너뛰므로 잡히지 않는다.
+12. **`SfMOptions.camera_params`** (`sfm/base.py:21` → `colmap_incremental.py:25`) 는 CLI 에 없지만
+    옵션 하나만 열면 TLS 로 측정한 intrinsics 를 "독립" 재구성에 못 박을 수 있고, 그 사실이 기록되지
+    않는다.
+13. **`ingest/e57/pose_to_colmap.py:21 stations_to_colmap`** 은 TLS station pose 와 `RingCropSpec` 으로
+    완전히 포즈가 잡힌 COLMAP 모델을 만든다. "360 rig 에 초기 포즈를 주자" 는 쉬운 지름길이고, 그
+    지름길은 독립 재구성이 아니다.
+14. **`materialize.py:388-391 sanity_checks`** 는 카메라 중심이 TLS bounding box 밖이면 거부한다 —
+    SfM 모델을 이 빌더에 통과시키면 **TLS 범위가 어떤 카메라를 받아들일지 결정**하게 된다.
+15. **mask 는 학습까지 간다.** `train/runner/base.py:38` 의 dataset hash 가 `masks/**/*` 를 포함하고
+    `train/staging.py:102-106` 이 staged tree 로 복사한다. 오늘 mask 는 TLS 입력이 없다 — 그 상태를
+    유지해야 한다.
+
+이 목록은 §13 의 fail-closed 표로 이어진다.
 
 ### AD-3 — SfM 증거는 artifact 여야 한다
 
@@ -530,6 +605,15 @@ G2 판정 항목:
 | ICP 미수렴 | claim 경로에서 거부 |
 | `init_points` 가 `sfm_id` 와 결속되지 않음 | image-only 빌드 거부 |
 | image-only dataset 에 TLS Golden Gate 를 통과했다고 기록 | 거부 (해당 게이트는 적용 불가) |
+| image-only dataset 이 `source="tls"` 로 기록됨 | 거부 (video 게이트 우회, AD-2.1 §1) |
+| `init.source="sfm_sparse"` 인데 holdout 구간이 init 제외 목록에 없음 | 거부 (`protocol.py:109` 의 구멍) |
+| 정합 기준이 `init_points.ply` 를 가리킴 | 거부 (평가측 산출물이어야 한다) |
+| `initialization.file` 이 dataset hash 밖을 가리킴 | 거부 |
+| `sfm_sparse` 선언과 실제 init 클라우드의 출처 불일치 | 거부 |
+| 평가 기준 클라우드의 identity 미기록 | claim 거부 (겹침을 판정할 수 없다) |
+| 360 crop 의 pano convention 이 보정 없이 기본값 | 거부 (측정하지 않은 기하 구속) |
+| SfM 카메라 intrinsics 가 TLS 측정값으로 고정됨 | 기록 없으면 거부 |
+| TLS station pose 가 image-only 재구성의 초기 포즈로 들어감 | 거부 |
 | `scale.basis` 없음 | metric claim 거부 (기존 동작) |
 | 대체 SfM 으로 만든 결과 | 구조 검증 전용, claim 없음 |
 
@@ -542,11 +626,19 @@ G2 판정 항목:
 * `minegs ingest video` 정리: 360 crop 생성 경로 신설(기존 `crop_equirect` 재사용), mask 생산 경로
   연결(`write_mask` 를 실제로 부르는 길), 선별 결정의 identity.
 * `FrameSetRecord`, `SfmRecord` 도입. `sparse/0` 하드코딩과 다중 component 처리.
+* 눈에 보이는 fail-open 정리: `--mapper` 값 검증, dead field `SfMOptions.mapper`, 비재귀 glob,
+  `--output_path` 디렉토리 생성, vocab tree 없는 `loop_detection`, crop 레이아웃과
+  `single_camera_per_folder` 의 모순.
 * `SFM_INTERNAL` frame 도입과 fail-closed 경계.
 * **metric 주장 없음.** 이 PR 이 끝나도 image-only dataset 은 만들 수 없다.
 
 ### Phase 3B — Metric registration + dataset materialization
 
+* **`minegs eval register` 의 `SE3 @ Sim3` 오류를 먼저 고친다.** 이 명령은 지금 한 번도 성공한 적이
+  없으므로, 3B 의 첫 커밋은 버그 수정과 그 버그를 고정하는 테스트다.
+* `diagnose` 에 실제 테스트를 붙인다 — 상수 stub 이 통과하지 못하도록.
+* 측정된 Sim3 를 **실제로 적용**하는 지점을 하나로 정한다: dataset materialization 에서 한 번
+  (`SFM_INTERNAL` → `TLS_GLOBAL` → `LOCAL_METRIC`). 평가 시점에 변환하지 않는다.
 * `RegistrationRecord`: support·구간·gate·측정된 Sim3 를 artifact 로.
 * `align_correspondences` fallback / 미수렴 ICP / rmse 단독 판정의 fail-closed 처리.
 * leakage 규칙(AD-2)과 `protocol.py` 확장.

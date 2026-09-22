@@ -774,8 +774,11 @@ fail-closed 목록, 3A/3B/3C 분할.
 전체다. 없는 것은 360 **영상**용 crop 생성 경로, mask 생산 경로(`write_mask` 호출자 없음),
 image-only dataset 빌더(`materialize.py` 가 `source="tls"` 를 하드코딩), 그리고 SfM·정합 결과의
 영속 증거다 — `SfMResult` 는 프로세스와 함께 사라지고 registration 결과는 사람이 manifest 에
-복사해 넣는다. 조용한 degrade 도 남아 있다: `sparse/0` 하드코딩, RANSAC 전체 fallback,
-타깃 없을 때의 identity Sim3, 미수렴 ICP 반환. Phase 3 는 이것들을 fail-closed 로 바꾼다.
+복사해 넣는다 — **그 CLI(`minegs eval register`)는 현재 모든 호출이 `SE3 @ Sim3` 타입 오류로
+실패하므로 붙여 넣을 파일조차 만들어지지 않는다**. 정합 결과를 실제로 **적용**하는 코드도 없다
+(`Registration.sim3`·`Scale.factor` 호출자 0 건). 조용한 degrade 도 남아 있다: `sparse/0` 하드코딩,
+`--mapper` 값 미검증, RANSAC 전체 fallback, 타깃 없을 때의 identity Sim3, 미수렴 ICP 반환.
+Phase 3 는 이것들을 fail-closed 로 바꾼다.
 
 ### Phase 4 — Advanced GS / Heavy Profile
 
