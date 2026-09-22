@@ -143,6 +143,23 @@ class Registration(_Strict):
     transform: list[list[float]]  # Sim3 or SE3 4x4, TLS_GLOBAL <- SfM source frame
     n_correspondences: int | None = None
     inlier_threshold_m: float | None = None
+    # --- Phase 3: what the transform was fitted against, and whether that permits a claim.
+    #: The artifact these numbers were copied from, by id and by digest. A registration that
+    #: names no record is a set of numbers somebody typed.
+    registration_id: str | None = None
+    record_sha256: str | None = None
+    sfm_id: str | None = None
+    #: Where the *scale* came from: independent survey control, or the TLS itself.
+    basis: str | None = None
+    #: Every piece of TLS the transform was fitted against — the initial correspondences and
+    #: the ICP target, merged. ``None`` means it was not recorded, which makes overlap with an
+    #: evaluation holdout undecidable (Phase 3 AD-2).
+    support_ranges_m: list[tuple[float, float]] | None = None
+    #: The registration's own verdict. The protocol judge reads it and does not re-derive it,
+    #: but it also does not trust it alone: the overlap with this dataset's holdout is checked
+    #: here, against this dataset's split.
+    claim_allowed: bool | None = None
+    claim_refusals: list[str] = Field(default_factory=list)
 
     @property
     def sim3(self) -> Sim3:

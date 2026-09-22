@@ -36,6 +36,10 @@ DATASET_HASH_PATTERNS = (
     "images/**/*",
     "masks/**/*",
     "centerline.csv",
+    # Phase 3 keeps the frame set, SfM and registration records inside the dataset so they are
+    # inside this hash. Evidence a manifest merely points at can be swapped afterwards with
+    # every recorded digest still matching; evidence in the hashed tree cannot.
+    "provenance/**/*",
 )
 
 

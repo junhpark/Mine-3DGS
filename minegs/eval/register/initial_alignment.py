@@ -39,15 +39,21 @@ def align_correspondences(
     ransac_iters: int = 200,
     inlier_m: float = 0.1,
     seed: int = 0,
-) -> tuple[Sim3, np.ndarray]:
-    """Robust Umeyama: returns (T dst_from_src, inlier mask). Small n -> plain fit."""
+) -> tuple[Sim3, np.ndarray, bool]:
+    """Robust Umeyama: returns (T dst_from_src, inlier mask, whether it fell back).
+
+    When RANSAC cannot find three mutually consistent correspondences it fits every point
+    instead, outliers included. That is sometimes the useful thing to look at and it is never
+    a robust fit, so the third element says it happened: the claim path refuses a registration
+    that was produced this way rather than reporting its confident-looking residual (§Phase 3).
+    """
     src = np.asarray(src, dtype=np.float64).reshape(-1, 3)
     dst = np.asarray(dst, dtype=np.float64).reshape(-1, 3)
     n = len(src)
     if n < 3:
         raise ContractError("need >= 3 correspondences")
     if n <= 4:
-        return umeyama(src, dst, with_scale), np.ones(n, dtype=bool)
+        return umeyama(src, dst, with_scale), np.ones(n, dtype=bool), False
     rng = np.random.default_rng(seed)
     best_mask = np.zeros(n, dtype=bool)
     for _ in range(ransac_iters):
@@ -60,6 +66,7 @@ def align_correspondences(
         mask = err < inlier_m
         if mask.sum() > best_mask.sum():
             best_mask = mask
-    if best_mask.sum() < 3:
+    fell_back = bool(best_mask.sum() < 3)
+    if fell_back:
         best_mask = np.ones(n, dtype=bool)
-    return umeyama(src[best_mask], dst[best_mask], with_scale), best_mask
+    return umeyama(src[best_mask], dst[best_mask], with_scale), best_mask, fell_back

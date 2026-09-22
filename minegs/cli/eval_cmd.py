@@ -142,49 +142,98 @@ def protocol(
 
 @app.command()
 def register(
-    source_ply: Path = typer.Argument(..., help="SfM cloud (arbitrary frame)"),
-    target_ply: Path = typer.Argument(..., help="TLS cloud (TLS_GLOBAL)"),
-    targets: Path | None = typer.Option(None, help="id,x,y,z CSV in the source frame"),
-    targets_tls: Path | None = typer.Option(None, help="id,x,y,z CSV in TLS_GLOBAL"),
+    sfm_dir: Path = typer.Argument(..., help="an SfM artifact from `ingest video sfm`"),
+    out_dir: Path = typer.Argument(..., help="where the registration artifact is written"),
+    basis: str = typer.Option(
+        ...,
+        help="known_target (independent metric evidence) | sim3_to_tls (coordinates read "
+        "off the TLS reference)",
+    ),
+    targets: Path = typer.Option(..., help="id,x,y,z CSV in the reconstruction's own frame"),
+    targets_tls: Path = typer.Option(..., help="id,x,y,z CSV in TLS_GLOBAL"),
+    target_ranges_m: str | None = typer.Option(
+        None, help="chainage the TLS-side targets came from, e.g. '0:20,60:80'"
+    ),
+    icp_target_ply: Path | None = typer.Option(
+        None, help="TLS subset to refine against (TLS_GLOBAL)"
+    ),
+    icp_ranges_m: str | None = typer.Option(None, help="chainage the ICP target covers"),
+    icp_whole_reference: bool = typer.Option(
+        False, help="the ICP target is the whole reference: diagnostic only, never a claim"
+    ),
+    reference_ply: Path | None = typer.Option(None, help="cloud the residuals are measured on"),
     icp_max_dist_m: float = typer.Option(0.5),
     icp_iters: int = typer.Option(50),
-    out: Path | None = typer.Option(
-        None, help="registration JSON (paste into manifest.registration)"
-    ),
+    max_rmse_m: float | None = typer.Option(None, help="quality gate: maximum residual"),
+    min_inlier_ratio: float | None = typer.Option(None, help="quality gate: minimum inliers"),
+    min_correspondences: int | None = typer.Option(None, help="quality gate: minimum matches"),
+    overwrite: bool = typer.Option(False),
 ) -> None:
-    """Sim(3) initial alignment from targets -> SE(3) ICP -> diagnostics (§7)."""
-    from minegs.core.frames import SE3
-    from minegs.core.pointcloud import read_ply
-    from minegs.eval.register import align_correspondences, diagnose, icp_point_to_point
-    from minegs.eval.register.initial_alignment import load_targets_csv, match_by_id
+    """Measure SFM_INTERNAL → TLS_GLOBAL and record what the measurement rests on (§7).
+
+    The transform is a Sim(3): initial alignment from correspondences, optional rigid ICP
+    refinement, composed in that order so the measured scale survives.
+
+    What decides whether the result can carry a metric claim is not the scale's origin but the
+    *support* — every piece of geometry that moved the transform, the ICP target included. An
+    ICP against the whole reference is diagnostic however the targets were obtained, because
+    nothing is then held out from it.
+    """
 
     def go() -> None:
-        src, tgt = read_ply(source_ply), read_ply(target_ply)
-        if targets and targets_tls:
-            a, b, ids = match_by_id(load_targets_csv(targets), load_targets_csv(targets_tls))
-            T0, inl = align_correspondences(a, b, with_scale=True)
-            console.print(
-                f"initial Sim3 from {int(inl.sum())}/{len(ids)} targets: scale={T0.s:.5f}"
-            )
-        else:
-            console.print(
-                "[yellow]no targets given: assuming source is already metric and roughly aligned[/]"
-            )
-            from minegs.core.frames import Sim3
+        from minegs.eval.register.run import register_sfm
 
-            T0 = Sim3.identity()
-        scaled = T0.apply(src.xyz)
-        res = icp_point_to_point(
-            scaled, tgt.xyz, SE3.identity(), max_dist_m=icp_max_dist_m, max_iters=icp_iters
+        thresholds = {
+            k: v
+            for k, v in (
+                ("max_rmse_m", max_rmse_m),
+                ("min_inlier_ratio", min_inlier_ratio),
+                ("min_correspondences", min_correspondences),
+            )
+            if v is not None
+        }
+        rec, root = register_sfm(
+            sfm_dir,
+            out_dir,
+            basis=basis,  # type: ignore[arg-type]
+            targets_sfm=targets,
+            targets_tls=targets_tls,
+            target_ranges_m=_ranges(target_ranges_m),
+            icp_target_ply=icp_target_ply,
+            icp_ranges_m=_ranges(icp_ranges_m),
+            icp_target_is_whole_reference=icp_whole_reference,
+            reference_ply=reference_ply,
+            icp_max_dist_m=icp_max_dist_m,
+            icp_iters=icp_iters,
+            thresholds=thresholds or None,
+            overwrite=overwrite,
         )
-        T = res.T @ T0
-        diag = diagnose(T, src.xyz, tgt.xyz, inlier_m=icp_max_dist_m / 5, method="sim3+icp")
+        d = rec.diagnostics
+        console.print(f"registration [bold]{rec.registration_id}[/] in {root}")
         console.print(
-            f"rmse={diag.rmse_m:.4f} m  inliers={diag.inlier_ratio:.3f}  scale={diag.scale:.5f}  icp_iters={res.iterations}"
+            f"  scale={rec.scale:.5f}  rmse={d.rmse_m:.4f} m  inliers={d.inlier_ratio:.3f}  "
+            f"n={d.n_source}"
         )
-        dump_json(diag.to_manifest(), out)
+        console.print(f"  support: {rec.support_ranges_m}")
+        console.print(f"  metric claim allowed: [bold]{rec.claim_allowed}[/]")
+        for reason in rec.claim_refusals:
+            console.print(f"  [yellow]no claim:[/] {reason}")
 
     run_guarded(go)
+
+
+def _ranges(text: str | None) -> list[tuple[float, float]] | None:
+    """``'0:20,60:80'`` -> [(0, 20), (60, 80)]. ``None`` stays None: unknown is not empty."""
+    if text is None:
+        return None
+    out = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, _, hi = part.partition(":")
+        out.append((float(lo), float(hi)))
+    return out
 
 
 @app.command()
