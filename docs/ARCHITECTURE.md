@@ -107,7 +107,8 @@ BACKEND_INTERNAL                        ← 어댑터가 반드시 역변환해�
   **측정 없이** 선언할 수 있게 된다. 그래서 `SFM_INTERNAL` 을 별도로 두고, 그 프레임에서 나가는
   유일한 출구를 **측정된 Sim(3)** 로 고정한다. 선언은 이 경로에서 거부된다. 계약 전문은
   [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) §3 AD-1, 정합 규칙은 같은 문서 §7.
-  `Frame` enum 에 값이 추가되는 것은 Phase 3A 이며, 그 전까지 이 항목은 결정의 기록이다.
+  구현됨: `Frame.SFM_INTERNAL`, `require_metric_frame()`(`minegs/core/frames.py`), 그리고
+  `resolve_tls_from_source()` 가 이 프레임을 거부한다(`minegs/dataset/frames.py`).
 * `SOURCE` 와 `SCANNER` 는 Phase 0B ingest 전용이며 dataset 계약에 등장하지 않는다. E57 의
   좌표가 `TLS_GLOBAL` 인지는 파일이 말해 주지 않으므로, 그 선언은 dataset materialization
   (Phase 0C, `minegs/dataset/`) 이 명시적으로 한다 — `source_frame.mode: explicit_identity`
@@ -402,4 +403,12 @@ end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced G
   claim 을 거부한다(scale 의 출처가 독립이어도 pose 가 평가 기준을 보고 최적화되면 leakage다);
   image-only dataset 은 같은 dataset 계약을 쓰되 `init_points` 가 SfM sparse 에서 왔음이 **검증**
   되어야 한다. 근거와 reality audit 은 [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md).
+* 2026-09 — Phase 3 구현: image/360 경로가 Phase 2 의 workflow·ledger·report 를 **그대로** 쓴다.
+  `INGEST` 가 frame set·재구성·registration, `DATASET` 이 image-only 빌더가 되고 그 뒤 단계는
+  Phase 2 handler 그대로다 — 학습·depth·surface·sections·volume 의 구현이 하나뿐이어야 두 경로가
+  갈라지지 않는다. 함께 고정한 것 — chainage holdout 은 `init_points.ply` 와 `sparse/0` **양쪽**
+  에서 실제로 제외된다(선언만으로는 부족하고, 학습기가 둘 중 어느 쪽으로도 초기화될 수 있다);
+  360 crop 이름은 view 를 품는다(depth map 이름이 image stem 하나당 하나이므로); frame set 검사는
+  `images/` 를 열거해 record 에 없는 파일을 거부한다(SfM 은 목록이 아니라 디렉토리를 본다).
+  §17 구현 기록 참조.
 * 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.

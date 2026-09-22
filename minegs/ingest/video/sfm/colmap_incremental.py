@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from minegs.ingest.video.sfm.base import SfMBackend, SfMOptions
+from minegs.ingest.video.sfm.base import MATCHERS, SfMBackend, SfMOptions
 
 
 def _common(images_dir: Path, work_dir: Path, opts: SfMOptions) -> list[list[str]]:
@@ -38,11 +38,14 @@ def _common(images_dir: Path, work_dir: Path, opts: SfMOptions) -> list[list[str
                 str(opts.rig_config),
             ]
         )
-    matcher = {
-        "sequential": ["colmap", "sequential_matcher", "--SequentialMatching.loop_detection", "1"],
-        "exhaustive": ["colmap", "exhaustive_matcher"],
-        "vocab_tree": ["colmap", "vocab_tree_matcher"],
-    }[opts.matcher]
+    matcher = list(MATCHERS[opts.matcher])
+    if opts.vocab_tree is not None:
+        # Loop detection is what closes a tunnel traverse that comes back on itself, and it is
+        # a vocabulary-tree search: COLMAP rejects the request when no tree is given, so it is
+        # asked for only when there is one to search.
+        matcher += ["--VocabTreeMatching.vocab_tree_path", str(opts.vocab_tree)]
+        if opts.matcher == "sequential":
+            matcher += ["--SequentialMatching.loop_detection", "1"]
     cmds.append([*matcher, "--database_path", str(db), "--FeatureMatching.use_gpu", gpu])
     return cmds
 

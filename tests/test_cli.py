@@ -172,22 +172,15 @@ def test_cli_missing_dependency_exit_code(tmp_path):
 
 
 def test_cli_dry_runs(tmp_path):
-    assert (
-        runner.invoke(
-            app,
-            [
-                "ingest",
-                "video",
-                "sfm",
-                str(tmp_path),
-                str(tmp_path / "w"),
-                "--dry-run",
-                "--mapper",
-                "global",
-            ],
-        ).exit_code
-        == 0
+    # `video sfm` takes a frame set, not a directory of images: the set is what says which
+    # frames selection kept and what they hashed to, and reconstructing from a bare directory
+    # is exactly the step that used to let a rejected frame back in (Phase 3 §5).
+    refused = runner.invoke(
+        app,
+        ["ingest", "video", "sfm", str(tmp_path), str(tmp_path / "w"), "--dry-run"],
     )
+    assert refused.exit_code == 2
+    assert "frame set" in refused.output or "frameset" in refused.output
     assert (
         runner.invoke(
             app, ["ingest", "e57", "tiles", "a.e57", str(tmp_path), "--dry-run"]

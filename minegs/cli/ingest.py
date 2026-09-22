@@ -429,36 +429,143 @@ def video_frames(
     video: Path = typer.Argument(...),
     out_dir: Path = typer.Argument(...),
     fps: float = typer.Option(2.0),
+    scale_width: int | None = typer.Option(None, help="downscale to this width, keeping aspect"),
+    start_s: float | None = typer.Option(None, help="skip this many seconds of the video"),
+    duration_s: float | None = typer.Option(None, help="extract only this many seconds"),
+    pattern: str = typer.Option("v_%06d.png"),
     dry_run: bool = typer.Option(False),
 ) -> None:
-    """ffmpeg frame extraction."""
+    """ffmpeg frame extraction. For a recorded, selectable set use `video frameset`."""
     from minegs.ingest.video.frames import extract_command, extract_frames
+
+    kw = {
+        "fps": fps,
+        "pattern": pattern,
+        "scale_width": scale_width,
+        "start_s": start_s,
+        "duration_s": duration_s,
+    }
+    kw = {k: v for k, v in kw.items() if v is not None}
 
     def go() -> None:
         if dry_run:
-            console.print(" ".join(extract_command(video, out_dir, fps=fps)))
+            console.print(" ".join(extract_command(video, out_dir, **kw)))
             return
-        console.print(f"extracted {len(extract_frames(video, out_dir, fps=fps))} frames")
+        console.print(f"extracted {len(extract_frames(video, out_dir, **kw))} frames")
 
     run_guarded(go)
 
 
-@video_app.command("select")
-def video_select(
-    frames_dir: Path = typer.Argument(...),
-    blur: float = typer.Option(60.0),
-    hamming: int = typer.Option(6),
+@video_app.command("frameset")
+def video_frameset(
+    source: Path = typer.Argument(..., help="video file, or a directory of images"),
+    out_dir: Path = typer.Argument(..., help="where the frame set artifact is written"),
+    kind: str = typer.Option("video", help="video | video360 | image_set"),
+    fps: float | None = typer.Option(None),
+    scale_width: int | None = typer.Option(None),
+    start_s: float | None = typer.Option(None),
+    duration_s: float | None = typer.Option(None),
+    blur: float = typer.Option(60.0, help="variance-of-Laplacian floor"),
+    hamming: int = typer.Option(6, help="dHash distance below which a frame is a duplicate"),
     max_frames: int | None = typer.Option(None),
-    out: Path | None = typer.Option(None, help="decisions JSON"),
+    n_yaw: int = typer.Option(8, help="360: perspective views around the ring"),
+    fov_deg: float = typer.Option(90.0, help="360: crop field of view"),
+    size: int = typer.Option(1200, help="360: crop width and height"),
+    pitches_deg: str = typer.Option("0", help="360: comma-separated pitches"),
+    yaw_offset_deg: float = typer.Option(0.0),
+    pano_source: str | None = typer.Option(
+        None, help="360: what the panorama convention was derived from (required)"
+    ),
+    pano_vendor: str | None = typer.Option(None),
+    pano_az_sign: int = typer.Option(1),
+    pano_el_flip: bool = typer.Option(False),
+    pano_az_offset_deg: float = typer.Option(0.0),
+    nadir_el_deg: float | None = typer.Option(
+        None, help="mask everything looking below this elevation (tripod, operator)"
+    ),
+    overwrite: bool = typer.Option(False),
 ) -> None:
-    """Blur + duplicate filtering; writes decisions, does not delete."""
-    from minegs.ingest.video.dedup_blur import select_frames
+    """Extract, select, crop and mask one input into the set SfM will be given.
+
+    The artifact it writes is the identity of that set: which video, which settings, which
+    frames survived selection and why, and for 360 which crop was cut from which panorama at
+    which yaw. `ingest video sfm` reads it, so a frame the selector rejected cannot reach the
+    reconstruction and an edited image is not the image that was selected.
+    """
+    from minegs.ingest.common.equirect import RingCropSpec
+    from minegs.ingest.common.geometry import PanoConvention
+    from minegs.ingest.video.build import build_frameset
 
     def go() -> None:
-        paths = sorted(list(frames_dir.glob("*.png")) + list(frames_dir.glob("*.jpg")))
-        dec = select_frames(paths, blur, hamming, max_frames)
-        console.print(f"kept {sum(d.keep for d in dec)} / {len(dec)}")
-        dump_json([d.__dict__ for d in dec], out)
+        from minegs.core.errors import ContractError
+
+        if kind not in ("video", "video360", "image_set"):
+            raise ContractError(f"unknown frame set kind {kind!r} (video, video360, image_set)")
+        ring = convention = None
+        if kind == "video360":
+            pitches = [float(v) for v in pitches_deg.split(",") if v.strip()]
+            ring = RingCropSpec(
+                n_yaw=n_yaw,
+                fov_deg=fov_deg,
+                width=size,
+                height=size,
+                pitches_deg=pitches,
+                yaw_offset_deg=yaw_offset_deg,
+            )
+            if not pano_source:
+                raise ContractError(
+                    "--pano-source is required for a 360 frame set: the panorama convention "
+                    "decides where azimuth zero is and which way elevation runs, and with "
+                    "fixed crop intrinsics it becomes a geometric constraint on the "
+                    "reconstruction. An unmeasured one must not be presented as measured."
+                )
+            convention = PanoConvention(
+                az_sign=pano_az_sign,
+                el_flip=pano_el_flip,
+                az_offset_deg=pano_az_offset_deg,
+                source=pano_source,
+                vendor=pano_vendor,
+            )
+        # What the source *is* decides how the frames arrive; `kind` says what the pictures
+        # are. Reading the directory case off `kind` meant a 360 survey delivered as a folder
+        # of panoramas — already extracted, or exported by the camera — could only be ingested
+        # as `image_set`, which throws away the ring crops that are the whole 360 path.
+        if source.is_dir():
+            video, image_dir = None, source
+        elif source.is_file():
+            video, image_dir = source, None
+        else:
+            raise ContractError(f"{source}: neither a video file nor a directory of images")
+        rec, root = build_frameset(
+            out_dir,
+            kind=kind,  # type: ignore[arg-type]
+            video=video,
+            image_dir=image_dir,
+            fps=fps,
+            scale_width=scale_width,
+            start_s=start_s,
+            duration_s=duration_s,
+            blur_threshold=blur,
+            hamming_threshold=hamming,
+            max_frames=max_frames,
+            ring=ring,
+            pano_convention=convention,
+            nadir_el_deg=nadir_el_deg,
+            overwrite=overwrite,
+        )
+        sel = rec.selection
+        console.print(f"frame set [bold]{rec.frameset_id}[/] in {root}")
+        if sel is not None:
+            console.print(f"  selected {sel.kept} / {sel.considered} frames")
+        if rec.crops:
+            console.print(
+                f"  {len(rec.crops)} crops from {len(set(c.parent_frame for c in rec.crops))} panoramas"
+            )
+        if rec.masks:
+            console.print(f"  {len(rec.masks)} masks")
+        console.print(f"  SfM input: {len(rec.images)} images, digest {rec.images_sha256[:12]}")
+        if not rec.extraction.real_execution:
+            console.print("[yellow]frame extraction was substituted[/]")
 
     run_guarded(go)
 
@@ -470,7 +577,12 @@ def video_rig(
     fov_deg: float = typer.Option(90.0),
     size: int = typer.Option(1200),
 ) -> None:
-    """Write COLMAP rig_config.json for a 360 ring crop."""
+    """Write COLMAP rig_config.json for a 360 ring crop.
+
+    For hand-run COLMAP. The Phase 3 path derives the rig from the frame set's crop records
+    instead, so that the configuration describes the crops that exist rather than the ones a
+    spec says should.
+    """
     from minegs.ingest.common.equirect import RingCropSpec
     from minegs.ingest.video.rig import write_rig_config
 
@@ -483,29 +595,60 @@ def video_rig(
 
 @video_app.command("sfm")
 def video_sfm(
-    images_dir: Path = typer.Argument(...),
-    work_dir: Path = typer.Argument(...),
-    mapper: str = typer.Option("global"),
+    frameset_dir: Path = typer.Argument(..., help="a frame set written by `video frameset`"),
+    out_dir: Path = typer.Argument(..., help="where the reconstruction and its record go"),
+    backend: str = typer.Option("colmap"),
+    mapper: str = typer.Option("global", help="global | incremental"),
+    matcher: str = typer.Option("sequential", help="sequential | exhaustive | vocab_tree"),
     fix_intrinsics: bool = typer.Option(False),
-    rig_config: Path | None = typer.Option(None),
-    masks: Path | None = typer.Option(None),
+    vocab_tree: Path | None = typer.Option(None, help="enables loop detection"),
+    use_gpu: bool = typer.Option(True, "--gpu/--no-gpu"),
+    component: str | None = typer.Option(
+        None, help="which reconstruction to use when COLMAP produced several"
+    ),
     dry_run: bool = typer.Option(False),
+    overwrite: bool = typer.Option(False),
 ) -> None:
-    """Run COLMAP (>= 4.0) SfM; --dry-run prints the commands."""
+    """Run COLMAP (>= 4.0) over a frame set and record what it reconstructed.
+
+    The result is in SFM_INTERNAL: its own coordinates, arbitrary in scale. It becomes metric
+    only through `minegs eval register`, which measures the transform and records what it
+    measured it against. There is no flag here that substitutes the reconstruction.
+    """
+    from minegs.ingest.video.models import check_frameset, load_frameset
     from minegs.ingest.video.sfm import SfMOptions, get_sfm_backend
+    from minegs.ingest.video.sfm.run import run_sfm
 
     def go() -> None:
-        be = get_sfm_backend("colmap", mapper)
+        rec_fs, fs_dir = load_frameset(frameset_dir)
+        check_frameset(rec_fs, fs_dir)
         opts = SfMOptions(
-            mapper=mapper, fix_intrinsics=fix_intrinsics, rig_config=rig_config, masks_dir=masks
-        )  # type: ignore[arg-type]
+            fix_intrinsics=fix_intrinsics,
+            matcher=matcher,  # type: ignore[arg-type]
+            vocab_tree=vocab_tree,
+            use_gpu=use_gpu,
+            masks_dir=rec_fs.mask_root(fs_dir),
+        )
         if dry_run:
-            for c in be.commands(images_dir, work_dir, opts):
+            be = get_sfm_backend(backend, mapper)
+            for c in be.commands(rec_fs.image_root(fs_dir), out_dir, opts):
                 console.print(" ".join(c))
             return
-        r = be.run(images_dir, work_dir, opts)
-        console.print(
-            f"{r.backend}: registered {r.n_registered} images, {r.n_points} points -> {r.sparse_dir}"
+        rec, root = run_sfm(
+            fs_dir,
+            out_dir,
+            backend=backend,
+            mapper=mapper,
+            options=opts,
+            component=component,
+            overwrite=overwrite,
         )
+        console.print(f"sfm [bold]{rec.sfm_id}[/] in {root}")
+        console.print(
+            f"  {rec.registered_images} images, {rec.points} points, "
+            f"component {rec.selected_component} of {len(rec.components)}"
+        )
+        console.print(f"  frame: [bold]{rec.frame}[/] ({rec.metric_state})")
+        console.print(f"  real SfM execution: {rec.real_sfm_execution}")
 
     run_guarded(go)

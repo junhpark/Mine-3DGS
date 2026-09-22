@@ -81,6 +81,20 @@ def judge(manifest: Manifest) -> Judgement:
         elif reg.inlier_ratio <= 0 or reg.rmse_m <= 0:
             metric_ok = False
             refusals.append("registration has no usable quality metrics -> no metric claims (§7)")
+        else:
+            # Phase 3 AD-2. The registration artifact already judged itself against its own
+            # quality gate and its own support; what it could not know is this dataset's
+            # holdout, so the overlap is decided here.
+            if not reg.registration_id:
+                metric_ok = False
+                refusals.append(
+                    "registration block names no registration artifact -> no metric claims: "
+                    "numbers with no record behind them are numbers somebody typed (§Phase 3)"
+                )
+            if reg.claim_allowed is not True:
+                metric_ok = False
+                why = "; ".join(reg.claim_refusals) or "the registration does not permit a claim"
+                refusals.append(f"registration does not permit a metric claim: {why}")
 
     # ---- novel_view
     if split.test_groups:
@@ -106,10 +120,21 @@ def judge(manifest: Manifest) -> Judgement:
             for r in ho.chainage_ranges_m
             if not any(lo <= r[0] and hi >= r[1] for lo, hi in init.excluded_chainage_ranges_m)
         ]
-        if missing and init.source == "tls":
+        if missing:
+            # This used to apply only when the init came from TLS, which exempted exactly the
+            # image-only case: `sfm_sparse` structure covers the holdout chainage as readily as
+            # a scanner does, because the frames that saw it were reconstructed too.
             ok = False
             refusals.append(
                 f"holdout ranges {missing} not declared in initialization.excluded_chainage_ranges_m"
+            )
+        overlap = _registration_overlap(manifest, ho.chainage_ranges_m)
+        if overlap:
+            ok = False
+            refusals.append(
+                f"registration support overlaps the evaluation holdout at {overlap} -> no "
+                "geometry/volume claim: the transform was fitted against the geometry the "
+                "accuracy would be measured on (Phase 3 AD-2). The numbers remain diagnostic."
             )
         if ok and metric_ok:
             protocols.append(Protocol.GEOMETRY_HOLDOUT)
@@ -164,3 +189,22 @@ def require(manifest: Manifest, claim: Claim) -> Judgement:
             f"dataset {manifest.dataset_id!r} (protocol {j.primary.value}) cannot claim {claim.value}: {detail}"
         )
     return j
+
+
+def _registration_overlap(
+    manifest: Manifest, holdout_ranges: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Where the registration support and the evaluation holdout are the same tunnel.
+
+    Support that was never recorded is treated as covering everything, so "we did not write it
+    down" refuses rather than passes. A dataset with no registration (the TLS path) has no
+    support to conflict with.
+    """
+    from minegs.eval.register.models import ranges_overlap
+
+    reg = manifest.registration
+    if reg is None or not holdout_ranges:
+        return []
+    if reg.support_ranges_m is None and reg.registration_id is None:
+        return []
+    return ranges_overlap(reg.support_ranges_m, [tuple(r) for r in holdout_ranges])

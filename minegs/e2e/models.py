@@ -32,12 +32,17 @@ be allowed to say.
 from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from minegs.core.config import VersionedModel
 from minegs.core.provenance import ProvenanceRecord
+from minegs.dataset.from_sfm import SfmDatasetConfig
+from minegs.ingest.common.equirect import RingCropSpec
+from minegs.ingest.common.geometry import PanoConvention
+from minegs.ingest.video.sfm.base import SfMOptions
 
 __all__ = [
     "STAGE_ORDER",
@@ -45,6 +50,7 @@ __all__ = [
     "GeometrySummary",
     "MaturitySummary",
     "Phase2Report",
+    "Phase3Inputs",
     "ReconstructionSummary",
     "RuntimeSummary",
     "SectionSummary",
@@ -91,6 +97,98 @@ class StageStatus(str, Enum):
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class Phase3Inputs(_Strict):
+    """The image/360 survey's settings, as one block (§Phase 3).
+
+    The Phase 3 path replaces what ``ingest`` and ``dataset`` mean — an E57 and a staging tree
+    become a video, a frame set, a reconstruction and a measured registration — but not the
+    stages themselves, and nothing after them. Keeping it in one nested block is what lets the
+    rest of ``E2EConfig`` stay the Phase 2 config it already is: a workflow that sets this is
+    running the image path, one that does not is running the scanner path, and no field means
+    two things depending on which.
+
+    Every option that decides what SfM is fed, what the transform was fitted to and what the
+    dataset declares is here rather than defaulted at the call site, because the stage's input
+    fingerprint is built from this block: a setting the config cannot express is a setting a
+    rerun cannot be shown to have used.
+    """
+
+    # ---- frame set
+    kind: Literal["video", "video360", "image_set"] = "video360"
+    video: str | None = None
+    image_dir: str | None = None
+    #: Where the frame set is written. Defaults to the workflow's own artifact directory.
+    frameset_dir: str | None = None
+    fps: float | None = None
+    scale_width: int | None = None
+    start_s: float | None = None
+    duration_s: float | None = None
+    frame_pattern: str = "v_%06d.png"
+    blur_threshold: float = 60.0
+    hamming_threshold: int = 6
+    max_frames: int | None = None
+    #: The 360 ring. Required for a ``video360`` set: the crops *are* the SfM input.
+    ring: RingCropSpec | None = None
+    #: Never defaulted for a 360 set (``build_frameset`` refuses): the library default names a
+    #: scanner's panorama, and adopting it for a camera would fix an unmeasured azimuth sign.
+    pano_convention: PanoConvention | None = None
+    nadir_el_deg: float | None = None
+    mask_boxes: list[tuple[int, int, int, int]] | None = None
+
+    # ---- reconstruction
+    sfm_dir: str | None = None
+    sfm_backend: str = "colmap"
+    sfm_mapper: str = "global"
+    sfm_options: SfMOptions | None = None
+    #: Which connected component to take when the reconstruction produced more than one.
+    #: Unset means "refuse rather than guess", which is what ``run_sfm`` does.
+    sfm_component: str | None = None
+
+    # ---- registration
+    registration_dir: str | None = None
+    basis: Literal["known_target", "sim3_to_tls"] = "known_target"
+    targets_sfm: str | None = None
+    targets_tls: str | None = None
+    target_ranges_m: list[tuple[float, float]] | None = None
+    icp_target_ply: str | None = None
+    icp_ranges_m: list[tuple[float, float]] | None = None
+    icp_target_is_whole_reference: bool = False
+    icp_max_dist_m: float = 0.5
+    icp_iters: int = 50
+    inlier_m: float | None = None
+    #: No thresholds means no claim (§Phase 3 AD-2). Left unset here on purpose: a number
+    #: invented in a default would be a gate tuned on nothing.
+    registration_thresholds: dict[str, float] | None = None
+
+    # ---- dataset
+    dataset: SfmDatasetConfig
+
+    PATH_FIELDS: ClassVar[tuple[str, ...]] = (
+        "video",
+        "image_dir",
+        "frameset_dir",
+        "sfm_dir",
+        "registration_dir",
+        "targets_sfm",
+        "targets_tls",
+        "icp_target_ply",
+    )
+
+    def resolve_paths(self, base: str | Path) -> Phase3Inputs:
+        """Make relative file references absolute against the config file's directory."""
+        out = self.model_copy(deep=True)
+        for name in self.PATH_FIELDS:
+            value = getattr(out, name)
+            if not value:
+                continue
+            q = Path(value)
+            setattr(out, name, str(q if q.is_absolute() else (Path(base) / q).resolve()))
+        if out.dataset.centerline_file:
+            q = Path(out.dataset.centerline_file)
+            out.dataset.centerline_file = str(q if q.is_absolute() else (Path(base) / q).resolve())
+        return out
 
 
 class StageRecord(_Strict):

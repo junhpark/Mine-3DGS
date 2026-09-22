@@ -134,7 +134,7 @@ def build_report(state: WorkflowState, report_id: str | None = None) -> Phase2Re
         sections=_sections(paired, sv),
         volume=_volume(paired, sv),
         runtime=_runtime(state),
-        maturity=_maturity(state, train, depth),
+        maturity=_maturity(state, train, depth, ingest),
         stages=[_stage_row(state, s) for s in STAGE_ORDER],
         provenance=stamp(dict(state.config), parents=[state.workflow_id]),
     )
@@ -151,6 +151,16 @@ def _source(ingest: dict[str, Any]) -> SourceSummary:
         )
     if ingest and not ingest.get("source_sha256"):
         notes.append("the source digest was not computed, so the survey has no identity here")
+    if ingest.get("mode") == "image_reconstruction":
+        notes.append(
+            "this survey is an image/360 capture: its geometry comes from SfM and enters "
+            "TLS_GLOBAL through the measured similarity recorded below, not from a scanner"
+        )
+        if ingest.get("registration_claim_allowed") is not True:
+            notes.append(
+                "the registration does not permit a metric claim: "
+                + ("; ".join(ingest.get("registration_claim_refusals") or []) or "no reason given")
+            )
     return SourceSummary(
         file_name=ingest.get("source_file_name"),
         sha256=ingest.get("source_sha256"),
@@ -167,6 +177,29 @@ def _source(ingest: dict[str, Any]) -> SourceSummary:
                 "n_images_extracted",
                 "n_images_skipped",
                 "mapping_status_counts",
+                # Phase 3. Absent on the scanner path, which is why they are filtered rather
+                # than defaulted: a zero here would read as "no frames", not "no video".
+                "source_capture",
+                "frameset_id",
+                "frameset_kind",
+                "n_frames_considered",
+                "n_frames_kept",
+                "n_frames_rejected",
+                "frame_extraction_method",
+                "frame_extraction_real",
+                "sfm_id",
+                "sfm_backend",
+                "sfm_registered_images",
+                "sfm_points",
+                "sfm_metric_state",
+                "real_sfm_execution",
+                "registration_id",
+                "registration_basis",
+                "registration_scale",
+                "registration_rmse_m",
+                "registration_inlier_ratio",
+                "registration_support_ranges_m",
+                "registration_claim_allowed",
             )
             if ingest.get(k) is not None
         },
@@ -179,6 +212,13 @@ def _dataset(dataset: dict[str, Any]) -> DatasetSummary:
     notes = list(dataset.get("refusals") or [])
     if dataset and dataset.get("golden_gate_passed") is not True:
         notes.append(f"golden gate: {dataset.get('golden_gate_result')}")
+    kind = dataset.get("golden_gate_kind")
+    if kind:
+        notes.append(
+            f"golden gate kind: {kind} — this dataset has no station scans, so the gate is the "
+            "reconstruction's own visibility plus the reference projected through its "
+            "registered cameras, awaiting human inspection"
+        )
     return DatasetSummary(
         dataset_id=dataset.get("dataset_id"),
         dataset_hash=dataset.get("dataset_hash"),
@@ -337,7 +377,10 @@ def _runtime(state: WorkflowState) -> RuntimeSummary:
 
 
 def _maturity(
-    state: WorkflowState, train: dict[str, Any], depth: dict[str, Any]
+    state: WorkflowState,
+    train: dict[str, Any],
+    depth: dict[str, Any],
+    ingest: dict[str, Any] | None = None,
 ) -> MaturitySummary:
     complete = all(state.stages[s].usable for s in STAGE_ORDER if s is not Stage.REPORT)
     notes: list[str] = []
@@ -354,6 +397,17 @@ def _maturity(
         notes.append("training was substituted, so no real GPU executed this workflow")
     if not depth.get("real_renderer_execution"):
         notes.append("depth was substituted, so GsplatDepthRenderer.render did not execute")
+    # Presence-checked rather than truthiness-checked: the scanner path has no SfM and no frame
+    # extraction, and reporting those as substituted would be a note about something that was
+    # never part of this workflow.
+    ing = ingest or {}
+    if "real_sfm_execution" in ing and not ing["real_sfm_execution"]:
+        notes.append(
+            "SfM was substituted, so no reconstruction engine ran and the reconstruction's "
+            "geometry is the stand-in's"
+        )
+    if "frame_extraction_real" in ing and not ing["frame_extraction_real"]:
+        notes.append("frame extraction was substituted, so no decoder produced these frames")
     return MaturitySummary(
         structural_status="implemented_and_structurally_tested" if complete else "incomplete",
         # Never set from here. A workflow cannot validate itself, and the value a human sets

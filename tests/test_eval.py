@@ -92,8 +92,13 @@ def test_umeyama_and_ransac(rng):
     assert np.isclose(est.s, 1.02) and np.allclose(est.apply(src), dst, atol=1e-9)
     dst_out = dst.copy()
     dst_out[:5] += 3.0  # outliers
-    est2, mask = align_correspondences(src, dst_out, inlier_m=0.05)
-    assert mask.sum() == 25 and np.isclose(est2.s, 1.02, atol=1e-6)
+    est2, mask, fell_back = align_correspondences(src, dst_out, inlier_m=0.05)
+    assert mask.sum() == 25 and np.isclose(est2.s, 1.02, atol=1e-6) and not fell_back
+    # Too few consistent correspondences: the fit still returns something, using every point,
+    # and says so. Silently reporting that as a robust fit is what the flag exists to stop.
+    scattered = rng.normal(size=(30, 3)) * 5.0
+    _, all_mask, fell_back2 = align_correspondences(src, scattered, inlier_m=1e-6)
+    assert fell_back2 and all_mask.all()
 
 
 def test_icp_recovers_pose_and_diagnostics(synthetic):

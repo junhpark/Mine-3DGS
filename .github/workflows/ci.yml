@@ -170,6 +170,74 @@ jobs:
           fi
           test ! -d /tmp/stg/bad
           echo 'phase 0c fail-closed smoke ok'
+          # Phase 3: the image/360 path as far as a runner without COLMAP or ffmpeg can go.
+          # The frame set is real — real selection, real ring crops, real masks, real digests —
+          # and everything past it is checked for refusing rather than degrading.
+          mkdir -p /tmp/p3/frames
+          python -c "
+          import numpy as np
+          from PIL import Image
+          rng = np.random.default_rng(0)
+          for i in range(4):
+              a = np.sin(np.linspace(0, 8, 64))[None, :, None] * 60 + rng.integers(0, 160, (32, 64, 3))
+              Image.fromarray(a.clip(0, 255).astype('uint8')).save(f'/tmp/p3/frames/v_{i:06d}.png')"
+          minegs ingest video frameset /tmp/p3/frames /tmp/p3/fs --kind video360 \
+            --n-yaw 4 --fov-deg 90 --size 32 --pano-source Configured --nadir-el-deg -30 \
+            --blur 0.0 --hamming 0
+          python -c "
+          from pathlib import Path
+          from minegs.ingest.video.models import check_frameset, load_frameset
+          rec, root = load_frameset('/tmp/p3/fs')
+          assert rec.kind == 'video360' and rec.pano_convention.source == 'Configured'
+          assert rec.extraction.method == 'none' and rec.extraction.real_execution is True
+          assert len(rec.images) == 16 and len(rec.crops) == 16 and len(rec.masks) == 16
+          stems = [Path(i.name).stem for i in rec.images]
+          assert len(set(stems)) == 16, 'two crops of one panorama want one depth map name'
+          check_frameset(rec, root)
+          print('phase 3 frame set smoke ok')"
+          # a 360 frame set must not borrow the scanner's panorama convention, or run without one
+          if minegs ingest video frameset /tmp/p3/frames /tmp/p3/fs2 --kind video360 --n-yaw 4; then
+            echo 'a 360 frame set was built with no declared panorama convention'; exit 1
+          fi
+          if minegs ingest video frameset /tmp/p3/frames /tmp/p3/fs3 --kind video360 --n-yaw 4 \
+               --pano-source E57Embedded; then
+            echo "a camera's frame set adopted the scanner's panorama convention"; exit 1
+          fi
+          # SfM is given the directory, not the list, so a file put there afterwards is refused
+          cp "$(find /tmp/p3/fs/images/p0y00 -name '*.png' | head -1)" \
+            /tmp/p3/fs/images/p0y00/smuggled.png
+          python -c "
+          from minegs.core.errors import ContractError
+          from minegs.ingest.video.models import check_frameset, load_frameset
+          try:
+              check_frameset(*load_frameset('/tmp/p3/fs'))
+          except ContractError as e:
+              assert 'not in the record' in str(e), e
+              print('phase 3 stowaway smoke ok')
+          else:
+              raise SystemExit('an image nobody recorded reached the SfM input set')"
+          rm /tmp/p3/fs/images/p0y00/smuggled.png
+          # no COLMAP here: the refusal must be about COLMAP, and must leave nothing behind
+          if minegs ingest video sfm /tmp/p3/fs /tmp/p3/sfm > /tmp/p3/sfm.out 2>&1; then
+            echo 'SfM reported success without COLMAP'; cat /tmp/p3/sfm.out; exit 1
+          fi
+          grep -q 'colmap' /tmp/p3/sfm.out || { echo 'wrong reason:'; cat /tmp/p3/sfm.out; exit 1; }
+          test ! -e /tmp/p3/sfm || { echo 'a reconstruction that never ran left a directory'; exit 1; }
+          # registration is a measurement: without correspondences there is nothing to measure
+          if minegs eval register /tmp/p3/fs /tmp/p3/reg --basis known_target; then
+            echo 'registration ran with no correspondences'; exit 1
+          fi
+          # each golden gate refuses the dataset it has no evidence for
+          if minegs dataset golden-gate /tmp/stg/dataset --out /tmp/p3/gg; then
+            echo 'a TLS dataset got a gate without its station scans'; exit 1
+          fi
+          # and a comparison is between two reconstructions, not one against itself
+          if minegs eval compare-paths /tmp/stg/dataset /tmp/stg/dataset \
+               --tls-sections /tmp/p3/x.json --tls-reference-sections /tmp/p3/x.json \
+               --image-sections /tmp/p3/x.json --image-reference-sections /tmp/p3/x.json; then
+            echo 'a dataset was compared against itself'; exit 1
+          fi
+          echo 'phase 3 fail-closed smoke ok'
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

@@ -613,6 +613,91 @@ G2 라고 부르지 않는다.
 > Real-data scientific validation remains NOT VALIDATED.
 > Phase 2 G2 remains PENDING.
 
+## Image / 360 독립 재구성 (Phase 3)
+
+TLS 초기 형상 없이 영상만으로 만든 재구성을, 측정된 Sim(3) 하나로 측량 좌표에 넣고, **같은**
+학습·depth·surface·단면·체적 경로로 평가한다. 계약은 [docs/PHASE3_CONTRACT.md](docs/PHASE3_CONTRACT.md).
+
+```bash
+# 1. 프레임 집합 — SfM 이 무엇을 먹는지가 디렉토리 레이아웃이 된다
+minegs ingest video frameset drift.mp4 work/fs --kind video360 --fps 2 \
+    --n-yaw 8 --fov-deg 90 --size 1600 \
+    --pano-source Configured --pano-az-sign 1 --nadir-el-deg -35
+
+# 2. 재구성 — 그 프레임 집합에서만
+minegs ingest video sfm work/fs work/sfm --backend colmap --mapper global
+
+# 3. 정합 — 측정이다. 대응이 없으면 거부한다
+minegs eval register work/sfm work/reg --basis known_target \
+    --targets targets_sfm.csv --targets-tls targets_tls.csv \
+    --reference-ply raw/tls_full.ply \
+    --max-rmse-m 0.05 --min-inlier-ratio 0.6 --min-correspondences 6
+
+# 4. dataset — init 은 이 재구성 자신의 점
+minegs dataset from-sfm work/fs work/sfm work/reg data/driftA/dataset \
+    --dataset-id driftA_v360 --source video360 --holdout-m 30:38 --centerline design.csv
+
+# 5. image-only Golden Gate — station scan 이 없으므로 다른 증거로 본다
+minegs dataset golden-gate data/driftA/dataset --out gg --reference-ply raw/tls_full.ply
+
+# 6. 두 경로 비교 — 같은 grid, 같은 holdout, 둘 다 관측한 구간에서만
+minegs eval compare-paths data/tls/dataset data/driftA/dataset \
+    --tls-sections a.json --tls-reference-sections b.json \
+    --image-sections c.json --image-reference-sections d.json --out cmp
+```
+
+읽는 법:
+
+* **`SFM_INTERNAL` 은 `SOURCE` 가 아니다.** 재구성 좌표는 scale 까지 임의이고, `TLS_GLOBAL` 로
+  나가는 유일한 출구는 **측정된** Sim(3) 다. `SOURCE` 문은 선언이고 SE(3) 만 돌려주므로 임의 scale
+  재구성을 통과시키면 "이 좌표가 곧 측량 기준" 을 측정 없이 선언하게 된다 — 그래서 거부된다.
+* **정합 support 는 ① 초기 대응 ∪ ② ICP target 이다.** `--basis known_target` 은 *scale* 의 출처를
+  말하지 pose 의 출처를 말하지 않는다. 타깃으로 scale 을 잡고 전체 TLS 로 pose 를 refine 하면 결과는
+  **diagnostic** 이다 — 전체와 겹치지 않는 holdout 은 없기 때문이다. support 범위를 기록하지 않으면
+  holdout 과의 겹침을 판정할 수 없고, 판정할 수 없으면 거부다.
+* **threshold 가 없으면 claim 도 없고, 불완전해도 없다.** claim 을 지는 게이트는
+  `max_rmse_m`·`min_inlier_ratio`·`min_correspondences` 셋 다 필요하다 — 각각은 혼자서는 눈이
+  멀었다. `{}` 는 관대한 게이트가 아니라 **판정했다고 기록되었으나 아무것도 보지 않은** 게이트라
+  이유와 함께 거부된다. 실측 전에 발명한 숫자는 아무 데이터도 근거하지 않은 threshold 라 더 나쁘다.
+* **claim 은 읽는 것이 아니라 다시 도출된다.** `claim_allowed` 는 결론이므로 `registration.json`
+  을 다시 열 때마다 품질 게이트와 함께 **재계산**해 기록된 값과 대조한다. manifest 가 들고 있는
+  사본도 record 와 전부 대조한다 — protocol judge 가 읽는 것은 manifest 쪽이다.
+* **init 이 재구성에서 왔다는 것은 원본과 대조해 증명된다.** dataset 안의 두 cloud 를 서로
+  비교하는 것은 같은 주장의 사본 두 개일 뿐이다. 선택된 SfM model 이
+  `provenance/phase3/sfm_model/` 에 번들되고, 거기서 측정된 Sim(3) → local origin → holdout
+  제외를 다시 밟아 `init_points.ply`·`sparse/0`·카메라 중심을 대조한다.
+* **holdout 은 선언이 아니라 사실이다.** image-only 경로에서 init cloud 는 재구성 그 자체이므로,
+  `init_points.ply` 와 `sparse/0` **양쪽**에서 holdout chainage 의 점을 뺀다.
+  `--holdout-images-excluded`(외삽 시험) 를 켜면 holdout 과 **겹치는** capture group 이 빌드
+  시점에 `train_groups` 에서 빠지고, chainage 를 잴 수 없는 그룹이 있으면 거부한다. 겹침은 그룹의
+  **구간**(`chainage_range_m`, 멤버 chainage 의 최소·최대) 으로 판정한다 — traverse 그룹은 갱도의
+  한 점이 아니라 한 구간이고, 중앙만 보면 한쪽 끝이 holdout 안에 들어간 그룹을 놓친다. 기본값은
+  **꺼짐**(복원 시험) 이다 — 플래그를 안 줬다는 이유로 더 강한 실험이라고 기록되면 안 된다.
+* **`golden-gate` 는 dataset 의 source 를 보고 갈라진다.** image-only 판은 `gate_kind:
+  image_sfm_registered` 를 적고, `real_data_validation_status` 는 언제나
+  `pending_human_inspection` 이다 — 사람이 볼 때까지.
+* **`compare-paths` 는 먼저 거부하고 나중에 비교한다.** 같은 grid 에서 잘리지 않았거나 서로 다른
+  holdout 으로 평가된 두 경로는 비교하지 않는다. 체적은 둘이 **함께 관측한** 구간에서만 적분되고,
+  빠진 구간은 보고된다.
+* **`real_execution` 은 경로별로 판정된다.** TLS 쪽과 image 쪽의 필수 stage 목록이 다르므로
+  따로 본다. flag 를 합치면 한쪽의 `true` 가 다른 쪽의 `false` 를 덮어쓰고, 목록에 없는 stage 는
+  아무도 보고하지 않은 채 통과한다. 없는 key 는 "모른다" 이고, 모르면 거짓이다.
+* **CLI 에 SfM·프레임 추출을 대체하는 flag 는 없다.** trainer/renderer 와 같은 규칙이다.
+
+### 지금 검증된 것과 아닌 것
+
+`tests/test_phase3_gate.py` 가 합성 갱도 하나를 스캐너와 파노라마 양쪽으로 재구성하고, 실제 선별·
+crop·mask·프레임 집합 검사·실제 정합·실제 image-only 빌더·실제 validator·실제 protocol judge 를
+관통한 뒤 두 경로를 비교한다. 대체되는 것은 네 hardware seam — **SfM·프레임 추출·trainer·
+renderer** — 이고 전부 기록된다. T1–T30 이 거부를 고정한다.
+
+**REAL COLMAP EXECUTION: NOT PERFORMED.** 이 저장소에서 COLMAP 은 한 번도 실행되지 않았다.
+
+> Phase 3 image/360 independent reconstruction path is implemented and structurally tested.
+> Real-data scientific validation remains NOT VALIDATED.
+> Phase 3 G2 remains PENDING.
+
+
 ## 평가 주장 게이트 (§5)
 
 `minegs eval protocol <dataset>` 이 manifest 의 `split`/`initialization` 만 보고 주장 가능 범위를 판정한다.
@@ -636,7 +721,7 @@ G2 라고 부르지 않는다.
 | 0D Local GS baseline | **0D.1 resume safety contract** + **0D.2 local GPU baseline execution contract: implemented + structurally tested** — gsplat v1.5.3 training resume 은 unsupported 이고 fail closed; 성공한 run 은 checkpoint·PLY·step 진행·frame invariant 를 모두 통과한 것만 기록된다. **실제 GPU baseline 미실행** → 0D 전체 **NOT COMPLETE** (ROADMAP §Phase 0D) |
 | 1 Metric surface & evaluation | **1A metric surface artifact + depth fusion**, **1B metric depth rendering**, **1C section/volume evidence boundary: implemented + structurally tested** — 학습된 run → 렌더 depth + manifest → 검증된 surface artifact → section artifact → gap-safe 체적 → claim. 검증된 manifest 가 있을 때만 `minegs_render` 이고, 외부 depth·원시 PLY·bare series 는 diagnostic 전용이다. 결측 구간을 가로지르는 적분은 없다. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), **TSDF/mesh: NOT IMPLEMENTED**, 실측 데이터 과학적 검증: **NOT VALIDATED** |
 | 2 E57 end-to-end MVP (v0.1) | **implemented + structurally tested** — `minegs e2e run` / `status` / `report` 가 E57 한 개를 ingest→dataset→train→depth→surface→geometry→단면/체적→report 로 관통한다. stage 마다 입력 identity 를 다시 읽어 대조하므로 움직인 입력 위에 조용히 쌓지 않는다. 복원과 held-out TLS 를 같은 grid 에서 pair 하고 공통 구간에서만 체적을 비교한다. structural gate 는 테스트 시점에 쓴 실제 E57 에서 돌지만 **trainer·renderer 는 대체**되고 그 사실이 report 에 남는다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** ([runbook](docs/PHASE2_E57_G2.md)) |
-| 3 Image/360 독립 재구성 | 부분 — 커맨드 빌더·rig·Sim3 정합 구현, 미검증 |
+| 3 Image/360 독립 재구성 | **implemented + structurally tested** — 영상/360 → 프레임 집합 → SfM(`SFM_INTERNAL`, 임의 scale) → 측정된 Sim(3) 정합 → image-only dataset → 기존 학습·depth·surface·단면·체적 → TLS-assisted 대비 공통 구간 비교. 초기화는 재구성 자신의 점이고 holdout 구간은 실제로 빠진다. **실제 COLMAP·GPU·렌더러·실측 영상 미실행** — 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 남는다. **Phase 3 G2: PENDING**, 실측 과학적 검증: **NOT VALIDATED** |
 | 4 Advanced GS / heavy | 미착수 — `depth_loss`·`normalize_world_space` 를 여기서 설계 |
 | 5 장거리 갱도 · 청킹 | 예약만 (manifest.chunks) |
 | 6 RunPod | **미구현, fail-closed** |

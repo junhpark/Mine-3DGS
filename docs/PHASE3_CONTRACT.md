@@ -331,7 +331,9 @@ image-only dataset 은 기본적으로 `geometry_diagnostic` 이다. `geometry_a
 
 1. `RegistrationRecord` 가 있고 품질 게이트를 통과한다 (§7).
 2. AD-2 의 leakage 규칙을 통과한다.
-3. `scale.basis` 가 `known_target` 이거나, `sim3_to_tls` 이면서 support ∩ holdout = ∅ 이다.
+3. `scale.basis` 가 무엇이든 **support ∩ holdout = ∅** 이다. `known_target` 은 *scale* 의 출처를
+   말하지 pose 의 출처를 말하지 않으므로, 타깃으로 scale 을 잡았더라도 TLS 로 pose 를 refine 했다면
+   그 TLS 가 support 다 (AD-2). TLS support 가 전혀 없으면 support 는 빈 집합이고 overlap 도 없다.
 4. Phase 1A/1B/1C 사슬을 그대로 통과한다 — 검증된 `minegs_render` depth 에서 나온 verified surface,
    재현되는 sections, gap-safe volume. **Gaussian center 를 surface 로 쓰지 않는다.**
 5. 학습이 holdout 이미지·구간을 보지 않았다 (기존 `split` / `init.excluded_chainage_ranges_m` 규칙).
@@ -549,7 +551,9 @@ video/이미지 (digest)
 | registration 있으나 품질 게이트 미달 | diagnostic | 없음 |
 | `sim3_to_tls`, support ∩ holdout ≠ ∅ | diagnostic | **없음** |
 | `sim3_to_tls`, support ∩ holdout = ∅, 게이트 통과 | claim 가능 | `geometry_accuracy`, `volume_accuracy` |
-| `known_target`, 게이트 통과 | claim 가능 | `geometry_accuracy`, `volume_accuracy` |
+| `known_target`, TLS support 없음, AD-2 leakage gate + 품질 게이트 통과 | claim 가능 | `geometry_accuracy`, `volume_accuracy` |
+| `known_target`, 선언된 TLS 부분집합 ICP, support ∩ holdout = ∅, 두 게이트 통과 | claim 가능 | `geometry_accuracy`, `volume_accuracy` |
+| `known_target` + 전체 TLS ICP | diagnostic | **없음** (basis 는 pose 의 출처를 말하지 않는다) |
 | 위 모두 + 검증된 surface 사슬 없음 | diagnostic | 없음 |
 | 합성 데이터 / 대체 SfM | 구조 검증 | **어떤 과학적 claim 도 없음** |
 
@@ -748,3 +752,168 @@ reality audit 결과 3A 를 더 쪼갤 이유는 보이지 않는다 — 360 cro
 5. **COLMAP 버전 호환.** `global_mapper` / `rig_configurator` / `--FeatureExtraction.use_gpu` 등은
    문자열로만 검증되어 있다. 실제 COLMAP 과 처음 만나는 순간은 Phase 3A 이고, 거기서 플래그가 틀리면
    계약이 아니라 명령을 고친다.
+
+---
+
+## 17. 구현 기록 — `phase-3-image360`
+
+§1–§16 은 C0 freeze 그대로 둔다. 이 절은 그 계약에 맞춰 실제로 구현된 것과, **구현 중에 계약이
+틀렸거나 비어 있던 곳**을 기록한다. 계약이 판정 기준이므로, 어긋난 곳은 여기서 명시한다.
+
+### 17.1 분할 변경
+
+§14 는 3A/3B/3C 세 PR 로 나눠 두었다. Product Owner 지시로 **하나의 branch·하나의 PR** 로
+구현했다. 내부 체크포인트 C1–C4 는 §14 의 경계를 그대로 따르고(C1 = 3A, C2/C3 = 3B, C4 = 3C),
+각 체크포인트는 별도 commit 으로 남아 있어 순서대로 읽을 수 있다. 분할의 근거였던 "metric 주장이
+시작되는 지점" 은 commit 경계로 보존된다.
+
+### 17.2 만들어진 것
+
+| 계약 | 구현 |
+|---|---|
+| §5 `FrameSetRecord` | `minegs/ingest/video/models.py`, 빌더 `.../build.py` |
+| §6 `SfmRecord` | `minegs/ingest/video/sfm/models.py`, 실행 `.../sfm/run.py` |
+| §7 `RegistrationRecord` | `minegs/eval/register/models.py`, 측정 `.../register/run.py` |
+| §8 dataset 변환 | `minegs/dataset/from_sfm.py` |
+| §7.1 image-only Golden Gate | `minegs/dataset/golden_gate_sfm.py` |
+| §14(3C) 구조 게이트 | `minegs/e2e/phase3.py` + `tests/test_phase3_gate.py` |
+| §14(3C) 비교 | `minegs/eval/compare/paths.py` |
+
+CLI: `minegs ingest video frames|frameset|rig|sfm`, `minegs eval register`,
+`minegs dataset from-sfm`, `minegs dataset golden-gate`(source 에 따라 분기),
+`minegs eval compare-paths`. `minegs ingest video select` 는 없어졌다 — 선별 결과가 디렉토리
+레이아웃이 되었으므로 독립 명령으로 남을 이유가 없다.
+
+Phase 3 workflow 는 Phase 2 의 `Stage` 열거와 ledger 를 **그대로** 쓴다. `INGEST` 가 프레임
+집합·재구성·registration 이 되고 `DATASET` 이 image-only 빌더가 될 뿐, `TRAIN`–`REPORT` 는 Phase 2
+handler 그대로다. 학습·depth·surface·geometry·sections·volume 의 구현은 하나뿐이고, 두 경로가
+따로 흐를 수 없다.
+
+### 17.3 대체된 seam (§11 표의 실제 값)
+
+| seam | 이 저장소에서 | 기록되는 곳 |
+|---|---|---|
+| frame extraction | `copy_extractor` — ffmpeg 없음 | `ExtractionRecord.real_execution: false` |
+| SfM | 테스트 stand-in — COLMAP 없음 | `SfmRecord.real_sfm_execution: false` |
+| trainer | Phase 2 stand-in — GPU 없음 | `real_gpu_execution: false` |
+| renderer | Phase 2 stand-in — CUDA 없음 | `real_renderer_execution: false` |
+
+네 개 모두 Python 에서만 주입된다. CLI 에 여는 플래그는 없다. 넷 다 report 의 maturity note 로
+올라오고, `eval compare-paths` 의 `real_execution` 은 **선언된 플래그가 전부 있고 전부 참일 때만**
+참이다 — 아무도 보고하지 않은 단계는 "대체되지 않았다" 가 아니라 "모른다" 이고, 모르면 거짓이다.
+
+**REAL COLMAP EXECUTION: NOT PERFORMED.** 이 저장소에서 COLMAP 은 한 번도 실행되지 않았다.
+`colmap_incremental` / `colmap_global` 의 argv 는 문자열 수준에서만 검증되어 있다(§16.5).
+"SfM validated" 라고 쓸 수 있는 근거는 없다.
+
+### 17.4 §11 의 S1–S11 이 어디에 있는가
+
+| S | 테스트 |
+|---|---|
+| S1 | T1, T2 |
+| S2 | T24 |
+| S3 | T18 |
+| S3b | T16 |
+| S4 | T21 |
+| S5 | T9 |
+| S6 | `tests/test_eval.py` 의 registration scale 회복 + T-gate `test_registration_recovers_the_scale_nothing_told_it` |
+| S7 | T15, T17, T19 |
+| S8 | `run_sfm` 의 다중 component 거부 (`tests/test_cli.py`) |
+| S9 | T10 |
+| S10 | T29, T30 |
+| S11 | `test_the_report_says_what_was_substituted_and_claims_nothing`, `test_the_comparison_refuses_to_be_read_as_a_measurement`, T34, T34b |
+
+### 17.5 계약이 비어 있던 곳 — 구현 중 발견
+
+1. **holdout 이 선언만 되고 제외되지 않았다.** §8 은 `init.excluded_chainage_ranges_m` 에 holdout 을
+   적게 했지만, image-only 경로에서 init cloud 는 **재구성 그 자체**다. 구간의 점을 남겨두면
+   holdout 이 학습에서 빼놓은 프레임으로 삼각측량된 구조를 모델에 그대로 넘겨주면서, manifest 는
+   빼놓았다고 말한다. `init_points.ply` 와 `sparse/0` 를 chainage 로 걸러 넣었다. 둘 다 거른 이유는
+   `stage_dataset(use_init_points=False)` 가 `sparse/0` 로 초기화할 수 있기 때문이다 — 두 경로 중
+   하나만 지키는 제외는 제외가 아니다.
+2. **360 crop 의 stem 이 겹쳤다.** `p0y00/v_07.png` 와 `p0y01/v_07.png` 는 Phase 1B 의 depth 이름
+   규약(§stem 하나에 map 하나)에서 같은 `v_07.npy` 를 요구한다. 한쪽 렌더가 다른 쪽을 덮어쓰고 두
+   view 가 같은 map 을 back-project 했을 것이다. crop 이름이 view 를 품도록 바꿨다. Phase 1B 계약은
+   건드리지 않았다 — 고칠 곳은 이름을 만드는 쪽이다.
+3. **frame set 이 밀항자를 잡지 못했다.** `check_frameset` 은 record 가 **적은** 이미지의 digest 만
+   검사했고, SfM 은 그 목록이 아니라 `images/` 디렉토리를 glob 한다. 나중에 복사해 넣은 파일은 모든
+   digest 가 맞은 채로 재구성에 들어갔다. 이제 디렉토리를 열거해 record 에 없는 이미지를 거부한다.
+   §5 가 "선별이 레이아웃의 성질" 이라고 말한 것을 실제로 성질로 만든 것은 이 검사다.
+4. **image-only gate 의 가시성 기준이 틀렸다.** 카메라별 하한은 긴 갱도의 올바른 재구성을 떨어뜨린다
+   — 갱도에서 모든 view 는 자기 주변만 보고, 갱구의 view 는 바깥의 어둠을 본다. 잡아야 할 실패는
+   "**모든** 카메라가 아무것도 못 본다" 이므로, 중앙값과 blind 비율로 판정하고 분포는 어느 쪽이든
+   report 에 남긴다.
+
+### 17.5b 독립 검토(round 1) 가 찾은 claim boundary 구멍 4건
+
+§17.5 의 4건은 구현 중에 찾은 것이고, 아래 4건은 **첫 독립 검토**가 찾았다. 전부 "기능이 안
+돌아간다" 가 아니라 **claim/provenance 를 우회할 수 있는 경로**였다. 공통 원인은 하나다 —
+*결론을 다시 도출하지 않고 읽었다*.
+
+1. **registration 의 claim 을 재도출하지 않았다.** `decide_claim()` 은 생성 시 한 번 실행되고,
+   `claim_allowed` / `claim_refusals` / `support_ranges_m` 는 그 결론이다. `check_registration()`
+   은 그 결론을 되읽기만 했고, 품질 게이트의 판정은 `quality_gate.json` 이라는 **record 밖 파일**
+   에 있어서 재도출할 재료조차 없었다. → `QualityGate` 를 `RegistrationRecord` 안으로 옮기고,
+   `check_registration()` 이 `evaluate_gate()` 와 `decide_claim()` 을 **다시 실행**해 기록된
+   결론과 대조한다. 어긋나면 거부.
+   덧붙여 **manifest 의 사본**이 record 와 같은지도 검사하지 않았다 — protocol judge 는 record 가
+   아니라 manifest 를 읽는다. record digest 가 맞아도 manifest 쪽 `claim_allowed` 만 뒤집으면
+   측정이 거부한 claim 이 허용되었다. → `CLAIM_BEARING_FIELDS` 전부를 record 와 대조한다.
+2. **"숨은 TLS init 없음" 이 원본 SfM 에 묶여 있지 않았다.** `_check_init_is_sfm_geometry` 는
+   `init_points.ply` 를 **같은 dataset 안의** `sparse/0` 와 비교했다. 둘 다 같은 TLS geometry 로
+   바꾸면 서로 완벽히 일치하므로 통과했다. 한 주장의 사본 두 개는 그 주장의 증거가 아니다.
+   → 선택된 SFM_INTERNAL model 을 `provenance/phase3/sfm_model/` 에 **번들**하고(digest 로 고정),
+   거기서 측정된 Sim(3) → local origin → holdout 제외 순서로 **다시 도출**해 dataset 의 두 cloud
+   와 **카메라 중심**까지 대조한다. 포즈까지 보는 이유는 점만 보면 view 를 갈아끼울 수 있기 때
+   문이고, 이것이 golden gate 를 대체하지는 않는다 — 원본 재구성 자체가 어긋난 경우는 여기서
+   충실히 재현되고 **눈으로 보는 쪽**에서 걸린다.
+3. **`images_excluded=True` 가 실제 train split 과 연결되지 않았다.** `train_images()` 가 읽기
+   시점에 걸러 주기는 하지만 chainage 를 **아는** 그룹만 거르고, 못 재는 그룹은 **남긴다**. 즉
+   manifest 는 외삽 시험이라고 기록하면서 holdout 안의 그룹이 학습에 들어갈 수 있었다. CLI 에는
+   플래그조차 없어 기본값 `True` 가 자동 적용되었다. → 기본값을 **`False`(복원 시험)** 로 내리고
+   CLI 에 노출했으며, `True` 일 때는 빌드 시점에 holdout 과 겹치는 capture group 을
+   `train_groups` 에서 **빼고**, chainage 를 못 재는 그룹이 있으면 **거부**한다. 확인할 수 없는
+   제외는 제외가 아니다.
+4. **`real_execution` 이 누락과 덮어쓰기를 통과시켰다.** 두 경로의 flag 를 하나의 dict 로 합쳐
+   판정했기 때문에 (i) 필수 key 존재 여부를 보지 않았고 — flag 하나만 true 여도 참이 되었다 —
+   (ii) image 쪽 값이 같은 이름의 TLS 쪽 값을 **덮어썼다**. 실제 G2 에서 TLS trainer 대체 사실이
+   사라질 수 있었다. → 경로별 필수 목록(`REQUIRED_EXECUTION`)을 두고 **따로** 판정한다. 없는
+   key 는 "모른다" 이고, 모르면 거짓이다.
+
+부수적으로, inlier 가 하나도 없을 때 diagnostics 가 NaN 이 되고 NaN 은 JSON 왕복을 통과하지
+못해 record 가 **쓰이고 다시 읽히지 않는** 상태가 되었다. 두 단계 뒤에 "null 은 float 이 아니다"
+라는 스키마 오류로 드러나던 것을, 발생 지점에서 그 이유로 거부한다.
+
+T31–T36 이 이 여섯을 고정한다. 여섯 guard 모두 mutation check 로 load-bearing 임을 확인했다 —
+각각 무력화하면 담당 테스트가 실제로 깨진다.
+
+### 17.5c 독립 검토(round 2)
+
+1. **capture group 의 chainage 가 한 점이었다.** traverse 경로의 그룹은 연속 프레임의 묶음이라
+   갱도의 **구간**을 덮는데, `chainage_m` 하나(멤버 평균)만 기록했다. 그래서 *중앙은 holdout 밖,
+   한쪽 끝은 holdout 안* 인 그룹 — straddling group — 이 학습에 남았다. `CaptureGroup` 에는
+   `chainage_range_m` 필드가 이미 있었고 채우지 않았을 뿐이다. 이제 멤버들의 chainage 최소·최대를
+   기록하고, 제외 판정은 **span ∩ holdout** 으로 한다. 판정 함수는 manifest 의 `train_images()`
+   가 쓰는 것과 **같은** `spans_overlap()` 이다 — 두 개를 두면 경계에 걸친 그룹에서 언젠가
+   서로 다른 답을 낸다. 360 그룹은 crop 들이 광학 중심을 공유하므로 span 이 한 점이고 비용이 없다.
+   T37 이 고정한다.
+2. **품질 게이트의 threshold 집합이 검증되지 않았다.** `.get` 으로 읽고 없으면 건너뛰었기 때문에
+   `{}` 가 **전부 통과**시켰다 — 대응 3점에 잔차 9.9 m 인 정합이 `passed=True` 로 claim 을 얻었다.
+   부분 집합도, 오타 난 key 하나도 마찬가지였다. claim 을 지는 게이트는
+   `max_rmse_m`·`min_inlier_ratio`·`min_correspondences` **셋 다** 필요하다 — 각각은 혼자서는
+   눈이 멀었다: `rmse_m` 은 inlier 위에서 계산되므로 2% 만 맞춘 fit 도 작은 잔차를 보고하고,
+   inlier 비율은 점의 개수를 말하지 않으며, 대응 몇 개로 둘 다 만족시킬 수 있다. 누락·미지의
+   key 는 이유와 함께 거부되고, `None`(아직 정하지 않음) 과 `{}`(판정했다고 기록되었으나 아무것도
+   보지 않음) 를 구분한다. T38 이 고정한다.
+
+T37·T38 의 guard 4개도 mutation check 로 load-bearing 임을 확인했다.
+
+### 17.6 성숙도
+
+> Phase 3 image/360 independent reconstruction path is implemented and structurally tested.
+> Real-data scientific validation remains NOT VALIDATED.
+> Phase 3 G2 remains PENDING.
+
+§12 의 real G2 조건은 하나도 충족되지 않았다. 합성 터널, 대체 SfM, 대체 학습, 대체 렌더러이고,
+image-only gate 의 `real_data_validation_status` 는 `pending_human_inspection` 이다 — 사람이 아직
+보지 않았고, 이 저장소의 어떤 코드도 그 값을 다른 것으로 쓰지 않는다(T28).
