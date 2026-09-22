@@ -299,20 +299,124 @@ def build_config_example() -> None:
     console.print(yaml.safe_dump(example_config(), sort_keys=False))
 
 
+@app.command("from-sfm")
+def from_sfm(
+    frameset_dir: Path = typer.Argument(..., help="a frame set from `ingest video frameset`"),
+    sfm_dir: Path = typer.Argument(..., help="an SfM artifact from `ingest video sfm`"),
+    registration_dir: Path = typer.Argument(..., help="a registration from `eval register`"),
+    out_dir: Path = typer.Argument(..., help="where the dataset is written"),
+    dataset_id: str = typer.Option(...),
+    source: str = typer.Option("video", help="video | video360"),
+    group_size: int = typer.Option(8, help="frames per capture group on the plain-video path"),
+    test_groups: str = typer.Option("", help="comma-separated group ids held out from training"),
+    holdout_m: str = typer.Option("", help="geometry holdout chainage, e.g. '30:38'"),
+    centerline: Path | None = typer.Option(None, help="design centerline CSV in TLS_GLOBAL"),
+    init_voxel_m: float = typer.Option(0.02),
+    overwrite: bool = typer.Option(False),
+) -> None:
+    """Build a dataset from a registered image/360 reconstruction (§Phase 3).
+
+    The result satisfies the same contract `from-e57` produces, so it trains, validates and
+    evaluates through the existing path. What it does not do is borrow TLS geometry:
+    `init_points.ply` is this reconstruction's own points, and the builder verifies that rather
+    than taking the manifest's word for it.
+    """
+    from minegs.dataset.from_sfm import SfmDatasetConfig, build_dataset_from_sfm
+
+    def go() -> None:
+        from minegs.cli.eval_cmd import _ranges
+
+        cfg = SfmDatasetConfig(
+            dataset_id=dataset_id,
+            source=source,  # type: ignore[arg-type]
+            group_size=group_size,
+            test_groups=[g for g in test_groups.split(",") if g.strip()],
+            geometry_holdout_m=_ranges(holdout_m) or [],
+            centerline_file=str(centerline) if centerline else None,
+            centerline_source="design" if centerline else "extracted",
+            init_voxel_m=init_voxel_m,
+        )
+        manifest, ds = build_dataset_from_sfm(
+            frameset_dir, sfm_dir, registration_dir, out_dir, cfg, overwrite=overwrite
+        )
+        console.print(f"dataset [bold]{manifest.dataset_id}[/] in {ds}")
+        console.print(f"  source={manifest.source}  init={manifest.initialization.source}")
+        console.print(f"  scale basis={manifest.scale.basis} factor={manifest.scale.factor:.5f}")
+        reg = manifest.registration
+        if reg is not None:
+            console.print(
+                f"  registration {reg.registration_id}: claim_allowed={reg.claim_allowed}, "
+                f"support={reg.support_ranges_m}"
+            )
+        console.print(f"  {len(manifest.capture_groups)} capture groups")
+
+    run_guarded(go)
+
+
 @app.command("golden-gate")
 def golden_gate(
     dataset_dir: Path = typer.Argument(...),
-    staging: Path = typer.Option(
-        ..., "--staging", help="the staging tree the dataset was built from"
+    staging: Path | None = typer.Option(
+        None, "--staging", help="TLS path: the staging tree the dataset was built from"
     ),
     out: Path = typer.Option(..., "--out", help="report directory"),
     stations: int = typer.Option(3),
     max_points: int = typer.Option(150_000),
+    reference_ply: Path | None = typer.Option(
+        None, "--reference-ply", help="image-only path: TLS reference to project into the views"
+    ),
 ) -> None:
-    """Golden gate: reprojection overlays, numerical checks, report.json, Viser TLS sample."""
+    """Golden gate: reprojection overlays, numerical checks, report.json, Viser TLS sample.
+
+    Which gate runs follows the dataset's source. A TLS dataset gets the station-scan
+    reprojection gate. An image-only dataset has no station scans, so it gets the image-only
+    gate — its own reconstruction's visibility, its registration, and the reference projected
+    through the registered cameras — and the report says which gate it was.
+    """
+    from minegs.core.manifest import Manifest
     from minegs.dataset.golden_gate import run_golden_gate
 
     def go() -> None:
+        from minegs.core.errors import ContractError
+
+        manifest = Manifest.load_dataset(dataset_dir, strict_layout=False)
+        if manifest.source in ("video", "video360"):
+            from minegs.dataset.golden_gate_sfm import run_image_only_gate
+
+            rep = run_image_only_gate(
+                dataset_dir,
+                out,
+                reference_ply=reference_ply,
+                n_views=stations,
+                max_reference_points=max_points,
+                raise_on_fail=False,
+            )
+            console.print(f"gate_kind=[bold]{rep['gate_kind']}[/]")
+            console.print(
+                f"structural_result=[bold]{rep['structural_result']}[/]  "
+                f"real_data_validation_status={rep['real_data_validation_status']}"
+            )
+            console.print(
+                f"  registration claim_allowed={rep['registration']['claim_allowed']}  "
+                f"support={rep['registration']['support_ranges_m']}"
+            )
+            console.print(
+                f"  real SfM execution: {rep['execution']['real_sfm_execution']}  "
+                f"real frame extraction: {rep['execution']['frame_extraction_real']}"
+            )
+            for p in rep["problems"]:
+                console.print(f"  [red]{p}[/]")
+            if rep["structural_result"] != "pass":
+                raise ContractError(
+                    f"image-only golden gate structural_result=fail; see {out} "
+                    f"({len(rep['problems'])} problem(s))"
+                )
+            return
+        if staging is None:
+            raise ContractError(
+                "a TLS dataset's golden gate reprojects each station's own scan, so it needs "
+                "--staging (the tree the dataset was built from)"
+            )
         rep = run_golden_gate(
             dataset_dir,
             staging,

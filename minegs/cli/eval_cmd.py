@@ -660,3 +660,103 @@ def render(
         dump_json(rep, out)
 
     run_guarded(go)
+
+
+@app.command("compare-paths")
+def compare_paths_cmd(
+    tls_dataset: Path = typer.Argument(..., help="the TLS-assisted dataset"),
+    image_dataset: Path = typer.Argument(..., help="the image/360-only dataset"),
+    tls_sections: Path = typer.Option(..., help="TLS-assisted prediction sections"),
+    tls_reference_sections: Path = typer.Option(..., help="reference sections in the TLS dataset"),
+    image_sections: Path = typer.Option(..., help="image-only prediction sections"),
+    image_reference_sections: Path = typer.Option(
+        ..., help="reference sections in the image-only dataset"
+    ),
+    ranges: str | None = typer.Option(
+        None, help="chainage to compare over; default is the holdout both datasets declare"
+    ),
+    tls_e2e_report: Path | None = typer.Option(None, help="e2e report of the TLS-assisted run"),
+    image_e2e_report: Path | None = typer.Option(None, help="e2e report of the image-only run"),
+    comparison_id: str = typer.Option("path-comparison"),
+    out: Path | None = typer.Option(None, help="directory for path_comparison.json"),
+) -> None:
+    """TLS-assisted against image-only, over the domain both of them observed (§Phase 3).
+
+    Both sides must have been cut on one grid and be evaluated over one declared holdout, and
+    the numbers are integrated over the intersection of what each actually observed — what
+    either side missed is reported, not quietly dropped. This is a comparison of two
+    reconstruction paths; it is not a claim, and it upgrades neither dataset's protocol.
+    """
+    from minegs.core.errors import ContractError
+    from minegs.eval.compare import (
+        COMPARISON_FILE,
+        compare_paths,
+        path_context,
+        require_same_holdout,
+    )
+    from minegs.eval.sections import check_section_record, load_section_input
+
+    def load(path: Path, dataset_dir: Path, what: str):
+        m, cl = _load_dataset_and_centerline(dataset_dir)
+        rec, _ = load_section_input(path)
+        if rec is None:
+            raise ContractError(
+                f"{path} is a bare section series, so nothing ties it to {what}. A path "
+                "comparison is between two datasets; a series that names neither cannot be in it."
+            )
+        from minegs.core.provenance import sha256_tree
+        from minegs.train.runner.base import DATASET_HASH_PATTERNS
+
+        check_section_record(
+            rec, m.dataset_id, sha256_tree(dataset_dir, DATASET_HASH_PATTERNS), dataset_dir, m, cl
+        )
+        return rec
+
+    def go() -> None:
+        tls_ctx = path_context(tls_dataset, e2e_report=tls_e2e_report)
+        img_ctx = path_context(image_dataset, e2e_report=image_e2e_report)
+        if tls_ctx["dataset_id"] == img_ctx["dataset_id"]:
+            raise ContractError(
+                f"both sides name dataset {tls_ctx['dataset_id']!r}; a path comparison is "
+                "between two reconstructions of one tunnel, not a dataset against itself"
+            )
+        explicit = _ranges(ranges)
+        domain = explicit if explicit else require_same_holdout(tls_ctx, img_ctx)
+        rep = compare_paths(
+            tls_pred=load(tls_sections, tls_dataset, "the TLS-assisted dataset"),
+            tls_ref=load(tls_reference_sections, tls_dataset, "the TLS-assisted dataset"),
+            image_pred=load(image_sections, image_dataset, "the image-only dataset"),
+            image_ref=load(image_reference_sections, image_dataset, "the image-only dataset"),
+            ranges=domain,
+            tls_context=tls_ctx,
+            image_context=img_ctx,
+            comparison_id=comparison_id,
+        )
+        if explicit:
+            rep.notes.insert(
+                0,
+                "the comparison domain was given on the command line, not taken from a declared "
+                "holdout; these numbers are diagnostic",
+            )
+        console.print(
+            f"comparison [bold]{rep.comparison_id}[/] over {rep.common_length_m:.2f} m "
+            f"common of {sum(hi - lo for lo, hi in rep.requested_intervals_m):.2f} m requested"
+        )
+        for label, r in (("tls_assisted", rep.tls_assisted), ("image_only", rep.image_only)):
+            v = r.paired.volume
+            console.print(
+                f"  {label:<12} {r.dataset_id}: V={v.predicted_volume_m3}, "
+                f"|ΔV|={v.absolute_error_m3}, "
+                f"median |ΔA|={r.paired.sections.median_absolute_error_m2}"
+            )
+        console.print(
+            f"  ΔV(image - tls) = {rep.volume_difference_m3}  "
+            f"Δmedian |ΔA| = {rep.section_median_difference_m2}"
+        )
+        console.print(f"  real_execution={rep.real_execution}")
+        for n in rep.notes:
+            console.print(f"  [yellow]{n}[/]")
+        console.print(f"[bold]{rep.maturity_statement}[/]")
+        dump_json(rep, (out / COMPARISON_FILE) if out is not None else None)
+
+    run_guarded(go)
