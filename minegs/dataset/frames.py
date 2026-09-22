@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from minegs.core.errors import ContractError
-from minegs.core.frames import FLOAT32_SAFE_MAGNITUDE_M, SE3, check_float32_safe
+from minegs.core.frames import FLOAT32_SAFE_MAGNITUDE_M, SE3, Frame, check_float32_safe
 from minegs.dataset.build_config import LocalMetricConfig, SourceFrameConfig
 
 #: Rotation orthonormality / determinant tolerance for a declared transform. A declared
@@ -80,8 +80,23 @@ def validate_rigid(M: np.ndarray | list, what: str) -> SE3:
     return SE3.from_matrix(A)
 
 
-def resolve_tls_from_source(cfg: SourceFrameConfig) -> SE3:
-    """The declared SOURCE → TLS_GLOBAL transform, validated. Never inferred."""
+def resolve_tls_from_source(cfg: SourceFrameConfig, source_frame: str = "SOURCE") -> SE3:
+    """The declared SOURCE → TLS_GLOBAL transform, validated. Never inferred.
+
+    ``source_frame`` is the frame the geometry actually arrives in, and there is exactly one
+    value this door refuses: ``SFM_INTERNAL`` (Phase 3 AD-1). Both modes here are declarations
+    and both return an SE(3), so promoting an independent reconstruction through them would
+    assert that its arbitrary scale is already metres — which nobody measured. That promotion
+    exists, and it is a measured Sim(3) with a registration artifact behind it.
+    """
+    if source_frame == Frame.SFM_INTERNAL.value:
+        raise ContractError(
+            "source_frame cannot promote SFM_INTERNAL geometry to TLS_GLOBAL. Both modes here "
+            "are declarations and carry no scale, while an independent SfM reconstruction is "
+            "arbitrary in scale as well as in origin: declaring it metric would make up the "
+            "one number nobody measured. Register it first (`minegs eval register`), and build "
+            "the dataset from the registration."
+        )
     if cfg.mode == "explicit_identity":
         return SE3.identity()
     assert cfg.T_tls_from_source is not None  # pydantic guarantees it

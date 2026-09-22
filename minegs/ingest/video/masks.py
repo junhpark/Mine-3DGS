@@ -37,9 +37,15 @@ def box_mask(width: int, height: int, boxes: list[tuple[int, int, int, int]]) ->
     return m
 
 
-def write_mask(mask: np.ndarray, images_dir: Path, image_name: str, masks_dir: Path) -> Path:
-    """COLMAP expects ``masks/<image_name>.png`` (name keeps its own extension)."""
-    masks_dir.mkdir(parents=True, exist_ok=True)
+def write_mask(mask: np.ndarray, image_name: str, masks_dir: Path) -> Path:
+    """COLMAP expects ``masks/<image_name>.png`` (the name keeps its own extension).
+
+    ``image_name`` is relative to the image root and may contain directories — a 360 ring set
+    is laid out per view — so the mask's own parent is created here. COLMAP resolves the mask
+    for an image by that exact relative name, and silently applies none when it does not
+    resolve, which is why the name is derived from the image rather than assembled by hand.
+    """
     p = masks_dir / (image_name + ".png")
+    p.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(mask).save(p)
     return p

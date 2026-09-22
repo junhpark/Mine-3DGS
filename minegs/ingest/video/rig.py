@@ -56,3 +56,52 @@ def write_rig_config(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rig_config_json(spec, image_prefixes), indent=2))
     return path
+
+
+def rig_config_from_crops(crops: list) -> list[dict]:
+    """COLMAP ``rig_config.json`` derived from the crop records, not from a directory listing.
+
+    The ring spec says what a crop *would* be; the records say what each crop is. Deriving the
+    rig from the records is what keeps the two from drifting: a crop cut at a different yaw, or
+    a view whose images were replaced, changes the rig this produces instead of being silently
+    described by the old one. ``image_prefix`` is still the per-view directory, because that is
+    how COLMAP addresses images — but it is read off the records here, and
+    ``check_frameset`` has already tied each record to the bytes of its crop.
+    """
+    from minegs.core.frames import SE3
+    from minegs.ingest.common.equirect import CropView, RingCropSpec
+
+    by_view: dict[str, object] = {}
+    for crop in crops:
+        by_view.setdefault(crop.view, crop)
+    if not by_view:
+        raise ValueError("no crop records to build a rig from")
+    views = list(by_view.values())
+
+    def rotation(crop) -> SE3:
+        spec = RingCropSpec(n_yaw=1, fov_deg=90.0, width=crop.width, height=crop.height)
+        view = CropView(crop.view, crop.yaw_deg, crop.pitch_deg, spec)
+        return SE3(view.R_scanner_from_cam, np.zeros(3))
+
+    ref = views[0]
+    T_ref = rotation(ref)
+    cams = []
+    for crop in views:
+        entry: dict = {"image_prefix": f"{crop.view}/"}
+        if crop is ref:
+            entry["ref_sensor"] = True
+        else:
+            cam_from_ref = rotation(crop).inverse() @ T_ref
+            entry["cam_from_rig_rotation"] = cam_from_ref.quat().tolist()
+            entry["cam_from_rig_translation"] = cam_from_ref.t.tolist()
+        entry["camera_model_name"] = "PINHOLE"
+        entry["camera_params"] = crop.camera_params()
+        cams.append(entry)
+    return [{"cameras": cams}]
+
+
+def write_rig_config_from_crops(crops: list, path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rig_config_from_crops(crops), indent=2))
+    return path

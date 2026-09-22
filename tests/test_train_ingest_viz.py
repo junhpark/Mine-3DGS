@@ -340,9 +340,20 @@ def test_sfm_commands_and_pdal_pipeline(tmp_path):
         cmds = get_sfm_backend("colmap", mapper).commands(
             tmp_path / "img",
             tmp_path / "w",
-            SfMOptions(mapper=mapper, fix_intrinsics=True, rig_config=tmp_path / "rig.json"),
+            SfMOptions(fix_intrinsics=True, rig_config=tmp_path / "rig.json"),
         )
         assert any(tool in c for c in cmds) and any("rig_configurator" in c for c in cmds)
+    # A mapper name that is not one of the two used to fall through to the incremental one,
+    # so a typo silently ran a different algorithm than the one that was asked for.
+    with pytest.raises(ContractError, match="unknown mapper"):
+        get_sfm_backend("colmap", "globl")
+    # Loop detection is a vocabulary-tree search, and COLMAP rejects it without a tree.
+    plain = get_sfm_backend("colmap", "global").commands(tmp_path, tmp_path / "w", SfMOptions())
+    assert not any("loop_detection" in tok for c in plain for tok in c)
+    with_tree = get_sfm_backend("colmap", "global").commands(
+        tmp_path, tmp_path / "w", SfMOptions(vocab_tree=tmp_path / "vt.bin")
+    )
+    assert any("loop_detection" in tok for c in with_tree for tok in c)
     with pytest.raises(NotYetImplementedError):
         get_sfm_backend("gluemap").commands(tmp_path, tmp_path, SfMOptions())
     pipe = tile_pipeline("scan.e57", tmp_path, 80, 15, 0.02)

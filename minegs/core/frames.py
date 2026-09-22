@@ -22,9 +22,39 @@ ArrayLike = Any
 
 class Frame(str, Enum):
     SOURCE = "SOURCE"
+    #: An independent image/360 SfM reconstruction's own coordinates (Phase 3 AD-1). Not
+    #: ``SOURCE``: a scanner's file is already in metres, while this is arbitrary in scale as
+    #: well as in origin, and the door out of ``SOURCE`` is a *declaration* that returns an
+    #: SE(3) and structurally cannot carry scale. Keeping the two apart is what stops an
+    #: unscaled reconstruction from being called metric by writing one line of config. The only
+    #: exit is a measured Sim(3) recorded in a registration artifact.
+    SFM_INTERNAL = "SFM_INTERNAL"
     TLS_GLOBAL = "TLS_GLOBAL"
     LOCAL_METRIC = "LOCAL_METRIC"
     BACKEND_INTERNAL = "BACKEND_INTERNAL"
+
+
+#: Frames whose unit is the metre and whose origin is tied to the survey (§3). Everything that
+#: measures distance lives in one of these.
+METRIC_FRAMES = frozenset({Frame.TLS_GLOBAL.value, Frame.LOCAL_METRIC.value})
+
+
+def require_metric_frame(frame: str, what: str) -> None:
+    """Refuse geometry that is not in a metric frame, naming ``SFM_INTERNAL`` when it is one.
+
+    Most consumers already compare against the exact frame they need, so this adds nothing for
+    them. It exists for the one case worth a sentence of its own: an arbitrary-scale SfM
+    reconstruction arriving where metres are expected. Distances computed from it would be in
+    no unit at all, and the failure is silent unless someone says so.
+    """
+    if frame == Frame.SFM_INTERNAL.value:
+        raise FrameError(
+            f"{what} is in {frame}, an independent SfM reconstruction's own arbitrary-scale "
+            "coordinates. It has no metric meaning until a measured Sim(3) registration puts "
+            "it in TLS_GLOBAL (Phase 3 §7); until then every length taken from it is unitless."
+        )
+    if frame not in METRIC_FRAMES:
+        raise FrameError(f"{what} is in {frame}, not a metric frame ({sorted(METRIC_FRAMES)})")
 
 
 # |x| * 2^-23 : spacing of adjacent float32 values at magnitude |x|
