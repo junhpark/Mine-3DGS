@@ -113,6 +113,10 @@ class RegistrationRecord(VersionedModel):
     scale: float = Field(gt=0)
     icp: IcpRecord
     diagnostics: RegistrationDiagnostics
+    #: The thresholds this registration was judged against and the verdict. Inside the record
+    #: because ``check_registration`` re-derives the claim from it: a verdict kept in a file
+    #: beside the record is a verdict nothing can re-check, and the claim rests on it.
+    quality_gate: QualityGate
     #: True when the robust fit gave up on its inliers and used every correspondence. The old
     #: code did this silently, which turned a failed robust fit into a confident-looking one.
     ransac_fallback_used: bool = False
@@ -259,11 +263,22 @@ def load_registration(path: str | Path) -> tuple[RegistrationRecord, Path]:
 
 
 def check_registration(rec: RegistrationRecord, sfm_model_sha256: str) -> None:
-    """The registration must still be of the reconstruction it says it is.
+    """The registration must still be of the reconstruction it says it is, and still say it.
+
+    Two separate things, and the second is the one a reader would skip.
 
     A transform is meaningless apart from the coordinates it transforms: pair it with a
     different model and it maps that model's points somewhere arbitrary, precisely and
-    confidently.
+    confidently. So the model digest is compared first.
+
+    Then the claim is **re-derived**. ``claim_allowed``, ``claim_refusals`` and
+    ``support_ranges_m`` are conclusions — ``decide_claim`` reached them once, from the support
+    records, the ICP record, the robust-fit fallback flag and the quality gate. Reading them
+    back is reading a conclusion, and a conclusion in a JSON file is four characters away from
+    ``true``. Everything they were derived from is in this record, so they are worked out again
+    here and compared; a record whose verdict does not follow from its own evidence is refused,
+    whatever it says about itself. The same argument applies to the gate: its verdict is
+    re-derived from the diagnostics and the thresholds it names.
     """
     if rec.sfm_model_sha256 != sfm_model_sha256:
         raise ContractError(
@@ -271,14 +286,60 @@ def check_registration(rec: RegistrationRecord, sfm_model_sha256: str) -> None:
             f"{rec.sfm_model_sha256[:12]}, but the model now hashes to {sfm_model_sha256[:12]}. "
             "A measured transform belongs to the reconstruction it was measured on."
         )
-    declared = union_ranges(
-        *[s.ranges_m for s in (rec.initial_support, rec.icp_support) if s is not None and s.is_tls]
+
+    gate = evaluate_gate(rec.diagnostics, rec.icp, rec.quality_gate.thresholds)
+    if (gate.passed, sorted(gate.reasons)) != (
+        rec.quality_gate.passed,
+        sorted(rec.quality_gate.reasons),
+    ):
+        raise ContractError(
+            f"registration {rec.registration_id} records a quality gate that does not follow "
+            f"from its own diagnostics: recorded passed={rec.quality_gate.passed} "
+            f"{rec.quality_gate.reasons}, re-derived passed={gate.passed} {gate.reasons}"
+        )
+
+    allowed, refusals, support = decide_claim(
+        basis=rec.basis,
+        initial_support=rec.initial_support,
+        icp_support=rec.icp_support,
+        icp=rec.icp,
+        gate=gate,
+        ransac_fallback_used=rec.ransac_fallback_used,
     )
-    if rec.claim_allowed and declared is None:
+    if allowed != rec.claim_allowed or sorted(refusals) != sorted(rec.claim_refusals):
+        raise ContractError(
+            f"registration {rec.registration_id} says claim_allowed={rec.claim_allowed} with "
+            f"refusals {rec.claim_refusals}, but its own support, ICP and gate records give "
+            f"claim_allowed={allowed} with refusals {refusals}. The verdict was not derived "
+            "from the evidence beside it."
+        )
+    if _ranges_differ(support, rec.support_ranges_m):
+        raise ContractError(
+            f"registration {rec.registration_id} records support ranges "
+            f"{rec.support_ranges_m}, but the union of its TLS support is {support}. The "
+            "extent a claim is judged against is not the extent the transform was fitted to."
+        )
+    if rec.claim_allowed and support is None:
         raise ContractError(
             f"registration {rec.registration_id} allows a claim while its TLS support has no "
             "recorded extent; overlap with an evaluation holdout cannot be decided"
         )
+
+
+def _ranges_differ(
+    a: list[tuple[float, float]] | None, b: list[tuple[float, float]] | None
+) -> bool:
+    """Compare chainage intervals as numbers. ``None`` ("unknown") equals only ``None``."""
+    if (a is None) != (b is None):
+        return True
+    if a is None or b is None:
+        return False
+    if len(a) != len(b):
+        return True
+    return any(
+        abs(float(x0) - float(y0)) > 1e-9 or abs(float(x1) - float(y1)) > 1e-9
+        for (x0, x1), (y0, y1) in zip(sorted(a), sorted(b), strict=True)
+    )
 
 
 def support_conflict(
@@ -288,6 +349,43 @@ def support_conflict(
     if not holdout_ranges:
         return []
     return ranges_overlap(rec.support_ranges_m, [tuple(r) for r in holdout_ranges])
+
+
+#: Everything a manifest copies out of a registration and a protocol judge then reads. Named
+#: once so the copy and the check cannot drift: a field added here is a field the dataset
+#: checker starts comparing.
+CLAIM_BEARING_FIELDS: tuple[str, ...] = (
+    "registration_id",
+    "basis",
+    "scale",
+    "support_ranges_m",
+    "claim_allowed",
+    "claim_refusals",
+    "transform",
+    "rmse_m",
+    "inlier_ratio",
+    "n_correspondences",
+    "inlier_threshold_m",
+    "method",
+)
+
+
+def claim_bearing_values(rec: RegistrationRecord) -> dict[str, Any]:
+    """The record's own values for the fields a manifest copies."""
+    return {
+        "registration_id": rec.registration_id,
+        "basis": rec.basis,
+        "scale": float(rec.scale),
+        "support_ranges_m": rec.support_ranges_m,
+        "claim_allowed": rec.claim_allowed,
+        "claim_refusals": list(rec.claim_refusals),
+        "transform": rec.T_tls_from_sfm,
+        "rmse_m": float(rec.diagnostics.rmse_m),
+        "inlier_ratio": float(rec.diagnostics.inlier_ratio),
+        "n_correspondences": rec.diagnostics.n_source,
+        "inlier_threshold_m": rec.diagnostics.inlier_threshold_m,
+        "method": rec.diagnostics.method,
+    }
 
 
 def describe(rec: RegistrationRecord) -> dict[str, Any]:
@@ -305,6 +403,7 @@ def describe(rec: RegistrationRecord) -> dict[str, Any]:
 
 
 __all__ = [
+    "CLAIM_BEARING_FIELDS",
     "REGISTRATION_FILE",
     "IcpRecord",
     "QualityGate",
@@ -313,6 +412,7 @@ __all__ = [
     "SupportKind",
     "SupportRecord",
     "check_registration",
+    "claim_bearing_values",
     "decide_claim",
     "describe",
     "evaluate_gate",

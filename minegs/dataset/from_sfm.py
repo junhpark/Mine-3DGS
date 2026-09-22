@@ -51,16 +51,24 @@ from minegs.core.manifest import (
 )
 from minegs.core.pointcloud import PointCloud, voxel_downsample, write_ply
 from minegs.core.provenance import git_commit, sha256_file, tool_versions
-from minegs.eval.register.models import load_registration
+from minegs.eval.register.models import (
+    CLAIM_BEARING_FIELDS,
+    RegistrationRecord,
+    check_registration,
+    claim_bearing_values,
+    load_registration,
+)
 from minegs.ingest.common import colmap_io
 from minegs.ingest.video.models import check_frameset, load_frameset
-from minegs.ingest.video.sfm.models import check_sfm, load_sfm
+from minegs.ingest.video.sfm.models import SPARSE_FILES, check_sfm, load_sfm, model_digest
 
 CENTERLINE_FILE = "centerline.csv"
 #: Immutable copies of the three records this dataset rests on. They live *inside* the dataset
 #: so that they are inside its hash: a manifest that points at evidence living outside the
 #: hashed tree can be paired with different evidence afterwards and nothing notices.
 PROVENANCE_DIR = "provenance/phase3"
+#: The selected SFM_INTERNAL model, kept inside the dataset tree (and so inside its hash).
+SFM_MODEL_DIR = "sfm_model"
 
 
 class SfmDatasetConfig(VersionedModel):
@@ -76,7 +84,13 @@ class SfmDatasetConfig(VersionedModel):
     group_size: int = Field(default=8, ge=1)
     test_groups: list[str] = Field(default_factory=list)
     geometry_holdout_m: list[tuple[float, float]] = Field(default_factory=list)
-    holdout_images_excluded: bool = True
+    #: False is the reconstruction test: the holdout's images are trained on and the held-out
+    #: *TLS geometry* is what the result is measured against. True is the extrapolation test,
+    #: and it is a much stronger statement about the experiment, so it is not the default — a
+    #: dataset should not end up labelled an extrapolation test because nobody passed a flag.
+    #: When it is true the builder takes the holdout's capture groups out of ``train_groups``,
+    #: so the manifest states what happened rather than what was asked for.
+    holdout_images_excluded: bool = False
     centerline_file: str | None = None
     centerline_source: Literal["design", "extracted"] = "extracted"
     centerline_bin_m: float = Field(default=2.0, gt=0)
@@ -320,6 +334,26 @@ def build_dataset_from_sfm(
     if unknown:
         raise ContractError(f"test groups {unknown} are not capture groups of this dataset")
     train_groups = [g for g in sorted(grouped) if g not in cfg.test_groups]
+    if holdout and cfg.holdout_images_excluded:
+        # `images_excluded=True` says the holdout's images were not trained on. `train_images()`
+        # enforces that at read time only for groups whose chainage is known, and keeps a group
+        # with no chainage — so the declaration could be true of the reader and false of the
+        # data. Both halves are closed here: a group inside the holdout leaves `train_groups`,
+        # and a group nobody could place refuses the build rather than being quietly trained on.
+        unplaced = sorted(g for g in train_groups if g not in chainage)
+        if unplaced:
+            raise ContractError(
+                f"holdout_images_excluded is set, but capture groups {unplaced[:5]} have no "
+                "chainage, so there is no way to say whether their images are inside the "
+                "holdout. An exclusion nobody can check is not an exclusion."
+            )
+        inside = [g for g in train_groups if _in_any(chainage[g], holdout)]
+        train_groups = [g for g in train_groups if g not in set(inside)]
+        if not train_groups:
+            raise ContractError(
+                f"every training capture group falls inside the holdout {holdout}; excluding "
+                "their images leaves nothing to train on"
+            )
 
     groups = {
         gid: CaptureGroup(
@@ -336,6 +370,13 @@ def build_dataset_from_sfm(
     shutil.copy2(fs_dir / "frameset.json", prov / "frameset.json")
     shutil.copy2(sfm_root / "sfm.json", prov / "sfm.json")
     shutil.copy2(reg_root / "registration.json", prov / "registration.json")
+    # The model itself, not only the record of it. Without these bytes the claim "the
+    # initialisation is this reconstruction's own points" can only be checked against another
+    # copy of the same dataset's geometry — which agrees with itself however it was made.
+    # A sparse model is small; this is the cheapest provenance in the tree.
+    (prov / SFM_MODEL_DIR).mkdir(parents=True, exist_ok=True)
+    for name in SPARSE_FILES:
+        shutil.copy2(model_dir / name, prov / SFM_MODEL_DIR / name)
 
     manifest = Manifest(
         dataset_id=cfg.dataset_id,
@@ -500,7 +541,75 @@ def check_image_only_dataset(dataset_dir: str | Path) -> None:
             f"{ds}: the manifest's registration digest does not match the record kept beside "
             "it; the numbers in the manifest are not the ones that were measured"
         )
-    _check_init_is_sfm_geometry(ds, manifest, rec_sfm)
+    rec_reg = RegistrationRecord.load(reg_json)
+    # The record must still follow from its own evidence — claim_allowed and the support
+    # extent are re-derived, not read (§Phase 3 AD-2, `check_registration`).
+    check_registration(rec_reg, rec_sfm.model_sha256)
+    if rec_reg.sfm_id != rec_sfm.sfm_id:
+        raise ContractError(
+            f"{ds}: the registration beside this dataset is of SfM {rec_reg.sfm_id}, not "
+            f"{rec_sfm.sfm_id}"
+        )
+    _check_manifest_matches_registration(ds, manifest, rec_reg)
+    _check_init_is_sfm_geometry(ds, manifest, rec_sfm, rec_reg)
+
+
+def _check_manifest_matches_registration(ds: Path, manifest: Manifest, rec_reg: Any) -> None:
+    """The manifest's copy of the registration must be that registration.
+
+    The protocol judge reads ``manifest.registration``, not the record. The digest above proves
+    the record is unedited and says nothing about the copy: a manifest with ``claim_allowed``
+    flipped to true, or with the support ranges emptied, sits beside a perfectly intact record
+    and grants the claim the record refuses. Every field the judge or a report can reach is
+    compared, from one list, so a field added to the copy starts being checked rather than
+    silently travelling unverified.
+    """
+    want = claim_bearing_values(rec_reg)
+    have = {
+        "registration_id": manifest.registration.registration_id,
+        "basis": manifest.registration.basis,
+        "scale": manifest.registration.scale,
+        "support_ranges_m": manifest.registration.support_ranges_m,
+        "claim_allowed": manifest.registration.claim_allowed,
+        "claim_refusals": list(manifest.registration.claim_refusals),
+        "transform": manifest.registration.transform,
+        "rmse_m": manifest.registration.rmse_m,
+        "inlier_ratio": manifest.registration.inlier_ratio,
+        "n_correspondences": manifest.registration.n_correspondences,
+        "inlier_threshold_m": manifest.registration.inlier_threshold_m,
+        "method": manifest.registration.method,
+    }
+    differ = [
+        f"{k}: manifest {have[k]!r} vs record {want[k]!r}"
+        for k in CLAIM_BEARING_FIELDS
+        if not _same_value(have[k], want[k])
+    ]
+    if differ:
+        raise ContractError(
+            f"{ds}: the manifest's registration block is not the registration it names "
+            f"({'; '.join(differ)}). The protocol judge reads the manifest, so a copy that "
+            "disagrees with the record grants what the measurement refused."
+        )
+    if manifest.scale is None or manifest.scale.factor != want["scale"]:
+        raise ContractError(
+            f"{ds}: scale.factor is {manifest.scale and manifest.scale.factor!r}, but the "
+            f"measured scale is {want['scale']!r}"
+        )
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    """Compare a manifest copy with a record value, tolerating float round-trips only."""
+    if isinstance(a, float) and isinstance(b, float):
+        return abs(a - b) <= 1e-9 * max(1.0, abs(b))
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b, strict=True))
+    if isinstance(a, tuple) or isinstance(b, tuple):
+        return _same_value(list(a) if a is not None else a, list(b) if b is not None else b)
+    return a == b
+
+
+def _in_any(s: float, ranges: list[tuple[float, float]]) -> bool:
+    return any(lo <= s <= hi for lo, hi in ranges)
 
 
 def _init_voxel_m(ds: Path) -> float | None:
@@ -509,38 +618,115 @@ def _init_voxel_m(ds: Path) -> float | None:
     return float(v) if v else None
 
 
-def _check_init_is_sfm_geometry(ds: Path, manifest: Manifest, rec_sfm: Any) -> None:
-    """Every init point must be a point of the registered reconstruction.
+def _check_init_is_sfm_geometry(ds: Path, manifest: Manifest, rec_sfm: Any, rec_reg: Any) -> None:
+    """Re-derive this dataset's geometry from the reconstruction it names, and compare.
 
-    The comparison is against the reconstruction's own points moved by the recorded transform,
-    so it catches the substitution that matters: a cloud of the right size, in the right frame,
-    from the wrong instrument.
+    The earlier version of this check compared ``init_points.ply`` against ``sparse/0`` — two
+    clouds inside the same dataset. Replace both with the same TLS-derived geometry and they
+    agree with each other perfectly, so the check passed on a dataset whose initialisation
+    came from a scanner. Two copies of a claim are not evidence for it.
+
+    So the comparison now starts outside the dataset, from the bundled ``SFM_INTERNAL`` model
+    whose digest must still be the one ``SfmRecord`` names, and walks the same path the builder
+    walked: the measured Sim(3), then the local origin, then the holdout exclusion. Both of the
+    dataset's clouds must be subsets of what comes out. The exact subsample is not re-derived —
+    that would pin the check to an RNG call order — but membership is, and a cloud from another
+    instrument is metres away, not a different draw.
     """
+    from scipy.spatial import cKDTree
+
     from minegs.core.pointcloud import read_ply
 
+    if rec_sfm.frame != Frame.SFM_INTERNAL.value:  # pragma: no cover - schema pins it
+        raise ContractError(f"{ds}: the recorded SfM model is not in SFM_INTERNAL")
+    bundled = ds / PROVENANCE_DIR / SFM_MODEL_DIR
+    missing = [n for n in SPARSE_FILES if not (bundled / n).is_file()]
+    if missing:
+        raise ContractError(
+            f"{ds}: the reconstruction this dataset is made of is not kept beside it "
+            f"({missing} missing from {PROVENANCE_DIR}/{SFM_MODEL_DIR}). Without it, "
+            "'the initialisation is this reconstruction's own points' can only be checked "
+            "against another copy of this dataset's own geometry."
+        )
+    digest = model_digest(bundled)
+    if digest != rec_sfm.model_sha256:
+        raise ContractError(
+            f"{ds}: the bundled SfM model hashes to {digest[:12]}, but the record beside it "
+            f"names {rec_sfm.model_sha256[:12]}. This is not the reconstruction the dataset "
+            "says it was built from."
+        )
+
+    # The builder's own path, in the same order and through the same functions.
+    model_tls = transform_model(colmap_io.read_model(bundled), rec_reg.sim3())
+    origin = np.asarray(manifest.T_tls_from_local.t, dtype=np.float64)
+    expected = model_tls.points_xyz() - origin
+    holdout = [(float(lo), float(hi)) for lo, hi in _declared_holdout(manifest)]
+    if holdout:
+        cl = _centerline_of(ds, manifest)
+        s = np.atleast_1d(cl.project(expected + origin)[0])
+        keep = np.ones(len(expected), bool)
+        for lo, hi in holdout:
+            keep &= ~((s >= lo) & (s <= hi))
+        expected = expected[keep]
+    if not len(expected):
+        raise ContractError(f"{ds}: the reconstruction has no points left outside the holdout")
+
+    voxel = _init_voxel_m(ds)
+    # A voxel downsample moves a point by at most half a voxel diagonal; the floor keeps a fine
+    # voxel from making this sensitive to float noise. What it catches is another instrument.
+    tol = max(voxel, 0.05) if voxel else 0.05
+    tree = cKDTree(expected)
     init = read_ply(ds / manifest.initialization.file)
     sparse = colmap_io.read_model(ds / "sparse" / "0")
     if not sparse.points3D:
-        raise ContractError(f"{ds}: sparse/0 holds no points to check the initialisation against")
-    from scipy.spatial import cKDTree
+        raise ContractError(f"{ds}: sparse/0 holds no points")
+    for what, xyz in (
+        ("init_points.ply", init.xyz if len(init) <= 20_000 else init.subsample(20_000, 0).xyz),
+        ("sparse/0", sparse.points_xyz()),
+    ):
+        if not len(xyz):
+            raise ContractError(f"{ds}: {what} is empty")
+        d, _ = tree.query(np.asarray(xyz, dtype=np.float64))
+        if float(np.max(d)) > tol:
+            raise ContractError(
+                f"{ds}: {what} is up to {float(np.max(d)):.3f} m from the registered "
+                "reconstruction this dataset names. Its geometry did not come from that "
+                "reconstruction, whatever the manifest says."
+            )
 
-    tree = cKDTree(sparse.points_xyz())
-    sample = init.xyz if len(init) <= 20_000 else init.subsample(20_000, seed=0).xyz
-    d, _ = tree.query(sample)
-    # The init cloud is a voxel downsample of the same points and the sparse model is a
-    # subsample of them, so every init point sits within about a voxel of a sparse point. The
-    # floor keeps a fine voxel from making the check hypersensitive to float noise; what it is
-    # catching is a cloud from a different instrument, which is metres away, not centimetres.
-    voxel = _init_voxel_m(ds)
-    tol = max(2.0 * voxel, 0.05) if voxel else 0.05
-    if float(np.max(d)) > tol:
+    # The cameras too. Points alone would leave the poses swappable, and a dataset whose views
+    # are somebody else's views renders depth of a tunnel these images never saw. This does not
+    # make the golden gate redundant: it catches *substituted* poses, while a reconstruction
+    # whose own poses and points disagree reproduces here faithfully and is caught by looking.
+    want = {n: c - origin for n, c in _camera_centres(model_tls).items()}
+    got = _camera_centres(sparse)
+    unknown = sorted(set(got) - set(want))
+    if unknown:
         raise ContractError(
-            f"{ds}: init_points.ply declares source sfm_sparse, but its points are up to "
-            f"{float(np.max(d)):.3f} m from the reconstruction's own points. This cloud did "
-            "not come from this reconstruction, whatever the manifest says."
+            f"{ds}: sparse/0 registers images {unknown[:5]} that the reconstruction beside it "
+            "does not. These views came from somewhere else."
         )
-    if rec_sfm.frame != Frame.SFM_INTERNAL.value:  # pragma: no cover - schema pins it
-        raise ContractError(f"{ds}: the recorded SfM model is not in SFM_INTERNAL")
+    off = {n: float(np.linalg.norm(got[n] - want[n])) for n in got}
+    worst = max(off.items(), key=lambda kv: kv[1], default=(None, 0.0))
+    if worst[0] is not None and worst[1] > tol:
+        raise ContractError(
+            f"{ds}: camera {worst[0]!r} sits {worst[1]:.3f} m from where the registered "
+            "reconstruction puts it. The dataset's poses are not this reconstruction's poses."
+        )
+
+
+def _declared_holdout(manifest: Manifest) -> list[tuple[float, float]]:
+    ho = manifest.split.geometry_holdout
+    return [] if ho is None else [tuple(r) for r in ho.chainage_ranges_m]
+
+
+def _centerline_of(ds: Path, manifest: Manifest) -> Centerline:
+    ref = manifest.centerline
+    if ref is None:
+        raise ContractError(
+            f"{ds}: a chainage holdout is declared with no reference axis to measure it along"
+        )
+    return Centerline.from_csv(ds / ref.file, ref.frame, ref.source)
 
 
 __all__ = [

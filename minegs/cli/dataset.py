@@ -310,6 +310,12 @@ def from_sfm(
     group_size: int = typer.Option(8, help="frames per capture group on the plain-video path"),
     test_groups: str = typer.Option("", help="comma-separated group ids held out from training"),
     holdout_m: str = typer.Option("", help="geometry holdout chainage, e.g. '30:38'"),
+    holdout_images_excluded: bool = typer.Option(
+        False,
+        help="extrapolation test: keep the holdout's images out of training too. Off is the "
+        "reconstruction test, where those images are trained on and the held-out TLS geometry "
+        "is what the result is measured against.",
+    ),
     centerline: Path | None = typer.Option(None, help="design centerline CSV in TLS_GLOBAL"),
     init_voxel_m: float = typer.Option(0.02),
     overwrite: bool = typer.Option(False),
@@ -332,6 +338,7 @@ def from_sfm(
             group_size=group_size,
             test_groups=[g for g in test_groups.split(",") if g.strip()],
             geometry_holdout_m=_ranges(holdout_m) or [],
+            holdout_images_excluded=holdout_images_excluded,
             centerline_file=str(centerline) if centerline else None,
             centerline_source="design" if centerline else "extracted",
             init_voxel_m=init_voxel_m,
@@ -348,7 +355,12 @@ def from_sfm(
                 f"  registration {reg.registration_id}: claim_allowed={reg.claim_allowed}, "
                 f"support={reg.support_ranges_m}"
             )
-        console.print(f"  {len(manifest.capture_groups)} capture groups")
+        ho = manifest.split.geometry_holdout
+        console.print(
+            f"  {len(manifest.capture_groups)} capture groups, "
+            f"{len(manifest.split.train_groups)} training"
+            + (f", holdout images excluded: {ho.images_excluded}" if ho else "")
+        )
 
     run_guarded(go)
 

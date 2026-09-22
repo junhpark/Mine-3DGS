@@ -821,7 +821,7 @@ handler 그대로다. 학습·depth·surface·geometry·sections·volume 의 구
 | S8 | `run_sfm` 의 다중 component 거부 (`tests/test_cli.py`) |
 | S9 | T10 |
 | S10 | T29, T30 |
-| S11 | `test_the_report_says_what_was_substituted_and_claims_nothing`, `test_the_comparison_refuses_to_be_read_as_a_measurement` |
+| S11 | `test_the_report_says_what_was_substituted_and_claims_nothing`, `test_the_comparison_refuses_to_be_read_as_a_measurement`, T34, T34b |
 
 ### 17.5 계약이 비어 있던 곳 — 구현 중 발견
 
@@ -843,6 +843,49 @@ handler 그대로다. 학습·depth·surface·geometry·sections·volume 의 구
    — 갱도에서 모든 view 는 자기 주변만 보고, 갱구의 view 는 바깥의 어둠을 본다. 잡아야 할 실패는
    "**모든** 카메라가 아무것도 못 본다" 이므로, 중앙값과 blind 비율로 판정하고 분포는 어느 쪽이든
    report 에 남긴다.
+
+### 17.5b 독립 검토(round 1) 가 찾은 claim boundary 구멍 4건
+
+§17.5 의 4건은 구현 중에 찾은 것이고, 아래 4건은 **첫 독립 검토**가 찾았다. 전부 "기능이 안
+돌아간다" 가 아니라 **claim/provenance 를 우회할 수 있는 경로**였다. 공통 원인은 하나다 —
+*결론을 다시 도출하지 않고 읽었다*.
+
+1. **registration 의 claim 을 재도출하지 않았다.** `decide_claim()` 은 생성 시 한 번 실행되고,
+   `claim_allowed` / `claim_refusals` / `support_ranges_m` 는 그 결론이다. `check_registration()`
+   은 그 결론을 되읽기만 했고, 품질 게이트의 판정은 `quality_gate.json` 이라는 **record 밖 파일**
+   에 있어서 재도출할 재료조차 없었다. → `QualityGate` 를 `RegistrationRecord` 안으로 옮기고,
+   `check_registration()` 이 `evaluate_gate()` 와 `decide_claim()` 을 **다시 실행**해 기록된
+   결론과 대조한다. 어긋나면 거부.
+   덧붙여 **manifest 의 사본**이 record 와 같은지도 검사하지 않았다 — protocol judge 는 record 가
+   아니라 manifest 를 읽는다. record digest 가 맞아도 manifest 쪽 `claim_allowed` 만 뒤집으면
+   측정이 거부한 claim 이 허용되었다. → `CLAIM_BEARING_FIELDS` 전부를 record 와 대조한다.
+2. **"숨은 TLS init 없음" 이 원본 SfM 에 묶여 있지 않았다.** `_check_init_is_sfm_geometry` 는
+   `init_points.ply` 를 **같은 dataset 안의** `sparse/0` 와 비교했다. 둘 다 같은 TLS geometry 로
+   바꾸면 서로 완벽히 일치하므로 통과했다. 한 주장의 사본 두 개는 그 주장의 증거가 아니다.
+   → 선택된 SFM_INTERNAL model 을 `provenance/phase3/sfm_model/` 에 **번들**하고(digest 로 고정),
+   거기서 측정된 Sim(3) → local origin → holdout 제외 순서로 **다시 도출**해 dataset 의 두 cloud
+   와 **카메라 중심**까지 대조한다. 포즈까지 보는 이유는 점만 보면 view 를 갈아끼울 수 있기 때
+   문이고, 이것이 golden gate 를 대체하지는 않는다 — 원본 재구성 자체가 어긋난 경우는 여기서
+   충실히 재현되고 **눈으로 보는 쪽**에서 걸린다.
+3. **`images_excluded=True` 가 실제 train split 과 연결되지 않았다.** `train_images()` 가 읽기
+   시점에 걸러 주기는 하지만 chainage 를 **아는** 그룹만 거르고, 못 재는 그룹은 **남긴다**. 즉
+   manifest 는 외삽 시험이라고 기록하면서 holdout 안의 그룹이 학습에 들어갈 수 있었다. CLI 에는
+   플래그조차 없어 기본값 `True` 가 자동 적용되었다. → 기본값을 **`False`(복원 시험)** 로 내리고
+   CLI 에 노출했으며, `True` 일 때는 빌드 시점에 holdout 과 겹치는 capture group 을
+   `train_groups` 에서 **빼고**, chainage 를 못 재는 그룹이 있으면 **거부**한다. 확인할 수 없는
+   제외는 제외가 아니다.
+4. **`real_execution` 이 누락과 덮어쓰기를 통과시켰다.** 두 경로의 flag 를 하나의 dict 로 합쳐
+   판정했기 때문에 (i) 필수 key 존재 여부를 보지 않았고 — flag 하나만 true 여도 참이 되었다 —
+   (ii) image 쪽 값이 같은 이름의 TLS 쪽 값을 **덮어썼다**. 실제 G2 에서 TLS trainer 대체 사실이
+   사라질 수 있었다. → 경로별 필수 목록(`REQUIRED_EXECUTION`)을 두고 **따로** 판정한다. 없는
+   key 는 "모른다" 이고, 모르면 거짓이다.
+
+부수적으로, inlier 가 하나도 없을 때 diagnostics 가 NaN 이 되고 NaN 은 JSON 왕복을 통과하지
+못해 record 가 **쓰이고 다시 읽히지 않는** 상태가 되었다. 두 단계 뒤에 "null 은 float 이 아니다"
+라는 스키마 오류로 드러나던 것을, 발생 지점에서 그 이유로 거부한다.
+
+T31–T36 이 이 여섯을 고정한다. 여섯 guard 모두 mutation check 로 load-bearing 임을 확인했다 —
+각각 무력화하면 담당 테스트가 실제로 깨진다.
 
 ### 17.6 성숙도
 

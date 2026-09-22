@@ -85,6 +85,9 @@ def phase3_config(scene, root: Path, **over) -> E2EConfig:
         dataset_id=over.pop("dataset_id", DATASET_ID),
         source="video360",
         geometry_holdout_m=over.pop("holdout", [HOLDOUT]),
+        # The gate keeps the stricter setting so the build-time enforcement is exercised; the
+        # library default is the weaker declaration (§T35).
+        holdout_images_excluded=over.pop("images_excluded", True),
         centerline_file=str(scene.centerline_csv),
         centerline_source="design",
         init_voxel_m=0.05,
@@ -658,7 +661,7 @@ def test_t21_an_initialisation_from_another_instrument_is_refused(scene, dataset
         PointCloud(tls.xyz[:2000] - np.asarray(m.T_tls_from_local.t), frame="LOCAL_METRIC"),
         dataset_copy / m.initialization.file,
     )
-    with pytest.raises(ContractError, match="did not come from this reconstruction"):
+    with pytest.raises(ContractError, match="did not come from that reconstruction"):
         check_image_only_dataset(dataset_copy)
 
 
@@ -726,28 +729,56 @@ def test_t26_each_gate_refuses_the_dataset_it_has_no_evidence_for(gate, tls_gate
         run_image_only_gate(tls_ds, tmp_path / "out", raise_on_fail=False)
 
 
-def test_t27_a_reconstruction_whose_poses_and_points_are_not_in_one_space_fails(
-    gate, dataset_copy, tmp_path
-):
-    # Both clouds move together, so the initialisation is still the reconstruction's own
-    # points and `check_image_only_dataset` passes. What is broken is the one thing this gate
-    # is for: the cameras and the geometry are no longer in the same space.
-    from minegs.core.manifest import Manifest
-    from minegs.dataset.golden_gate_sfm import run_image_only_gate
+def test_t27_a_reconstruction_whose_poses_and_points_are_not_in_one_space_fails(scene, tmp_path):
+    """A bad reconstruction, not a tampered dataset.
+
+    Moving the dataset's points or poses after the fact is caught earlier, by the check that
+    re-derives them from the reconstruction the dataset names. What that check cannot catch is
+    an SfM whose *own* output is incoherent: the dataset reproduces it faithfully, every digest
+    agrees, and only looking through the cameras shows that they see nothing. That is the gate
+    this test is about, so the incoherence is put where a real one would be — in the
+    reconstruction itself.
+    """
+    from minegs.core.frames import quat_to_rotmat
     from minegs.ingest.common import colmap_io
 
-    shift = np.array([500.0, 0.0, 0.0])
-    model = colmap_io.read_model(dataset_copy / "sparse" / "0")
-    for pid, pt in model.points3D.items():
-        model.points3D[pid] = colmap_io.Point3D(pid, pt.xyz + shift, pt.rgb)
-    colmap_io.write_model(model, dataset_copy / "sparse" / "0")
-    m = Manifest.load_dataset(dataset_copy, strict_layout=False)
-    init = read_ply(dataset_copy / m.initialization.file)
-    write_ply(
-        PointCloud(init.xyz + shift, rgb=init.rgb, frame="LOCAL_METRIC"),
-        dataset_copy / m.initialization.file,
-    )
-    report = run_image_only_gate(dataset_copy, tmp_path / "out", raise_on_fail=False)
+    from video_survey import stand_in_sfm
+
+    honest = stand_in_sfm(scene.survey)
+
+    def adrift(images_dir, work_dir, opts):
+        # The poses drift away from the points, not the other way round: the points are what
+        # the registration measures itself against, and moving them would leave nothing to
+        # measure rather than a reconstruction that is wrong in the way this gate is for.
+        run = honest(images_dir, work_dir, opts)
+        model = colmap_io.read_model(work_dir / "sparse/0")
+        shift = np.array([500.0, 0.0, 0.0])
+        for iid, im in model.images.items():
+            R_cw = quat_to_rotmat(im.qvec)
+            model.images[iid] = colmap_io.Image(
+                im.id,
+                im.qvec,
+                im.tvec - R_cw @ shift,
+                im.camera_id,
+                im.name,
+                im.xys,
+                im.point3D_ids,
+            )
+        colmap_io.write_model(model, work_dir / "sparse/0")
+        return run
+
+    root = tmp_path / "wf"
+    cfg = phase3_config(scene, root, dataset_id="adrift")
+    wf = Workflow(root / "wf", cfg)
+    with pytest.raises(ContractError) as excinfo:
+        wf.execute(
+            phase3_specs(),
+            through=Stage.DATASET,
+            sfm=adrift,
+            frame_extractor=copy_extractor(scene.survey.frames_dir),
+        )
+    assert "image-only golden gate" in str(excinfo.value)
+    report = json.loads(next((root / "wf").rglob("golden_gate_sfm.json")).read_text())
     assert report["structural_result"] == "fail"
     assert any("one space" in p for p in report["problems"])
 
@@ -870,3 +901,262 @@ def test_a_360_survey_delivered_as_a_folder_of_panoramas_still_gets_its_ring(sce
     )
     assert missing.exit_code != 0
     assert "neither a video file nor a directory" in missing.output
+
+
+# ================================================================ T31-T35, round 2
+#
+# The four paths a reviewer found around the claim boundary. Each one passed every check in
+# the first round of this gate.
+
+
+def registration_of(dataset_dir: Path):
+    from minegs.eval.register.models import RegistrationRecord
+
+    path = Path(dataset_dir) / PROVENANCE_DIR / "registration.json"
+    return RegistrationRecord.load(path), path
+
+
+def test_t31_a_registration_that_declares_a_claim_it_did_not_derive_is_refused(gate, tmp_path):
+    """`claim_allowed` is a conclusion, and a conclusion in JSON is four characters from true.
+
+    The earlier check compared the SfM model digest and asked one question about unknown
+    support. Everything `decide_claim` reached — the verdict, the refusals, the support extent —
+    was read back and believed.
+    """
+    from minegs.eval.register.models import check_registration, load_registration
+
+    src = Path(outputs(gate.state, Stage.INGEST)["registration_dir"])
+    dst = tmp_path / "reg"
+    shutil.copytree(src, dst)
+    rec, _ = load_registration(dst)
+    check_registration(rec, rec.sfm_model_sha256)  # honest record, re-derives cleanly
+
+    def edited(**over):
+        doc = json.loads((dst / "registration.json").read_text())
+        doc.update(over)
+        (dst / "registration.json").write_text(json.dumps(doc, indent=2))
+        return load_registration(dst)[0]
+
+    # the thresholds are gone and the gate honestly says so — but the claim still says yes
+    no_gate = edited(
+        quality_gate={
+            "thresholds": None,
+            "passed": False,
+            "reasons": ["no thresholds configured"],
+        }
+    )
+    with pytest.raises(ContractError, match="not derived from the evidence"):
+        check_registration(no_gate, no_gate.sfm_model_sha256)
+
+    # the refusals are deleted but the evidence that produced them is not
+    silent = edited(
+        quality_gate=rec.quality_gate.model_dump(mode="json"),
+        ransac_fallback_used=True,
+        claim_allowed=True,
+        claim_refusals=[],
+    )
+    with pytest.raises(ContractError, match="not derived from the evidence"):
+        check_registration(silent, silent.sfm_model_sha256)
+
+    # the gate verdict itself is rewritten to pass against thresholds it fails
+    forged = edited(
+        ransac_fallback_used=False,
+        claim_allowed=True,
+        claim_refusals=[],
+        quality_gate={"thresholds": {"max_rmse_m": 1e-9}, "passed": True, "reasons": []},
+    )
+    with pytest.raises(ContractError, match="does not follow from its own diagnostics"):
+        check_registration(forged, forged.sfm_model_sha256)
+
+
+def test_t32_a_manifest_that_disagrees_with_its_registration_is_refused(dataset_copy):
+    """The protocol judge reads the manifest, so the copy has to be the record.
+
+    The digest check proves the *record* is unedited and says nothing about the manifest's
+    copy of it: flipping `claim_allowed` there, or emptying the support ranges, sat beside a
+    perfectly intact record and granted exactly what the measurement refused.
+    """
+    from minegs.core.manifest import Manifest
+    from minegs.dataset.from_sfm import check_image_only_dataset
+
+    check_image_only_dataset(dataset_copy)
+    rec, _ = registration_of(dataset_copy)
+    honest = {
+        "claim_allowed": rec.claim_allowed,
+        "claim_refusals": list(rec.claim_refusals),
+        "support_ranges_m": rec.support_ranges_m,
+        "scale": float(rec.scale),
+        "rmse_m": float(rec.diagnostics.rmse_m),
+    }
+
+    def set_registration(**over):
+        m = Manifest.load_dataset(dataset_copy, strict_layout=False)
+        for k, v in over.items():
+            setattr(m.registration, k, v)
+        m.save_dataset(dataset_copy)
+
+    # Any disagreement, either direction: the manifest is not allowed to be a second opinion.
+    for over in (
+        {"claim_allowed": not honest["claim_allowed"]},
+        {"claim_refusals": ["a reason nobody measured"]},
+        {"support_ranges_m": [(0.0, 5.0)]},
+        {"scale": honest["scale"] * 1.02},
+        {"rmse_m": 0.0},
+    ):
+        set_registration(**over)
+        with pytest.raises(ContractError, match=r"not the registration it names|measured scale"):
+            check_image_only_dataset(dataset_copy)
+        set_registration(**honest)
+    check_image_only_dataset(dataset_copy)  # restored
+
+
+def test_t33_replacing_both_clouds_with_tls_geometry_is_refused(scene, dataset_copy):
+    """Two copies of a claim are not evidence for it.
+
+    `init_points.ply` used to be compared against `sparse/0` — both inside the dataset. Put the
+    same scanner geometry in both and they agree with each other perfectly, so a dataset whose
+    initialisation came from a TLS passed a check named after refusing exactly that.
+    """
+    from minegs.core.manifest import Manifest
+    from minegs.dataset.from_sfm import check_image_only_dataset
+    from minegs.ingest.common import colmap_io
+
+    check_image_only_dataset(dataset_copy)
+    m = Manifest.load_dataset(dataset_copy, strict_layout=False)
+    origin = np.asarray(m.T_tls_from_local.t)
+    tls_local = read_ply(scene.tls).xyz[:3000] - origin
+
+    write_ply(PointCloud(tls_local, frame="LOCAL_METRIC"), dataset_copy / m.initialization.file)
+    model = colmap_io.read_model(dataset_copy / "sparse" / "0")
+    model.points3D = {
+        i + 1: colmap_io.Point3D(i + 1, tls_local[i], np.full(3, 128, np.uint8))
+        for i in range(len(tls_local))
+    }
+    colmap_io.write_model(model, dataset_copy / "sparse" / "0")
+
+    with pytest.raises(ContractError, match="did not come from that reconstruction"):
+        check_image_only_dataset(dataset_copy)
+
+
+def test_t34_a_path_that_did_not_say_what_ran_is_not_a_real_execution():
+    """`real_execution` is per path, over a required list, and absence is not consent."""
+    from minegs.eval.compare.paths import REQUIRED_EXECUTION, _path_execution
+
+    full_tls = dict.fromkeys(REQUIRED_EXECUTION["tls_assisted"], True)
+    full_img = dict.fromkeys(REQUIRED_EXECUTION["image_only"], True)
+    assert _path_execution("tls_assisted", full_tls)[0] is True
+    assert _path_execution("image_only", full_img)[0] is True
+
+    # one required stage never reported
+    for label, full in (("tls_assisted", full_tls), ("image_only", full_img)):
+        for key in REQUIRED_EXECUTION[label]:
+            partial = {k: v for k, v in full.items() if k != key}
+            real, missing, _ = _path_execution(label, partial)
+            assert real is False and missing == [key]
+
+    # and one path's truth cannot cover the other's substitution
+    assert _path_execution("tls_assisted", {**full_tls, "real_gpu_execution": False})[0] is False
+    assert _path_execution("image_only", full_img)[0] is True
+
+
+def test_t34b_one_paths_real_stage_cannot_erase_the_others_substitution(gate, tls_gate):
+    from minegs.eval.compare import REQUIRED_EXECUTION, compare_paths, path_context
+    from minegs.eval.sections import load_section_input
+
+    def side(g):
+        sv = outputs(g.state, Stage.SECTIONS_VOLUME)
+        pred, _ = load_section_input(sv["sections_predicted_path"])
+        ref, _ = load_section_input(sv["sections_reference_path"])
+        return path_context(outputs(g.state, Stage.DATASET)["dataset_dir"]), pred, ref
+
+    tls_ctx, tls_pred, tls_ref = side(tls_gate)
+    img_ctx, img_pred, img_ref = side(gate)
+    # the TLS trainer was substituted; the image path claims every stage of its own ran
+    tls_ctx["execution"] = dict.fromkeys(REQUIRED_EXECUTION["tls_assisted"], False)
+    img_ctx["execution"] = dict.fromkeys(REQUIRED_EXECUTION["image_only"], True)
+    rep = compare_paths(
+        tls_pred=tls_pred,
+        tls_ref=tls_ref,
+        image_pred=img_pred,
+        image_ref=img_ref,
+        ranges=[HOLDOUT],
+        tls_context=tls_ctx,
+        image_context=img_ctx,
+        comparison_id="overwrite",
+    )
+    assert rep.real_execution is False
+    assert any("TLS-assisted path substituted" in n for n in rep.notes)
+    assert rep.tls_assisted.execution["real_gpu_execution"] is False
+
+
+def test_t35_an_image_exclusion_nobody_can_check_is_not_an_exclusion(scene, tmp_path):
+    """`images_excluded=True` has to be true of the dataset, not only of the reader.
+
+    `train_images()` drops holdout groups at read time — but only those whose chainage is
+    known, and it keeps a group it cannot place. So a manifest could record the extrapolation
+    test while a group sitting inside the holdout was trained on.
+    """
+    from minegs.core.manifest import Manifest
+
+    excluded = run_phase3(
+        scene, tmp_path / "wf", through=Stage.DATASET, dataset_id="excl", images_excluded=True
+    )
+    ds = Path(outputs(excluded.state, Stage.DATASET)["dataset_dir"])
+    m = Manifest.load_dataset(ds, strict_layout=False)
+    assert m.split.geometry_holdout.images_excluded is True
+    lo, hi = HOLDOUT
+    spans = {g: m.capture_groups[g].span() for g in m.split.train_groups}
+    assert all(s is not None for s in spans.values()), spans
+    assert not [g for g, (a, b) in spans.items() if a <= hi and b >= lo], spans
+    # and the manifest says so structurally: train_images() has nothing left to filter
+    assert sorted(m.train_images()) == sorted(m.images_of(m.split.train_groups))
+
+    kept = run_phase3(
+        scene, tmp_path / "wf2", through=Stage.DATASET, dataset_id="kept", images_excluded=False
+    )
+    m2 = Manifest.load_dataset(
+        Path(outputs(kept.state, Stage.DATASET)["dataset_dir"]), strict_layout=False
+    )
+    assert m2.split.geometry_holdout.images_excluded is False
+    assert [
+        g
+        for g, s in ((g, m2.capture_groups[g].span()) for g in m2.split.train_groups)
+        if s and s[0] <= hi and s[1] >= lo
+    ], "the reconstruction test keeps those images"
+
+
+def test_t36_a_registration_with_nothing_to_measure_refuses_instead_of_writing_nulls(
+    scene, tmp_path
+):
+    """A residual that is not a number is not a small residual.
+
+    With no inlier anywhere, the diagnostics come back NaN — and NaN does not survive a JSON
+    round trip, so the record was written and then could not be read: the failure surfaced two
+    stages later as a schema error about a null float. It is refused where it happens, as what
+    it is.
+    """
+    from minegs.ingest.common import colmap_io
+
+    from video_survey import stand_in_sfm
+
+    honest = stand_in_sfm(scene.survey)
+
+    def nowhere(images_dir, work_dir, opts):
+        run = honest(images_dir, work_dir, opts)
+        model = colmap_io.read_model(work_dir / "sparse/0")
+        model.points3D = {
+            pid: colmap_io.Point3D(pid, pt.xyz + np.array([1e6, 0.0, 0.0]), pt.rgb)
+            for pid, pt in model.points3D.items()
+        }
+        colmap_io.write_model(model, work_dir / "sparse/0")
+        return run
+
+    root = tmp_path / "wf"
+    wf = Workflow(root / "wf", phase3_config(scene, root, dataset_id="nowhere"))
+    with pytest.raises(ContractError, match="are not numbers"):
+        wf.execute(
+            phase3_specs(),
+            through=Stage.INGEST,
+            sfm=nowhere,
+            frame_extractor=copy_extractor(scene.survey.frames_dir),
+        )

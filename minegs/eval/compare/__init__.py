@@ -1,6 +1,7 @@
 from minegs.eval.compare.paths import (
     COMPARISON_FILE,
     MATURITY_PENDING,
+    REQUIRED_EXECUTION,
     PathComparison,
     PathResult,
     compare_paths,
@@ -11,6 +12,7 @@ from minegs.eval.compare.paths import (
 __all__ = [
     "COMPARISON_FILE",
     "MATURITY_PENDING",
+    "REQUIRED_EXECUTION",
     "PathComparison",
     "PathResult",
     "compare_paths",

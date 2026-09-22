@@ -183,6 +183,21 @@ def register_sfm(
         inlier_m=inlier_m if inlier_m is not None else icp_max_dist_m / 5,
         method="sim3+icp" if icp.used else "sim3",
     )
+    # A registration with no inliers produces NaN residuals, and NaN does not survive a JSON
+    # round trip: the record was written and could not be read back, so the failure surfaced
+    # later as a schema error about a null float instead of here, as what it is.
+    unusable = sorted(
+        name
+        for name in ("rmse_m", "median_m", "p90_m", "inlier_ratio", "scale")
+        if not np.isfinite(getattr(diagnostics, name))
+    )
+    if unusable:
+        raise ContractError(
+            f"the registration diagnostics are not numbers ({', '.join(unusable)}): the "
+            f"transform put {diagnostics.n_source} reconstruction points nowhere near the "
+            "reference, so there is nothing to judge. Check the correspondences and the "
+            "reference cloud rather than recording this as a measurement."
+        )
     gate = evaluate_gate(diagnostics, icp, thresholds)
     allowed, refusals, support = decide_claim(
         basis=basis,
@@ -216,6 +231,7 @@ def register_sfm(
         scale=float(T.s),
         icp=icp,
         diagnostics=diagnostics,
+        quality_gate=gate,
         ransac_fallback_used=fell_back,
         reference_file=ref_path.name if ref_path else None,
         reference_sha256=sha256_file(ref_path) if ref_path else None,
@@ -224,8 +240,9 @@ def register_sfm(
         provenance=stamp(options, parents=[rec_sfm.sfm_id]),
     )
     check_registration(record, rec_sfm.model_sha256)
+    # One copy of the verdict, inside the record that rests on it. A second file beside it
+    # would be a verdict nothing re-derives and nothing compares.
     (out / REGISTRATION_FILE).write_text(record.model_dump_json(indent=2))
-    (out / "quality_gate.json").write_text(gate.model_dump_json(indent=2))
     return record, out
 
 

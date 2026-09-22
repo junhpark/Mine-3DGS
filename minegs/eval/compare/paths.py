@@ -40,6 +40,20 @@ from minegs.eval.volume.paired import (
 
 COMPARISON_FILE = "path_comparison.json"
 
+#: What each path has to have declared before its numbers can be called real, by label. Every
+#: key must be present *and* true: a stage nobody reported is "we do not know", and we do not
+#: know is not "it ran". The two lists differ because the scanner path has no SfM and no frame
+#: decoder, so requiring those of it would make a real TLS survey unprovable.
+REQUIRED_EXECUTION: dict[str, tuple[str, ...]] = {
+    "tls_assisted": ("real_gpu_execution", "real_renderer_execution"),
+    "image_only": (
+        "real_frame_extraction",
+        "real_sfm_execution",
+        "real_gpu_execution",
+        "real_renderer_execution",
+    ),
+}
+
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -81,8 +95,9 @@ class PathComparison(VersionedModel):
     #: The difference the comparison exists for, over the common domain only.
     volume_difference_m3: float | None = None
     section_median_difference_m2: float | None = None
-    #: True only when every stage on both paths declared itself real. Anything substituted,
-    #: or undeclared, leaves this False and these numbers structural rather than scientific.
+    #: True only when **each** path separately declared every stage it needs and declared
+    #: them all real. Anything substituted, or undeclared, leaves this False and these numbers
+    #: structural rather than scientific.
     real_execution: bool = False
     maturity_statement: str = ""
     notes: list[str] = Field(default_factory=list)
@@ -171,6 +186,14 @@ def require_same_holdout(
             "comparing them would compare two experiments, not two reconstruction paths"
         )
     return sorted(a)
+
+
+def _path_execution(label: str, flags: dict[str, bool]) -> tuple[bool, list[str], list[str]]:
+    """Whether one path really ran, what it never reported, and what it substituted."""
+    required = REQUIRED_EXECUTION[label]
+    missing = [k for k in required if k not in flags]
+    substituted = sorted(k for k, v in flags.items() if not v)
+    return (not missing and not substituted), missing, substituted
 
 
 def _intersect(a: list[Interval], b: list[Interval]) -> list[Interval]:
@@ -269,17 +292,25 @@ def compare_paths(
 
     exec_tls = dict(tls_context.get("execution", {}))
     exec_img = dict(image_context.get("execution", {}))
-    flags = {**exec_tls, **exec_img}
-    real = bool(flags) and all(bool(v) for v in flags.values())
+    # Judged per path, never on a merged dictionary. Merging let one path's flag overwrite the
+    # other's under the same key — an image path that really trained could erase the fact that
+    # the TLS path's trainer was substituted — and it let a single true flag stand in for a
+    # list nobody checked was complete.
+    real_tls, missing_tls, subs_tls = _path_execution("tls_assisted", exec_tls)
+    real_img, missing_img, subs_img = _path_execution("image_only", exec_img)
+    real = real_tls and real_img
     if not real:
-        substituted = sorted(k for k, v in flags.items() if not v)
+        for label, missing, substituted in (
+            ("the TLS-assisted path", missing_tls, subs_tls),
+            ("the image-only path", missing_img, subs_img),
+        ):
+            if substituted:
+                notes.append(f"{label} substituted {', '.join(substituted)}")
+            if missing:
+                notes.append(f"{label} did not say whether {', '.join(missing)} really ran")
         notes.append(
-            "this comparison is structural evidence about the pipeline and not a measurement "
-            + (
-                f"of a mine: {', '.join(substituted)} did not really run"
-                if substituted
-                else "of a mine: neither path declared which of its stages really ran"
-            )
+            "so this comparison is structural evidence about the pipeline and not a "
+            "measurement of a mine"
         )
 
     vol_tls = paired_tls.volume.predicted_volume_m3
@@ -329,6 +360,7 @@ def compare_paths(
 __all__ = [
     "COMPARISON_FILE",
     "MATURITY_PENDING",
+    "REQUIRED_EXECUTION",
     "PathComparison",
     "PathResult",
     "compare_paths",

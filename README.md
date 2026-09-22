@@ -657,14 +657,27 @@ minegs eval compare-paths data/tls/dataset data/driftA/dataset \
   holdout 과의 겹침을 판정할 수 없고, 판정할 수 없으면 거부다.
 * **threshold 가 없으면 claim 도 없다.** 숫자 없는 게이트는 전부 통과시킨다. 실측 전에 발명한 숫자는
   아무 데이터도 근거하지 않은 threshold 라 더 나쁘다.
+* **claim 은 읽는 것이 아니라 다시 도출된다.** `claim_allowed` 는 결론이므로 `registration.json`
+  을 다시 열 때마다 품질 게이트와 함께 **재계산**해 기록된 값과 대조한다. manifest 가 들고 있는
+  사본도 record 와 전부 대조한다 — protocol judge 가 읽는 것은 manifest 쪽이다.
+* **init 이 재구성에서 왔다는 것은 원본과 대조해 증명된다.** dataset 안의 두 cloud 를 서로
+  비교하는 것은 같은 주장의 사본 두 개일 뿐이다. 선택된 SfM model 이
+  `provenance/phase3/sfm_model/` 에 번들되고, 거기서 측정된 Sim(3) → local origin → holdout
+  제외를 다시 밟아 `init_points.ply`·`sparse/0`·카메라 중심을 대조한다.
 * **holdout 은 선언이 아니라 사실이다.** image-only 경로에서 init cloud 는 재구성 그 자체이므로,
   `init_points.ply` 와 `sparse/0` **양쪽**에서 holdout chainage 의 점을 뺀다.
+  `--holdout-images-excluded`(외삽 시험) 를 켜면 holdout 과 겹치는 capture group 이 빌드 시점에
+  `train_groups` 에서 빠지고, chainage 를 잴 수 없는 그룹이 있으면 거부한다. 기본값은
+  **꺼짐**(복원 시험) 이다 — 플래그를 안 줬다는 이유로 더 강한 실험이라고 기록되면 안 된다.
 * **`golden-gate` 는 dataset 의 source 를 보고 갈라진다.** image-only 판은 `gate_kind:
   image_sfm_registered` 를 적고, `real_data_validation_status` 는 언제나
   `pending_human_inspection` 이다 — 사람이 볼 때까지.
 * **`compare-paths` 는 먼저 거부하고 나중에 비교한다.** 같은 grid 에서 잘리지 않았거나 서로 다른
   holdout 으로 평가된 두 경로는 비교하지 않는다. 체적은 둘이 **함께 관측한** 구간에서만 적분되고,
   빠진 구간은 보고된다.
+* **`real_execution` 은 경로별로 판정된다.** TLS 쪽과 image 쪽의 필수 stage 목록이 다르므로
+  따로 본다. flag 를 합치면 한쪽의 `true` 가 다른 쪽의 `false` 를 덮어쓰고, 목록에 없는 stage 는
+  아무도 보고하지 않은 채 통과한다. 없는 key 는 "모른다" 이고, 모르면 거짓이다.
 * **CLI 에 SfM·프레임 추출을 대체하는 flag 는 없다.** trainer/renderer 와 같은 규칙이다.
 
 ### 지금 검증된 것과 아닌 것
