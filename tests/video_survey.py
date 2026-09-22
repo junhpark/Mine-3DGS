@@ -182,10 +182,18 @@ def stand_in_sfm(survey: VideoSurvey, *, max_points: int = 6000, seed: int = 11)
         images: dict[int, colmap_io.Image] = {}
         for iid, path in enumerate(sorted(images_dir.rglob("*.png")), start=1):
             rel = path.relative_to(images_dir).as_posix()
-            view_name = rel.split("/")[0]
-            stem = Path(rel).stem.removesuffix(f"_{view_name}")
-            view, pose = views[view_name], survey.pano_poses[stem]
-            R_tls_from_cam = pose.R @ view.R_scanner_from_cam
+            if "/" in rel:
+                # A 360 ring crop: `p0y02/v_000007_p0y02.png`, one camera per view.
+                view_name = rel.split("/")[0]
+                stem = Path(rel).stem.removesuffix(f"_{view_name}")
+                R_scanner_from_cam = views[view_name].R_scanner_from_cam
+            else:
+                # A plain frame: one forward-looking camera per capture, which is what the
+                # traverse path produces. Same rig geometry as the ring's first view.
+                view_name, stem = sorted(views)[0], Path(rel).stem
+                R_scanner_from_cam = views[view_name].R_scanner_from_cam
+            pose = survey.pano_poses[stem]
+            R_tls_from_cam = pose.R @ R_scanner_from_cam
             centre_sfm = T_SFM_FROM_TLS.apply(pose.t.reshape(1, 3))[0]
             R_sfm_from_cam = T_SFM_FROM_TLS.R @ R_tls_from_cam
             R_cw = R_sfm_from_cam.T

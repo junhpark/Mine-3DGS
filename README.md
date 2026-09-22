@@ -655,8 +655,10 @@ minegs eval compare-paths data/tls/dataset data/driftA/dataset \
   말하지 pose 의 출처를 말하지 않는다. 타깃으로 scale 을 잡고 전체 TLS 로 pose 를 refine 하면 결과는
   **diagnostic** 이다 — 전체와 겹치지 않는 holdout 은 없기 때문이다. support 범위를 기록하지 않으면
   holdout 과의 겹침을 판정할 수 없고, 판정할 수 없으면 거부다.
-* **threshold 가 없으면 claim 도 없다.** 숫자 없는 게이트는 전부 통과시킨다. 실측 전에 발명한 숫자는
-  아무 데이터도 근거하지 않은 threshold 라 더 나쁘다.
+* **threshold 가 없으면 claim 도 없고, 불완전해도 없다.** claim 을 지는 게이트는
+  `max_rmse_m`·`min_inlier_ratio`·`min_correspondences` 셋 다 필요하다 — 각각은 혼자서는 눈이
+  멀었다. `{}` 는 관대한 게이트가 아니라 **판정했다고 기록되었으나 아무것도 보지 않은** 게이트라
+  이유와 함께 거부된다. 실측 전에 발명한 숫자는 아무 데이터도 근거하지 않은 threshold 라 더 나쁘다.
 * **claim 은 읽는 것이 아니라 다시 도출된다.** `claim_allowed` 는 결론이므로 `registration.json`
   을 다시 열 때마다 품질 게이트와 함께 **재계산**해 기록된 값과 대조한다. manifest 가 들고 있는
   사본도 record 와 전부 대조한다 — protocol judge 가 읽는 것은 manifest 쪽이다.
@@ -666,8 +668,10 @@ minegs eval compare-paths data/tls/dataset data/driftA/dataset \
   제외를 다시 밟아 `init_points.ply`·`sparse/0`·카메라 중심을 대조한다.
 * **holdout 은 선언이 아니라 사실이다.** image-only 경로에서 init cloud 는 재구성 그 자체이므로,
   `init_points.ply` 와 `sparse/0` **양쪽**에서 holdout chainage 의 점을 뺀다.
-  `--holdout-images-excluded`(외삽 시험) 를 켜면 holdout 과 겹치는 capture group 이 빌드 시점에
-  `train_groups` 에서 빠지고, chainage 를 잴 수 없는 그룹이 있으면 거부한다. 기본값은
+  `--holdout-images-excluded`(외삽 시험) 를 켜면 holdout 과 **겹치는** capture group 이 빌드
+  시점에 `train_groups` 에서 빠지고, chainage 를 잴 수 없는 그룹이 있으면 거부한다. 겹침은 그룹의
+  **구간**(`chainage_range_m`, 멤버 chainage 의 최소·최대) 으로 판정한다 — traverse 그룹은 갱도의
+  한 점이 아니라 한 구간이고, 중앙만 보면 한쪽 끝이 holdout 안에 들어간 그룹을 놓친다. 기본값은
   **꺼짐**(복원 시험) 이다 — 플래그를 안 줬다는 이유로 더 강한 실험이라고 기록되면 안 된다.
 * **`golden-gate` 는 dataset 의 source 를 보고 갈라진다.** image-only 판은 `gate_kind:
   image_sfm_registered` 를 적고, `real_data_validation_status` 는 언제나

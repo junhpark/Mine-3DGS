@@ -1160,3 +1160,154 @@ def test_t36_a_registration_with_nothing_to_measure_refuses_instead_of_writing_n
             sfm=nowhere,
             frame_extractor=copy_extractor(scene.survey.frames_dir),
         )
+
+
+# ================================================================ T37-T38, round 2
+#
+# A capture group is a stretch of drift, not a point on it; and a gate with a hole in it is
+# not a weaker gate.
+
+
+def plain_video_dataset(scene, root: Path, *, holdout, images_excluded, group_size=3):
+    """The traverse path: one camera per frame, groups of consecutive frames.
+
+    Built through the library rather than the workflow, because what is under test is the
+    builder's arithmetic over a group's members and the workflow would only carry it.
+    """
+    from minegs.dataset.from_sfm import SfmDatasetConfig, build_dataset_from_sfm
+    from minegs.eval.register.run import register_sfm
+    from minegs.ingest.video.build import build_frameset
+    from minegs.ingest.video.sfm.run import run_sfm
+
+    from video_survey import stand_in_sfm
+
+    _, fs_dir = build_frameset(
+        root / "fs",
+        kind="image_set",
+        image_dir=scene.survey.frames_dir,
+        blur_threshold=0.0,
+        hamming_threshold=0,
+    )
+    _, sfm_dir = run_sfm(fs_dir, root / "sfm", executor=stand_in_sfm(scene.survey))
+    _, reg_dir = register_sfm(
+        sfm_dir,
+        root / "reg",
+        basis="known_target",
+        targets_sfm=scene.survey.targets_sfm,
+        targets_tls=scene.survey.targets_tls,
+        reference_ply=scene.tls,
+        thresholds=dict(THRESHOLDS),
+    )
+    cfg = SfmDatasetConfig(
+        dataset_id="traverse",
+        source="video",
+        group_size=group_size,
+        geometry_holdout_m=[holdout],
+        holdout_images_excluded=images_excluded,
+        centerline_file=str(scene.centerline_csv),
+        centerline_source="design",
+        init_voxel_m=0.05,
+    )
+    return build_dataset_from_sfm(fs_dir, sfm_dir, reg_dir, root / "ds", cfg)
+
+
+def test_t37_a_group_that_straddles_the_holdout_boundary_is_excluded(scene, tmp_path):
+    """A group's midpoint is not the group.
+
+    The traverse path makes a capture group out of consecutive frames, so it covers a stretch
+    of drift. Recording one chainage for it — the mean — hid the case that matters: a group
+    whose middle sits outside the holdout while one end reaches inside. Under the mean rule
+    that group stayed in training with frames the holdout was supposed to keep out.
+    """
+    straddle = (10.0, 14.0)
+    manifest, _ = plain_video_dataset(
+        scene, tmp_path / "excl", holdout=straddle, images_excluded=True
+    )
+    groups = manifest.capture_groups
+    assert all(g.type == "trajectory_segment" for g in groups.values())
+
+    # every group covers a real stretch, and it is the members' own extent
+    spans = {gid: g.chainage_range_m for gid, g in groups.items()}
+    assert all(s is not None and s[1] > s[0] for s in spans.values()), spans
+
+    straddlers = [
+        gid
+        for gid, (lo, hi) in spans.items()
+        if hi >= straddle[0]
+        and lo <= straddle[1]
+        and not (straddle[0] <= groups[gid].chainage_m <= straddle[1])
+    ]
+    assert straddlers, f"the fixture no longer produces a straddling group: {spans}"
+    for gid in straddlers:
+        assert gid not in manifest.split.train_groups, (
+            f"{gid} spans {spans[gid]}, reaches into the holdout {straddle}, and its midpoint "
+            f"{groups[gid].chainage_m} is outside it — the case a single chainage hid"
+        )
+    assert manifest.split.train_groups, "something has to be left to train on"
+
+    # and the reconstruction test keeps them, which is what makes it a different experiment
+    kept, _ = plain_video_dataset(scene, tmp_path / "kept", holdout=straddle, images_excluded=False)
+    assert set(straddlers) <= set(kept.split.train_groups)
+
+
+def test_t38_an_incomplete_quality_gate_cannot_carry_a_claim(scene, tmp_path):
+    """`{}` is not a lenient gate. It is a gate that ran and judged nothing.
+
+    Reading the thresholds with `.get` and skipping whatever was absent meant an empty
+    dictionary passed everything: a registration with a 9.9 m residual over three
+    correspondences came out `passed=True` and carried a metric claim. So did a dictionary
+    holding one limit, or only a misspelt key that no check reads.
+    """
+    from minegs.eval.register.models import REQUIRED_THRESHOLDS, evaluate_gate
+
+    from video_survey import stand_in_sfm
+
+    full = dict(THRESHOLDS)
+    assert sorted(full) == sorted(REQUIRED_THRESHOLDS)
+
+    for label, thresholds in (
+        ("empty", {}),
+        ("unknown only", {"min_scale": 0.1}),
+        ("partial", {"max_rmse_m": 100.0}),
+        ("partial pair", {"max_rmse_m": 100.0, "min_inlier_ratio": 0.0}),
+        ("complete but misspelt", {**full, "max_rmse": 1.0}),
+    ):
+        g = run_phase3(
+            scene,
+            tmp_path / label.replace(" ", "_"),
+            through=Stage.INGEST,
+            thresholds=thresholds,
+        )
+        ing = outputs(g.state, Stage.INGEST)
+        assert ing["registration_claim_allowed"] is False, label
+        assert ing["registration_claim_refusals"], label
+
+    # the same numbers with the complete gate do carry one
+    ok = run_phase3(scene, tmp_path / "complete", through=Stage.INGEST, thresholds=full)
+    assert outputs(ok.state, Stage.INGEST)["registration_claim_allowed"] is True
+
+    # and a record carrying a hand-written verdict over an incomplete gate does not survive
+    # being re-read, because the gate is re-derived (T31)
+    from minegs.eval.register.models import IcpRecord
+    from minegs.eval.register.run import register_sfm
+    from minegs.ingest.video.build import build_frameset
+    from minegs.ingest.video.sfm.run import run_sfm
+
+    _, fs_dir = build_frameset(
+        tmp_path / "fs2",
+        kind="image_set",
+        image_dir=scene.survey.frames_dir,
+        blur_threshold=0.0,
+        hamming_threshold=0,
+    )
+    _, sfm_dir = run_sfm(fs_dir, tmp_path / "sfm2", executor=stand_in_sfm(scene.survey))
+    rec, _ = register_sfm(
+        sfm_dir,
+        tmp_path / "reg2",
+        basis="known_target",
+        targets_sfm=scene.survey.targets_sfm,
+        targets_tls=scene.survey.targets_tls,
+        reference_ply=scene.tls,
+        thresholds=full,
+    )
+    assert evaluate_gate(rec.diagnostics, IcpRecord(used=False), {}).passed is False

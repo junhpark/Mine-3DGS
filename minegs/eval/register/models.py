@@ -37,6 +37,13 @@ from minegs.eval.register.diagnostics import RegistrationDiagnostics
 
 REGISTRATION_FILE = "registration.json"
 
+#: What a claim-bearing quality gate has to judge. All three, because each is blind on its
+#: own: ``rmse_m`` is computed over the inliers, so a fit that matched two per cent of the
+#: cloud beautifully reports a tiny residual; the inlier ratio says nothing about how many
+#: points there were; and a handful of correspondences can have both. A gate missing any of
+#: them is a gate with a hole in exactly the shape of a bad registration.
+REQUIRED_THRESHOLDS: tuple[str, ...] = ("max_rmse_m", "min_inlier_ratio", "min_correspondences")
+
 #: Where the metric scale came from. ``known_target`` is evidence from outside the TLS —
 #: survey control, a measured baseline. ``sim3_to_tls`` is the TLS itself.
 RegistrationBasis = Literal["known_target", "sim3_to_tls"]
@@ -84,7 +91,9 @@ class QualityGate(_Strict):
 
     ``thresholds is None`` is the normal state until pilot data fixes them, and it means the
     registration is diagnostic. That is deliberate: a gate with no numbers admits everything,
-    and numbers invented here would be a threshold tuned on nothing.
+    and numbers invented here would be a threshold tuned on nothing. ``{}`` is not a weaker
+    version of that — it is a gate that ran and judged nothing, so it is refused by name
+    (:func:`evaluate_gate`), as is a partial or misspelt set.
     """
 
     thresholds: dict[str, float] | None = None
@@ -222,15 +231,34 @@ def evaluate_gate(
     icp: IcpRecord,
     thresholds: dict[str, float] | None,
 ) -> QualityGate:
-    """Judge a registration against explicit thresholds, on more than one number.
+    """Judge a registration against an explicit, complete set of thresholds.
 
-    ``rmse_m`` alone says nothing: it is computed over the inliers, so a fit that matched two
-    per cent of the cloud beautifully reports a tiny residual. The inlier ratio and the number
-    of correspondences are what make it mean something.
+    The shape of the threshold dictionary is part of the gate, not a convenience. Reading it
+    with ``.get`` and skipping whatever was absent meant ``{}`` passed everything — a
+    registration with a 9.9 m residual over three correspondences came out ``passed=True`` and
+    carried a claim — and so did a dictionary holding only one limit, or only a misspelt key
+    that nothing reads. A gate that admits everything is worse than no gate, because the record
+    says it was judged.
+
+    So a non-``None`` dictionary must name every threshold in :data:`REQUIRED_THRESHOLDS` and
+    nothing else. ``None`` stays what it was: the normal state until pilot data fixes the
+    numbers, and a refusal rather than a pass.
     """
     if thresholds is None:
         return QualityGate(thresholds=None, passed=False, reasons=["no thresholds configured"])
     reasons: list[str] = []
+    missing = [k for k in REQUIRED_THRESHOLDS if k not in thresholds]
+    if missing:
+        reasons.append(
+            f"the quality gate is incomplete: {', '.join(missing)} not configured. A claim "
+            "needs all of " + ", ".join(REQUIRED_THRESHOLDS) + ", because each is blind alone"
+        )
+    unknown = sorted(set(thresholds) - set(REQUIRED_THRESHOLDS))
+    if unknown:
+        reasons.append(
+            f"the quality gate names thresholds nothing applies ({', '.join(unknown)}); a "
+            "limit under a name no check reads is a limit that never ran"
+        )
     max_rmse = thresholds.get("max_rmse_m")
     if max_rmse is not None and diagnostics.rmse_m > max_rmse:
         reasons.append(f"rmse {diagnostics.rmse_m:.4f} m > {max_rmse} m")
@@ -405,6 +433,7 @@ def describe(rec: RegistrationRecord) -> dict[str, Any]:
 __all__ = [
     "CLAIM_BEARING_FIELDS",
     "REGISTRATION_FILE",
+    "REQUIRED_THRESHOLDS",
     "IcpRecord",
     "QualityGate",
     "RegistrationBasis",

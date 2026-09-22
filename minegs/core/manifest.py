@@ -284,7 +284,7 @@ class Manifest(VersionedModel):
             keep = []
             for gid in self.split.train_groups:
                 span = self.capture_groups[gid].span()
-                if span is None or not _intersects_any(span, ho.chainage_ranges_m):
+                if span is None or not spans_overlap(span, ho.chainage_ranges_m):
                     keep.extend(self.capture_groups[gid].members)
             imgs = keep
         return imgs
@@ -358,7 +358,14 @@ class Manifest(VersionedModel):
         return self.save(Path(dataset_dir) / MANIFEST_FILE)
 
 
-def _intersects_any(span: tuple[float, float], ranges: list[tuple[float, float]]) -> bool:
+def spans_overlap(span: tuple[float, float], ranges: list[tuple[float, float]]) -> bool:
+    """Whether a capture group's chainage span touches any of *ranges*.
+
+    One definition of "inside the holdout", shared by the builder that excludes a group and
+    the manifest that filters it at read time. Two of these would eventually disagree about
+    a group with one frame over the line, and that group is the whole reason the span is
+    recorded rather than a midpoint.
+    """
     return any(span[1] >= lo and span[0] <= hi for lo, hi in ranges)
 
 

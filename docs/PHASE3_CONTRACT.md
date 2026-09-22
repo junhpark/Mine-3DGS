@@ -887,6 +887,27 @@ handler 그대로다. 학습·depth·surface·geometry·sections·volume 의 구
 T31–T36 이 이 여섯을 고정한다. 여섯 guard 모두 mutation check 로 load-bearing 임을 확인했다 —
 각각 무력화하면 담당 테스트가 실제로 깨진다.
 
+### 17.5c 독립 검토(round 2)
+
+1. **capture group 의 chainage 가 한 점이었다.** traverse 경로의 그룹은 연속 프레임의 묶음이라
+   갱도의 **구간**을 덮는데, `chainage_m` 하나(멤버 평균)만 기록했다. 그래서 *중앙은 holdout 밖,
+   한쪽 끝은 holdout 안* 인 그룹 — straddling group — 이 학습에 남았다. `CaptureGroup` 에는
+   `chainage_range_m` 필드가 이미 있었고 채우지 않았을 뿐이다. 이제 멤버들의 chainage 최소·최대를
+   기록하고, 제외 판정은 **span ∩ holdout** 으로 한다. 판정 함수는 manifest 의 `train_images()`
+   가 쓰는 것과 **같은** `spans_overlap()` 이다 — 두 개를 두면 경계에 걸친 그룹에서 언젠가
+   서로 다른 답을 낸다. 360 그룹은 crop 들이 광학 중심을 공유하므로 span 이 한 점이고 비용이 없다.
+   T37 이 고정한다.
+2. **품질 게이트의 threshold 집합이 검증되지 않았다.** `.get` 으로 읽고 없으면 건너뛰었기 때문에
+   `{}` 가 **전부 통과**시켰다 — 대응 3점에 잔차 9.9 m 인 정합이 `passed=True` 로 claim 을 얻었다.
+   부분 집합도, 오타 난 key 하나도 마찬가지였다. claim 을 지는 게이트는
+   `max_rmse_m`·`min_inlier_ratio`·`min_correspondences` **셋 다** 필요하다 — 각각은 혼자서는
+   눈이 멀었다: `rmse_m` 은 inlier 위에서 계산되므로 2% 만 맞춘 fit 도 작은 잔차를 보고하고,
+   inlier 비율은 점의 개수를 말하지 않으며, 대응 몇 개로 둘 다 만족시킬 수 있다. 누락·미지의
+   key 는 이유와 함께 거부되고, `None`(아직 정하지 않음) 과 `{}`(판정했다고 기록되었으나 아무것도
+   보지 않음) 를 구분한다. T38 이 고정한다.
+
+T37·T38 의 guard 4개도 mutation check 로 load-bearing 임을 확인했다.
+
 ### 17.6 성숙도
 
 > Phase 3 image/360 independent reconstruction path is implemented and structurally tested.

@@ -48,6 +48,7 @@ from minegs.core.manifest import (
     Registration,
     Scale,
     Split,
+    spans_overlap,
 )
 from minegs.core.pointcloud import PointCloud, voxel_downsample, write_ply
 from minegs.core.provenance import git_commit, sha256_file, tool_versions
@@ -324,12 +325,20 @@ def build_dataset_from_sfm(
     grouped = _groups(cfg, names, crops_by_parent)
     centres = _camera_centres(model_tls)
     chainage: dict[str, float] = {}
+    spans: dict[str, tuple[float, float]] = {}
     if centerline_tls is not None:
         for gid, members in grouped.items():
             pts = np.array([centres[n] for n in members if n in centres])
             if len(pts):
-                s, _ = centerline_tls.project(pts.mean(axis=0))
-                chainage[gid] = float(np.atleast_1d(s)[0])
+                # The members' own chainages, not the chainage of their mean position. A group
+                # of the plain-video path is a *run* of the traverse and covers a span of
+                # drift; collapsing it to one number hides exactly the case that matters — a
+                # group whose middle sits outside the holdout while one end reaches inside it.
+                # For a 360 group the crops share an optical centre, so the span is a point and
+                # this costs nothing.
+                s = np.atleast_1d(centerline_tls.project(pts)[0])
+                spans[gid] = (float(s.min()), float(s.max()))
+                chainage[gid] = float(s.mean())
     unknown = sorted(set(cfg.test_groups) - set(grouped))
     if unknown:
         raise ContractError(f"test groups {unknown} are not capture groups of this dataset")
@@ -340,14 +349,18 @@ def build_dataset_from_sfm(
         # with no chainage — so the declaration could be true of the reader and false of the
         # data. Both halves are closed here: a group inside the holdout leaves `train_groups`,
         # and a group nobody could place refuses the build rather than being quietly trained on.
-        unplaced = sorted(g for g in train_groups if g not in chainage)
+        unplaced = sorted(g for g in train_groups if g not in spans)
         if unplaced:
             raise ContractError(
                 f"holdout_images_excluded is set, but capture groups {unplaced[:5]} have no "
                 "chainage, so there is no way to say whether their images are inside the "
                 "holdout. An exclusion nobody can check is not an exclusion."
             )
-        inside = [g for g in train_groups if _in_any(chainage[g], holdout)]
+        # Overlap of the group's span with the holdout, through the same helper the manifest's
+        # own `train_images()` uses, so the build-time exclusion and the read-time one cannot
+        # disagree about what "inside" means. A group with one frame in the holdout is a group
+        # that saw the holdout.
+        inside = [g for g in train_groups if spans_overlap(spans[g], holdout)]
         train_groups = [g for g in train_groups if g not in set(inside)]
         if not train_groups:
             raise ContractError(
@@ -360,6 +373,7 @@ def build_dataset_from_sfm(
             type="camera_rig" if crops_by_parent else "trajectory_segment",
             members=members,
             chainage_m=chainage.get(gid),
+            chainage_range_m=spans.get(gid),
         )
         for gid, members in grouped.items()
     }
@@ -606,10 +620,6 @@ def _same_value(a: Any, b: Any) -> bool:
     if isinstance(a, tuple) or isinstance(b, tuple):
         return _same_value(list(a) if a is not None else a, list(b) if b is not None else b)
     return a == b
-
-
-def _in_any(s: float, ranges: list[tuple[float, float]]) -> bool:
-    return any(lo <= s <= hi for lo, hi in ranges)
 
 
 def _init_voxel_m(ds: Path) -> float | None:
