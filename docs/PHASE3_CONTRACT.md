@@ -106,7 +106,7 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 | COLMAP 포맷 적합성 | **검증 없음** | 테스트의 모든 `cameras.txt`/`images.txt`/`rigs.txt` 는 `colmap_io.py:173 write_model` 이 쓰고 `:278 read_model` 이 되읽는다. 서로만 맞는 한 쌍이어도 통과한다 — 진짜 COLMAP 이 읽어 준 적은 없다 |
 | video source 의 claim 차단 | **부분 검증** | `eval/protocol.py:75-83` — `source in ("video","video360")` 인데 `registration` 이 없거나 품질 지표가 0 이면 metric claim 거부. 테스트는 `reg is None` 분기(`tests/test_eval.py:81-84`)만 덮고, **품질 지표가 0 인 분기(`:81-83`)는 테스트가 없다** |
 | image-only dataset 빌더 | **없음** | 유일한 실빌더는 `cli/dataset.py:258 from-e57`. `dataset/materialize.py:755` 이 `initialization.source="tls"` 를, `:768` 이 `source="tls"` 를 **하드코딩**한다 |
-| SfM frame 의 표현 | **없음** | `core/frames.py:23 Frame` 은 `SOURCE / TLS_GLOBAL / LOCAL_METRIC / BACKEND_INTERNAL` 뿐. ARCHITECTURE §3 은 SOURCE 를 "스캐너 로컬 / SfM 임의" 로 설명하지만, SOURCE → TLS_GLOBAL 의 문 (`dataset/build_config.py:30 SourceFrameConfig`) 은 `se3()` (`:60`) 를 돌려준다 — **구조적으로 scale 을 담을 수 없다** |
+| SfM frame 의 표현 | **없음** | `core/frames.py:23 Frame` 은 `SOURCE / TLS_GLOBAL / LOCAL_METRIC / BACKEND_INTERNAL` 뿐. 감사 시점의 ARCHITECTURE §3 은 SOURCE 를 "스캐너 로컬 / SfM 임의" 로 설명했지만, SOURCE → TLS_GLOBAL 의 문 (`dataset/build_config.py:30 SourceFrameConfig`) 은 `se3()` (`:60`) 를 돌려준다 — **구조적으로 scale 을 담을 수 없다**. §3 AD-1 의 결정에 따라 이 C0 에서 ARCHITECTURE §3·§14 를 갱신했고, enum 값은 Phase 3A 에서 들어온다 |
 | manifest 의 registration/scale 어휘 | **이미 존재** | `core/manifest.py:138 Registration`, `:32 DatasetSource = "tls"\|"video"\|"video360"`, `ScaleBasis = "tls_pose"\|"sim3_to_tls"\|"known_target"`, `InitSource = "tls"\|"sfm_sparse"\|"random"` |
 
 ### 2.1 재사용할 수 있는 것
@@ -148,7 +148,11 @@ Phase 3 는 greenfield 가 아니다. 아래는 **파일 이름이나 docstring 
 * `sparse/0` 하드코딩, RANSAC 전체 fallback, target 없는 identity Sim3, 미수렴 ICP 반환 — 모두
   **조용한 degrade** 이고 Phase 3 에서 fail-closed 로 바꿔야 한다.
 
-### 2.3 ROADMAP 정정
+### 2.3 문서 정정
+
+ARCHITECTURE §3 은 `SOURCE` 를 "스캐너 로컬 / SfM 임의" 로 정의하고 있었다. AD-1 이 그 절반을
+떼어 내므로 §3 의 프레임 그림, §6.2·§7 의 포인터, §14 의 결정 이력을 이번 C0 에서 함께 고친다.
+문서 변경뿐이고 코드는 건드리지 않는다.
 
 ROADMAP §1 표의 Phase 3 행은 "부분 implemented (커맨드 빌더·rig·정합), 미검증" 이다. 방향은 맞지만
 두 가지가 빠져 있어 사실관계만 보강한다: (1) SfM 실행 경로는 존재하되 **한 번도 실행된 적이 없고**
@@ -189,8 +193,10 @@ LOCAL_METRIC          학습 입력 좌표, 1 unit = 1 m
 * `SFM_INTERNAL` 에서 나가는 유일한 출구는 **측정된 Sim3** 이다. `SourceFrameConfig` 의 선언 문은
   `SFM_INTERNAL` 을 받지 않는다.
 * Phase 3A 산출물에는 `TLS_GLOBAL` / `LOCAL_METRIC` 문자열이 등장하지 않는다 (Phase 0B 와 같은 규칙).
-* ARCHITECTURE §3 의 프레임 그림은 이 값이 코드로 들어오는 Phase 3A 에서 함께 고친다. 이번 C0 는
-  계약만 고정하고 불변식 문서를 미리 바꾸지 않는다.
+* **ARCHITECTURE §3 은 이번 C0 에서 함께 고친다.** 그 문서가 `SOURCE` 를 "스캐너 로컬 / SfM 임의"
+  라고 정의하고 있었기 때문에, 이 계약만 바꾸면 source of truth 가 둘이 된다. §3 의 프레임 그림과
+  §14 결정 이력을 지금 갱신하고, `Frame` enum 에 값이 들어가는 것은 Phase 3A 로 남긴다 — 결정의
+  기록이 먼저이고 구현이 뒤따른다.
 
 ### AD-2 — TLS registration/evaluation leakage (BLOCKING, 이번 C0 의 핵심 결정)
 
@@ -202,20 +208,31 @@ Phase 3 는 **두 모델을 모두 허용하되, 어느 쪽인지 artifact 가 �
 
 | scale basis | 정합 근거 | TLS holdout | 허용되는 주장 |
 |---|---|---|---|
-| **`known_target`** (선호) | 측량 타깃·기준선 등 **TLS 가 아닌 독립 metric 증거** | 전체를 평가에 쓸 수 있다 | `geometry_accuracy`, `volume_accuracy` 가능 |
+| **`known_target`**, TLS ICP 없음 (선호) | 측량 타깃·기준선 등 **TLS 가 아닌 독립 metric 증거**뿐 | 전체를 평가에 쓸 수 있다 | `geometry_accuracy`, `volume_accuracy` 가능 |
+| **`known_target`** + 선언된 TLS 부분집합으로 ICP | 타깃 + **그 TLS 부분집합** | 그 부분집합과 **겹치지 않는** 구간만 | support ∩ holdout = ∅ 일 때만 claim |
 | **`sim3_to_tls`** (허용, 조건부) | **선언된 registration support 집합**의 TLS 기하 | support 와 **겹치지 않는** 구간만 | support ∩ holdout = ∅ 일 때만 claim, 아니면 거부 |
-| 그 외 (타깃 없음, 전체 클라우드 ICP) | 평가 기준 클라우드 자체 | — | **diagnostic 전용**, 영구히 claim 불가 |
+| 그 외 (타깃 없음, **또는 전체 TLS 클라우드 ICP**) | 평가 기준 클라우드 자체 | — | **diagnostic 전용**, 영구히 claim 불가 |
+
+**`basis` 는 scale 의 출처일 뿐 pose 의 출처가 아니다.** 독립 타깃으로 scale 을 얻었더라도 그 뒤
+전체 TLS 클라우드에 ICP 를 돌리면 **최종 `T_tls_from_sfm` 은 평가 기준 클라우드를 보고 최적화된
+것**이다. 그 상태로 같은 클라우드에서 accuracy 를 재면 leakage 다. 그래서 support 는 basis 가 아니라
+**최종 변환을 움직인 기하 전체**로 정의한다: ① 초기 Sim3 의 대응과 ② ICP 의 target 의 **합집합**
+(§7 `support_ranges_m`). 전체 TLS 로 ICP 를 돌렸다면 support 는 사실상 TLS 전체이므로 disjoint 한
+holdout 이 남지 않고, `known_target` 이어도 결과는 diagnostic 이다. ICP 를 claim 경로에서 쓰려면
+target 을 **선언된 부분집합**으로 제한해야 한다.
 
 강제 조건:
 
-1. **정합에 무엇을 썼는지 남는다.** `RegistrationRecord` (§7) 가 support 의 종류(타깃 CSV / TLS
-   부분집합), 파일 digest, **chainage 구간**, 대응 개수, inlier, residual 을 기록한다.
-2. **겹침을 판정할 수 있다.** support 구간과 `split.geometry_holdout.chainage_ranges_m` 의 교집합을
-   계산할 수 있어야 한다. 계산할 수 없으면 (support 구간 미기록) 그것 자체가 거부 사유다.
+1. **정합에 무엇을 썼는지 남는다.** `RegistrationRecord` (§7) 가 초기 Sim3 의 support 와 ICP 의
+   support 를 **각각** 기록한다: 종류(타깃 CSV / TLS 부분집합), 파일 digest, **chainage 구간**,
+   대응 개수, inlier, residual. 둘의 합집합이 claim gate 가 보는 support 다.
+2. **겹침을 판정할 수 있다.** support 구간(①∪②)과 `split.geometry_holdout.chainage_ranges_m` 의
+   교집합을 계산할 수 있어야 한다. 계산할 수 없으면 (support 구간 미기록, 또는 ICP 를 돌렸는데
+   `icp_support` 가 비어 있음) 그것 자체가 거부 사유다.
 3. **겹치면 fail closed.** 겹친 상태로 `geometry_accuracy` / `volume_accuracy` 를 내지 않는다.
    숫자를 죽이는 것이 아니라 **claim 을 죽인다** — 같은 숫자를 `geometry_diagnostic` 으로는 낼 수 있다.
 4. **diagnostic 정렬과 claim 정렬을 구분한다.** 전체 클라우드 ICP 는 "그림이 맞는지 보는" 용도로
-   유효하고, 그 결과로 만든 숫자는 영구히 diagnostic 이다.
+   유효하고, 그 결과로 만든 숫자는 **basis 와 무관하게** 영구히 diagnostic 이다.
 5. **비교는 같은 평가 영역에서 한다.** TLS-assisted GS 와 image-only GS 를 비교할 때 holdout,
    section 파라미터, 적분 구간이 같아야 한다 — Phase 1C/2 의 `eval/volume/paired.py` 규칙(같은 grid,
    공통 구간만)을 그대로 쓴다.
@@ -427,8 +444,11 @@ TLS_GLOBAL
 | `registration_id` | identity |
 | `sfm_id` | 무엇을 정합했는지 |
 | `basis` | `known_target` \| `sim3_to_tls` |
-| `support` | 타깃 CSV digest **또는** TLS 파일 digest + 사용한 부분집합의 정의 |
-| `support_ranges_m` | support 가 덮는 chainage 구간 (겹침 판정의 근거) |
+| `initial_support` | ① 에 쓴 것: 타깃 CSV digest **또는** TLS 파일 digest + 사용한 부분집합의 정의 |
+| `initial_support_ranges_m` | ① 의 support 가 덮는 chainage 구간 |
+| `icp_support` | ② 에 쓴 target 기하: TLS 파일 digest + 부분집합의 정의 (ICP 를 돌렸다면 필수) |
+| `icp_support_ranges_m` | ② 의 support 가 덮는 chainage 구간 |
+| `support_ranges_m` | 위 둘의 **합집합**. claim gate 가 holdout 과 겹침을 판정하는 값 |
 | `T_tls_from_sfm` | 측정된 Sim3 (scale 포함) |
 | `icp` | 사용 여부, `converged`, iterations, max_dist |
 | `diagnostics` | 기존 `RegistrationDiagnostics` 그대로 |
@@ -438,6 +458,10 @@ TLS_GLOBAL
 
 * **선언 금지.** `SFM_INTERNAL → TLS_GLOBAL` 은 언제나 측정이다. `SourceFrameConfig` 의
   `explicit_identity` 는 이 경로에서 거부된다.
+* **support 는 최종 변환을 움직인 모든 기하다.** ① 의 대응만이 아니라 ② 의 ICP target 까지
+  포함한다 — ICP 는 target 클라우드를 보고 transform 을 계속 최적화하므로, ICP 에 들어간 TLS 는
+  정합 근거이지 무관한 참조가 아니다. `basis` 가 무엇이든 `support_ranges_m` 은 둘의 합집합이고,
+  claim gate 는 그 합집합으로 판정한다 (§AD-2).
 * **ICP 는 scale 을 바꾸지 않는다** (`rigid_icp.py:58`, `with_scale=False`). 이것은 유지되는 불변식이고
   테스트로 고정한다.
 * **미수렴 ICP 는 claim 경로에서 거부**된다. 현재는 `converged=False` 여도 결과가 반환된다.
@@ -445,9 +469,11 @@ TLS_GLOBAL
   (`initial_alignment.py:60`). claim 경로에서는 그 fallback 이 일어났다는 사실이 기록되고 거부된다.
 * **`rmse_m` 단독 신뢰 금지.** `diagnose` 의 rmse 는 inlier 에 대해서만 계산된다
   (`diagnostics.py:52`). 게이트는 `inlier_ratio` 와 함께 판정한다.
-* **임계값은 이번 C0 에서 정하지 않는다.** 숫자(최소 inlier_ratio, 최대 rmse, 최소 대응 수)는 실측
-  데이터를 한 번 본 뒤 Phase 3 G2 결정으로 고정한다. 그 전까지는 **게이트의 형태만** 계약이고, 값이
-  없으면 claim 은 나오지 않는다 (fail closed). 임의 숫자를 지금 발명하지 않는다.
+* **임계값은 이번 C0 에서 정하지 않는다.** 숫자(최소 inlier_ratio, 최대 rmse, 최소 대응 수)는
+  **pilot / commissioning 데이터 또는 pre-G2 관측**으로 정하고 **freeze 한 뒤**, claim-bearing G2
+  에서는 바꾸지 않는다. 즉 threshold 를 정하는 데이터와 claim 을 만드는 데이터는 같지 않다 —
+  결과를 보고 기준을 맞추면 그 기준은 아무것도 거르지 못한다. 그 전까지는 **게이트의 형태만**
+  계약이고, 값이 없으면 claim 은 나오지 않는다 (fail closed). 임의 숫자를 지금 발명하지 않는다.
 
 ### 7.1 진단이 잡는 것과 잡지 못하는 것
 
@@ -534,14 +560,28 @@ video/이미지 (digest)
 CI 에는 COLMAP 도 ffmpeg 도 GPU 도 없다. Phase 2 가 trainer/renderer 를 대체하고 **그 사실을
 기록했던** 방식을 그대로 쓴다.
 
-* **대체되는 것은 SfM 하나뿐**이다. `sfm=` seam 으로 주입하고 `real_sfm_execution: false` 를
-  `SfmRecord` 와 report 에 남긴다. CLI 에는 이 seam 을 여는 플래그를 만들지 않는다.
+**Phase 3 가 새로 추가하는 substitution seam 은 SfM 하나다.** 그러나 3C 의 전 구간 게이트는
+image-only dataset → 학습 → depth → surface → geometry/section/volume 까지 도는 것이므로, **Phase 2
+의 trainer·renderer 대체를 그대로 함께 쓴다.** ffmpeg 가 없으면 프레임 추출도 대체된다. 즉 3C 에서
+동시에 대체되는 것은 하나가 아니라 셋 또는 넷이고, 문서가 "SfM 하나뿐" 이라고 말하면 그 게이트가
+무엇을 증명하는지 잘못 말하는 것이 된다.
+
+| seam | 언제 | 기록 |
+|---|---|---|
+| SfM (신규, Phase 3) | CI 에 COLMAP 없음 | `real_sfm_execution: false` — `SfmRecord` 와 report |
+| trainer (Phase 2) | CI 에 GPU·gsplat 없음 | `real_gpu_execution: false` |
+| renderer (Phase 2) | CI 에 CUDA 없음 | `real_renderer_execution: false` |
+| frame extraction | CI 에 ffmpeg 없음 → 파일 복사 | 추출 설정과 대체 사실을 `FrameSetRecord` 에 |
+
+규칙:
+
+* 모든 seam 은 **Python 에서만** 주입된다. CLI 에는 어떤 seam 도 여는 플래그를 만들지 않는다.
+* 모든 대체 사실은 artifact 와 report 에 남고, 하나라도 대체되었으면 그 실행은 **어떤 과학적
+  claim 도 만들지 않는다**. 구조 검증이지 G2 가 아니다.
 * 그 외는 실제 코드로 돈다: 실제 crop 리샘플, 실제 선별 지표, 실제 rig 구성, 실제 COLMAP 모델 IO,
-  실제 Umeyama/ICP/diagnostics, 실제 dataset 빌더·validator·protocol judge·golden gate, 실제 Phase
-  1A/1B/1C 사슬.
+  실제 Umeyama/ICP/diagnostics, 실제 dataset 빌더·validator·protocol judge, 실제 Phase 1A/1B/1C 사슬.
 * 합성 입력은 기존 `core/synthetic.py` 의 터널과 렌더 경로에서 만든다 — 파노라마를 만들고, 거기서
   ring crop 을 잘라 "360 영상 프레임" 으로 쓰면 crop→rig→SfM 입력 경로 전체가 실제 코드로 검증된다.
-* ffmpeg 가 없는 CI 에서는 프레임 추출을 파일 복사로 대체하되, **추출 설정과 대체 사실을 기록**한다.
 
 최소 구조 테스트 (Phase 3C 에서 확정):
 
@@ -550,6 +590,7 @@ CI 에는 COLMAP 도 ffmpeg 도 GPU 도 없다. Phase 2 가 trainer/renderer 를
 | S1 | `SFM_INTERNAL` 클라우드는 metric 소비자에 들어가지 못한다 |
 | S2 | registration 없는 image-only dataset 은 metric claim 을 받지 못한다 |
 | S3 | support ∩ holdout ≠ ∅ 이면 claim 이 거부된다 (숫자는 diagnostic 으로 남는다) |
+| S3b | `known_target` 이어도 전체 TLS ICP 를 거치면 claim 이 거부된다 (support 는 ①∪②) |
 | S4 | `init_points.ply` 가 SfM 에서 오지 않으면 image-only 빌드가 거부된다 |
 | S5 | crop 의 orientation 기록과 실제 crop 이 어긋나면 거부된다 |
 | S6 | ICP 가 scale 을 바꾸지 않는다 |
@@ -557,6 +598,7 @@ CI 에는 COLMAP 도 ffmpeg 도 GPU 도 없다. Phase 2 가 trainer/renderer 를
 | S8 | sparse component 가 여럿이면 명시적 선택 없이는 거부된다 |
 | S9 | mask 이름이 이미지와 어긋나면 조용히 무시되지 않고 거부된다 |
 | S10 | TLS-assisted 와 image-only 비교가 같은 grid·공통 구간에서만 이뤄진다 |
+| S11 | 대체된 seam 이 하나라도 있으면 report 가 그것을 전부 드러내고 claim 이 나오지 않는다 |
 
 ---
 
@@ -600,6 +642,8 @@ G2 판정 항목:
 | registration 없음 / 품질 지표 없음 | metric claim 거부 (기존 `protocol.py:79`) |
 | registration 게이트 미달 | claim 거부, diagnostic 유지 |
 | support 구간 미기록 | claim 거부 (겹침을 판정할 수 없으므로) |
+| ICP 를 돌렸는데 `icp_support` 미기록 | claim 거부 |
+| 전체 TLS 클라우드로 ICP (basis 무관) | claim 거부, diagnostic 유지 |
 | support ∩ holdout ≠ ∅ | claim 거부 |
 | RANSAC 전체 fallback 발생 | claim 경로에서 거부 |
 | ICP 미수렴 | claim 경로에서 거부 |
@@ -647,7 +691,8 @@ G2 판정 항목:
 
 ### Phase 3C — Independent reconstruction structural gate + G2 비교
 
-* image-only dataset → 학습 → depth → surface → geometry/section/volume 구조 게이트 (SfM 대체 seam).
+* image-only dataset → 학습 → depth → surface → geometry/section/volume 구조 게이트.
+  신규 대체는 SfM 하나지만, 이 구간은 Phase 2 의 trainer·renderer 대체 위에서 돈다 (§11 표).
 * TLS-assisted vs image-only 를 공통 구간에서 비교하는 report.
 * real-data G2 runbook.
 
@@ -672,7 +717,8 @@ reality audit 결과 3A 를 더 쪼갤 이유는 보이지 않는다 — 360 cro
 3. TLS registration/evaluation leakage 결정이 명시되어 있다 (AD-2).
 4. SfM frame 결정이 명시되어 있다 (AD-1).
 5. ROADMAP 의 Phase 3 서술이 audit 결과와 어긋나지 않는다.
-6. 구현은 시작하지 않는다. 이 문서 + stale docstring 정정 + ROADMAP 사실관계 정정이 전부다.
+5b. ARCHITECTURE 가 AD-1 과 어긋나지 않는다 — frame 그림, §7 정합, §14 결정 이력.
+6. 구현은 시작하지 않는다. 이 문서 + stale docstring 정정 + ROADMAP/ARCHITECTURE 문서 정정이 전부다.
 7. PR 을 열되 **merge 하지 않는다**. 독립 검토 후 Phase 3A 지시를 받는다.
 
 ### Phase 3 전체 (참고)

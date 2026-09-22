@@ -80,9 +80,12 @@ minegs/
 SCANNER        개별 스캔 자신의 좌표             ← 0B.3 --raw 추출 (unregistered)
    │  T_source_from_scan (E57 pose)
    ▼
-SOURCE        원본 파일 자신의 좌표 (스캐너 로컬 / SfM 임의)  ← 0B 추출 산출물
-   │  Phase 0C 의 선언
-   ▼
+SOURCE        원본 파일 자신의 좌표 (스캐너 로컬, 이미 m)   ← 0B 추출 산출물
+   │  Phase 0C 의 선언 (SE(3), scale 없음)
+   │
+   │            SFM_INTERNAL   독립 SfM 자신의 좌표 — 임의 scale, 임의 원점
+   │                  │  측정된 Sim(3) (Phase 3 §7, registration artifact 에 근거와 품질)
+   ▼                  ▼
 TLS_GLOBAL     실제 계측 좌표, m        ← 평가·보고
    │  SE(3), 병진·회전만
    ▼
@@ -97,6 +100,14 @@ BACKEND_INTERNAL                        ← 어댑터가 반드시 역변환해�
 * UTM 급 좌표(10⁶ m)를 float32 에 넣으면 유효 정밀도가 수십 cm 로 떨어진다.
   체적 계측에서 이 하나로 결과가 무의미해진다.
 * `T_tls_from_local` 은 manifest 필수 항목. run 이 청크 단위면 청크마다 하나.
+* **`SFM_INTERNAL` 은 `SOURCE` 가 아니다 (Phase 3 AD-1).** 독립 image/360 SfM 의 출력은 scale 까지
+  임의다. `SOURCE` → `TLS_GLOBAL` 의 문(`SourceFrameConfig`)은 `explicit_identity` /
+  `explicit_transform` 두 모드의 **선언**이고 `se3()` 를 돌려주므로 구조적으로 scale 을 담을 수 없다.
+  임의 scale 재구성을 `SOURCE` 라 부르면 `explicit_identity` 한 줄로 "이 좌표가 곧 측량 기준" 이라고
+  **측정 없이** 선언할 수 있게 된다. 그래서 `SFM_INTERNAL` 을 별도로 두고, 그 프레임에서 나가는
+  유일한 출구를 **측정된 Sim(3)** 로 고정한다. 선언은 이 경로에서 거부된다. 계약 전문은
+  [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) §3 AD-1, 정합 규칙은 같은 문서 §7.
+  `Frame` enum 에 값이 추가되는 것은 Phase 3A 이며, 그 전까지 이 항목은 결정의 기록이다.
 * `SOURCE` 와 `SCANNER` 는 Phase 0B ingest 전용이며 dataset 계약에 등장하지 않는다. E57 의
   좌표가 `TLS_GLOBAL` 인지는 파일이 말해 주지 않으므로, 그 선언은 dataset materialization
   (Phase 0C, `minegs/dataset/`) 이 명시적으로 한다 — `source_frame.mode: explicit_identity`
@@ -217,8 +228,10 @@ COLMAP → leak-free `init_points.ply` → 재투영 **골든 게이트** → Vi
 
 ### 6.2 영상 · 360
 ffmpeg → 블러·중복 제거 → (360: equirect → 링 크롭, K 는 합성이므로 정확히 알려짐,
-**같은 프레임의 크롭은 COLMAP rig 로 등록**) → 마스킹 → SfM → 희소점 →
-`init_points.ply` → `register` (§7).
+**같은 프레임의 크롭은 COLMAP rig 로 등록**) → 마스킹 → SfM → 희소점 → `register` (§7) →
+metric dataset (`init_points.ply` 는 등록된 SfM 희소점에서). 순서와 증거 요구는
+[docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) §6–§8 이 정한다 — SfM 희소점은 등록 전까지
+`SFM_INTERNAL` 이므로 그 상태로 dataset 에 들어가지 않는다.
 
 ```yaml
 sfm:
@@ -246,6 +259,10 @@ sfm:
 ```
 
 TLS 경로는 항등. 품질 지표 없는 정합 결과는 평가에 쓸 수 없다.
+
+image-only 경로의 추가 규칙(정합 support 와 evaluation holdout 의 분리, ICP target 까지 support 에
+포함, 측정된 Sim(3) 만 허용)은 [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) §3 AD-2 와 §7 이
+source of truth 다.
 
 ## 8. 학습 엔진
 
@@ -379,4 +396,10 @@ end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced G
   홀드아웃, COLMAP ≥4.0 global mapper(GLOMAP 독립 저장소 2026-03 아카이브), 360 rig,
   epoch/change, PanoSource 어댑터, v0.1 백엔드 gsplat 단일, INRIA 저장소 미포함,
   CPU/GPU 런타임 분리, Sim3→SE3, 양방향 형상 지표, provenance 계층, Phase 0 을 0A–0D 로 분할.
+* 2026-09 — Phase 3 C0 (AD-1): 독립 SfM 출력은 `SOURCE` 가 아니라 **`SFM_INTERNAL`** 이고, 그
+  프레임에서 `TLS_GLOBAL` 로 나가는 유일한 경로는 **측정된 Sim(3)** 다 (선언 금지). 함께 고정한
+  것 — 정합 support 는 초기 Sim3 대응과 **ICP target 의 합집합**이며 evaluation holdout 과 겹치면
+  claim 을 거부한다(scale 의 출처가 독립이어도 pose 가 평가 기준을 보고 최적화되면 leakage다);
+  image-only dataset 은 같은 dataset 계약을 쓰되 `init_points` 가 SfM sparse 에서 왔음이 **검증**
+  되어야 한다. 근거와 reality audit 은 [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md).
 * 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.
