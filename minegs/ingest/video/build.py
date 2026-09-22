@@ -35,6 +35,10 @@ from minegs.ingest.common.equirect import CropView, RingCropSpec, crop_equirect
 from minegs.ingest.common.geometry import PanoConvention
 from minegs.ingest.video.models import (
     FRAMESET_FILE,
+    # Matched case-insensitively. The old selector globbed `*.png` and `*.jpg` literally and
+    # non-recursively, so a `.jpeg` from a phone and every crop under a view directory vanished
+    # without a word. Shared with the record's own check, which enumerates this same set.
+    IMAGE_SUFFIXES,
     CropRecord,
     ExtractionRecord,
     FrameDecision,
@@ -47,11 +51,6 @@ from minegs.ingest.video.models import (
     expected_mask_name,
     images_digest,
 )
-
-#: Suffixes a frame set reads, matched case-insensitively. The old selector globbed `*.png`
-#: and `*.jpg` literally and non-recursively, so a `.jpeg` from a phone and every crop under a
-#: view directory vanished without a word.
-IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 
 FRAMES_DIRNAME = "frames"
 IMAGES_DIRNAME = "images"

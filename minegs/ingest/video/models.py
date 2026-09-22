@@ -38,6 +38,12 @@ from minegs.ingest.common.geometry import PanoConvention
 
 FRAMESET_FILE = "frameset.json"
 
+#: Suffixes a frame set reads, matched case-insensitively. Defined here rather than beside the
+#: builder because the check that the SfM input set is *exactly* the record has to enumerate the
+#: directory the same way the builder filled it; two lists would mean a file one of them counts
+#: and the other does not.
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
+
 #: What kind of input a frame set was made from. ``video360`` is the only kind that carries
 #: crops and a panorama convention; ``image_set`` skips extraction entirely.
 FrameSetKind = Literal["video", "video360", "image_set"]
@@ -242,9 +248,34 @@ def check_frameset(rec: FrameSetRecord, frameset_dir: str | Path) -> None:
             f"record says {rec.images_sha256[:12]}; the list was edited after it was written"
         )
 
+    _check_no_stowaways(rec, root)
     _check_selection_consistency(rec)
     _check_crops(rec, root)
     _check_masks(rec, frameset_dir)
+
+
+def _check_no_stowaways(rec: FrameSetRecord, root: Path) -> None:
+    """``images/`` must hold the record's images and nothing else.
+
+    The record's digests prove that every image it names is unchanged. They say nothing about a
+    file it does not name, and the SfM backend is pointed at this directory rather than at the
+    list: it globs. So a frame dropped by selection, or one from another survey entirely,
+    reaches the reconstruction by being copied in afterwards, with every recorded digest still
+    matching. Enumerating the directory is what closes that, and it is why the check reads the
+    world instead of the record.
+    """
+    on_disk = {
+        p.relative_to(root).as_posix()
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+    }
+    surplus = sorted(on_disk - {e.name for e in rec.images})
+    if surplus:
+        raise ContractError(
+            f"frame set {rec.frameset_id}: {len(surplus)} image(s) under {root} are not in the "
+            f"record (e.g. {surplus[:5]}). SfM is given this directory, not the list, so a file "
+            "put here afterwards would be reconstructed from without appearing anywhere."
+        )
 
 
 def _check_selection_consistency(rec: FrameSetRecord) -> None:
@@ -369,6 +400,7 @@ def expected_mask_name(image_name: str) -> str:
 
 __all__ = [
     "FRAMESET_FILE",
+    "IMAGE_SUFFIXES",
     "CropRecord",
     "ExtractionRecord",
     "FrameDecision",
