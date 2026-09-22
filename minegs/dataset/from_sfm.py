@@ -223,6 +223,56 @@ def build_dataset_from_sfm(
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(mask_root / mask.mask_file, target)
 
+    # ---- the reference axis, derived before anything is excluded along it
+    # From the *whole* reconstruction: a centerline extracted from the kept part only would
+    # have a hole where the holdout is, and every chainage past it would be renumbered.
+    centerline_tls: Centerline | None = None
+    if cfg.centerline_file is not None:
+        centerline_tls = Centerline.from_csv(
+            cfg.centerline_file, "TLS_GLOBAL", cfg.centerline_source
+        )
+    elif len(points_tls) >= 2:
+        centerline_tls = Centerline.extract_from_points(
+            points_tls, bin_m=cfg.centerline_bin_m, frame="TLS_GLOBAL"
+        )
+    if centerline_tls is not None:
+        centerline_tls.to_csv(ds / CENTERLINE_FILE)
+
+    # ---- the holdout, taken out of the geometry rather than only declared
+    #
+    # `initialization.excluded_chainage_ranges_m` is a statement that the held-out chainage is
+    # not in what the model starts from, and on this path the initialisation *is* the
+    # reconstruction: leaving its points in would hand the model the structure triangulated
+    # from the very frames the holdout keeps out of training, under a manifest saying it had
+    # not. Both the init cloud and `sparse/0` are filtered, because the trainer can be told to
+    # initialise from either (`stage_dataset(use_init_points=False)`), and an exclusion that
+    # one of two paths honours is not an exclusion.
+    holdout = [(float(lo), float(hi)) for lo, hi in cfg.geometry_holdout_m]
+    excluded_ids: set[int] = set()
+    if holdout:
+        if centerline_tls is None:
+            raise ContractError(
+                "a geometry holdout is declared in chainage, but this dataset has no reference "
+                "axis: without one there is no way to say which reconstruction points are "
+                "inside the holdout, so the exclusion could only be asserted"
+            )
+        ids = sorted(model_tls.points3D)
+        s = np.atleast_1d(
+            centerline_tls.project(np.array([model_tls.points3D[i].xyz for i in ids]))[0]
+        )
+        inside = np.zeros(len(ids), bool)
+        for lo, hi in holdout:
+            inside |= (s >= lo) & (s <= hi)
+        excluded_ids = {ids[k] for k in np.flatnonzero(inside)}
+        model_local.points3D = {
+            k: v for k, v in model_local.points3D.items() if k not in excluded_ids
+        }
+        if not model_local.points3D:
+            raise ContractError(
+                f"every reconstruction point falls inside the declared holdout {holdout}; "
+                "there would be nothing left to initialise training from"
+            )
+
     # ---- initialisation from the reconstruction's own points, never from a reference cloud
     init_xyz = model_local.points_xyz()
     if cfg.init_voxel_m:
@@ -251,19 +301,6 @@ def build_dataset_from_sfm(
         )
         model_local.points3D = {k: v for k, v in model_local.points3D.items() if k in keep}
     colmap_io.write_model(model_local, ds / "sparse" / "0")
-
-    # ---- centerline: the design line, or one extracted from *this* reconstruction
-    centerline_tls: Centerline | None = None
-    if cfg.centerline_file is not None:
-        centerline_tls = Centerline.from_csv(
-            cfg.centerline_file, "TLS_GLOBAL", cfg.centerline_source
-        )
-    elif len(points_tls) >= 2:
-        centerline_tls = Centerline.extract_from_points(
-            points_tls, bin_m=cfg.centerline_bin_m, frame="TLS_GLOBAL"
-        )
-    if centerline_tls is not None:
-        centerline_tls.to_csv(ds / CENTERLINE_FILE)
 
     # ---- groups, split, chainage
     crops_by_parent: dict[str, list[str]] = {}
@@ -300,7 +337,6 @@ def build_dataset_from_sfm(
     shutil.copy2(sfm_root / "sfm.json", prov / "sfm.json")
     shutil.copy2(reg_root / "registration.json", prov / "registration.json")
 
-    holdout = [tuple(r) for r in cfg.geometry_holdout_m]
     manifest = Manifest(
         dataset_id=cfg.dataset_id,
         coordinate_frames=CoordinateFrames(T_tls_from_local=T_tls_from_local.to_list()),
@@ -320,9 +356,8 @@ def build_dataset_from_sfm(
             source="sfm_sparse",
             file="init_points.ply",
             groups=train_groups,
-            # The init cloud *is* the reconstruction, so excluding holdout chainage from it
-            # means excluding the structure the held-out frames produced. Declared here and
-            # enforced below, because the protocol judge refuses an undeclared holdout.
+            # True of the cloud on disk, not only of this field: the points inside these
+            # ranges were dropped above, before the init cloud and `sparse/0` were written.
             excluded_chainage_ranges_m=holdout,
             n_points=len(init),
         ),
@@ -368,14 +403,22 @@ def build_dataset_from_sfm(
             source=pc.source,
             vendor=pc.vendor,
         )
-    _write_sfm_provenance(ds, rec_fs, rec_sfm, rec_reg, cfg)
+    _write_sfm_provenance(
+        ds, rec_fs, rec_sfm, rec_reg, cfg, n_holdout_points_excluded=len(excluded_ids)
+    )
     manifest.save_dataset(ds)
     check_image_only_dataset(ds)
     return manifest, ds
 
 
 def _write_sfm_provenance(
-    ds: Path, rec_fs: Any, rec_sfm: Any, rec_reg: Any, cfg: SfmDatasetConfig
+    ds: Path,
+    rec_fs: Any,
+    rec_sfm: Any,
+    rec_reg: Any,
+    cfg: SfmDatasetConfig,
+    *,
+    n_holdout_points_excluded: int = 0,
 ) -> None:
     """The one file that ties the dataset's init cloud to the reconstruction it came from."""
     (ds / PROVENANCE_DIR / "init_provenance.json").write_text(
@@ -393,6 +436,8 @@ def _write_sfm_provenance(
                 "claim_allowed": rec_reg.claim_allowed,
                 "init_source": "sfm_sparse",
                 "init_voxel_m": cfg.init_voxel_m,
+                "holdout_ranges_m": [list(r) for r in cfg.geometry_holdout_m],
+                "n_holdout_points_excluded": n_holdout_points_excluded,
                 "config": cfg.model_dump(mode="json"),
             },
             indent=2,

@@ -268,8 +268,8 @@ def cut_ring_crops(
     """Cut every kept panorama into the ring's views, recording each crop's own geometry.
 
     The crop's yaw, pitch and intrinsics are written next to its digest. A path like
-    ``p0y03/v_000007.png`` is convenient and is not evidence: the rig is derived from these
-    records, and a crop whose bytes change stops matching the orientation it was cut at.
+    ``p0y03/v_000007_p0y03.png`` is convenient and is not evidence: the rig is derived from
+    these records, and a crop whose bytes change stops matching the orientation it was cut at.
     """
     views = spec.crops()
     K = spec.K()
@@ -280,7 +280,12 @@ def cut_ring_crops(
         stem = Path(parent).stem
         for view in views:
             arr = crop_equirect(pano, view, convention)
-            name = f"{view.name}/{stem}.png"
+            # The view is in the file name and not only in the directory. Downstream, a depth
+            # map is named after an image's *stem* (§Phase 1B), so `p0y00/v_07.png` and
+            # `p0y01/v_07.png` would both want `v_07.npy`: one render would overwrite the
+            # other and both views would then back-project the same map. Repeating the view
+            # here is redundant to a reader and is the thing that keeps the stems distinct.
+            name = f"{view.name}/{stem}_{view.name}.png"
             target = images_dir / name
             _write_image(arr, target)
             out.append(

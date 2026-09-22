@@ -41,6 +41,7 @@ from minegs.core.provenance import git_commit, make_id, stamp, tool_versions
 from minegs.e2e.models import (
     STAGE_ORDER,
     WORKFLOW_STATE_FILE,
+    Phase3Inputs,
     Stage,
     StageRecord,
     StageStatus,
@@ -91,6 +92,10 @@ class E2EConfig(VersionedModel):
     build_config: str | None = None
     #: The held-out TLS cloud, in TLS_GLOBAL. The evaluation reference — never training input.
     tls_reference_ply: str | None = None
+    #: Set only on the image/360 path (§Phase 3). It replaces what ``ingest`` and ``dataset``
+    #: do, and nothing else: the stages after them are the same stages, run on a dataset that
+    #: no scanner contributed geometry to.
+    phase3: Phase3Inputs | None = None
 
     # ---- ingest
     voxel_m: float | None = None
@@ -142,7 +147,18 @@ class E2EConfig(VersionedModel):
                 continue
             q = Path(value)
             setattr(cfg, name, str(q if q.is_absolute() else (base / q).resolve()))
+        if cfg.phase3 is not None:
+            cfg.phase3 = cfg.phase3.resolve_paths(base)
         return cfg
+
+    def require_phase3(self) -> Phase3Inputs:
+        """The image/360 block, or a refusal naming what is missing."""
+        if self.phase3 is None:
+            raise ContractError(
+                "this workflow is running the image/360 stages but its config has no `phase3` "
+                "block, so there is no video, no frame selection and no registration to run"
+            )
+        return self.phase3
 
     def require(self, *names: str) -> tuple[Any, ...]:
         """Fetch config values a stage cannot run without, naming all the missing ones at once."""
@@ -177,6 +193,12 @@ class StageContext:
     #: accept. Neither is allowed to mean "trust this because we made it".
     renderer: Any = None
     trainer: Any = None
+    #: The Phase 3 seams, and the same rule applies to them. A substituted SfM still has to
+    #: leave a model the real ``check_sfm`` accepts and a record that says ``real_sfm_execution
+    #: = false``; a substituted frame extractor still has to leave frames the real selector,
+    #: cropper and digest check accept. Neither may mean "trust this because we made it".
+    sfm: Any = None
+    frame_extractor: Any = None
     #: True only when this execution's ``--rebuild-from`` covers this stage. A stage that
     #: publishes into a fixed directory reads it to decide whether it may replace what is
     #: there: an ordinary run never may, because an artifact nobody asked to destroy is
@@ -220,7 +242,15 @@ class Workflow:
         self.path = self.work_dir / WORKFLOW_STATE_FILE
         if self.path.is_file():
             self.state = WorkflowState.load(self.path)
-            if config is not None and config.model_dump(mode="json") != self.state.config:
+            # Parsed on both sides before comparing. The stored config is a document written by
+            # an earlier version of this model, and a field added since then is not a setting
+            # someone changed: comparing raw dicts made every such addition look like one and
+            # condemned ledgers that are still exactly what they say they are. A real
+            # difference — a moved path, another profile, a different holdout — still differs
+            # after parsing, which is the thing this refusal is for.
+            if config is not None and config.model_dump(mode="json") != E2EConfig.from_dict(
+                dict(self.state.config)
+            ).model_dump(mode="json"):
                 # Silently adopting a new config would make every recorded fingerprint a
                 # statement about settings that are no longer in force.
                 raise ContractError(
@@ -250,6 +280,8 @@ class Workflow:
         stage: Stage,
         renderer: Any = None,
         trainer: Any = None,
+        sfm: Any = None,
+        frame_extractor: Any = None,
         rebuilding: bool = False,
     ) -> StageContext:
         return StageContext(
@@ -259,6 +291,8 @@ class Workflow:
             state=self.state,
             renderer=renderer,
             trainer=trainer,
+            sfm=sfm,
+            frame_extractor=frame_extractor,
             rebuilding=rebuilding,
         )
 
@@ -295,6 +329,8 @@ class Workflow:
         rebuild_from: Stage | None = None,
         renderer: Any = None,
         trainer: Any = None,
+        sfm: Any = None,
+        frame_extractor: Any = None,
         on_stage: Callable[[str, StageRecord], None] | None = None,
     ) -> WorkflowState:
         """Run the stages up to *through*, reusing what is still valid.
@@ -331,6 +367,8 @@ class Workflow:
                 cache,
                 renderer=renderer,
                 trainer=trainer,
+                sfm=sfm,
+                frame_extractor=frame_extractor,
                 rebuilding=stage in rebuilding,
             )
             if on_stage is not None:
@@ -345,11 +383,20 @@ class Workflow:
         cache: dict[Stage, dict[str, Any]],
         renderer: Any,
         trainer: Any,
+        sfm: Any = None,
+        frame_extractor: Any = None,
         rebuilding: bool = False,
     ) -> StageRecord:
         spec = specs[stage]
         rec = self.state.stages[stage]
-        ctx = self._context(stage, renderer=renderer, trainer=trainer, rebuilding=rebuilding)
+        ctx = self._context(
+            stage,
+            renderer=renderer,
+            trainer=trainer,
+            sfm=sfm,
+            frame_extractor=frame_extractor,
+            rebuilding=rebuilding,
+        )
         inputs = self.resolve_inputs(stage, specs, cache)
         fp = fingerprint(inputs)
 

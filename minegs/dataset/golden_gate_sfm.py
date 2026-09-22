@@ -72,6 +72,40 @@ def _visibility(model: colmap_io.ColmapModel) -> dict[str, dict[str, float]]:
     return out
 
 
+def _visibility_problems(
+    visibility: dict[str, dict[str, float]], min_fraction: float, max_blind: float
+) -> list[str]:
+    """Read the visibility table for the failure it exists to catch, and not for geometry.
+
+    A camera that sees almost nothing is not by itself a fault: down a long drift every view
+    sees its own neighbourhood, and the ones at the portal look out of the tunnel and see the
+    dark. Failing on those would make a correct reconstruction of a long drift fail, and
+    loosening the threshold until they pass would leave no threshold at all.
+
+    What a reconstruction whose poses and points are not in one space actually looks like is
+    *every* camera seeing nothing, so that is what is tested: the median camera must see a real
+    share of the model, and the blind ones must be a minority. Both are reported either way, so
+    a reader can see the distribution rather than a verdict.
+    """
+    if not visibility:
+        return ["the reconstruction registers no cameras, so nothing could be checked"]
+    fractions = sorted(v["visible_fraction"] for v in visibility.values())
+    median = float(fractions[len(fractions) // 2])
+    blind = sorted(n for n, v in visibility.items() if v["visible_points"] == 0)
+    out: list[str] = []
+    if median < min_fraction:
+        out.append(
+            f"the median camera sees {median:.3%} of the reconstruction, below "
+            f"{min_fraction:.1%}: the poses and the points may not be in one space"
+        )
+    if len(blind) > max_blind * len(visibility):
+        out.append(
+            f"{len(blind)} of {len(visibility)} cameras see none of the reconstruction at all "
+            f"(e.g. {blind[:3]}); a view at the portal looking out is expected, this many is not"
+        )
+    return out
+
+
 def _overlay(
     image_path: Path, cam: colmap_io.Camera, pose: SE3, ref_xyz: np.ndarray, out_path: Path
 ) -> dict[str, Any]:
@@ -109,6 +143,7 @@ def run_image_only_gate(
     n_views: int = 3,
     max_reference_points: int = 200_000,
     min_visible_fraction: float = 0.01,
+    max_blind_fraction: float = 0.25,
     raise_on_fail: bool = True,
 ) -> dict[str, Any]:
     """Assemble the image-only evidence and write the report."""
@@ -127,15 +162,7 @@ def run_image_only_gate(
         raise ContractError(f"{ds}: sparse/0 registers no images")
     visibility = _visibility(model)
     problems: list[str] = []
-    blind = sorted(
-        name for name, v in visibility.items() if v["visible_fraction"] < min_visible_fraction
-    )
-    if blind:
-        problems.append(
-            f"{len(blind)} of {len(visibility)} cameras see less than "
-            f"{min_visible_fraction:.1%} of the reconstruction (e.g. {blind[:3]}): the poses "
-            "and the points may not be in one space"
-        )
+    problems += _visibility_problems(visibility, min_visible_fraction, max_blind_fraction)
 
     prov = json.loads((ds / PROVENANCE_DIR / "init_provenance.json").read_text())
     reg = manifest.registration
@@ -190,6 +217,12 @@ def run_image_only_gate(
         "minegs_version": minegs.__version__,
         "git_commit": git_commit(),
         "reconstruction": {
+            "median_visible_fraction": float(
+                sorted(v["visible_fraction"] for v in visibility.values())[len(visibility) // 2]
+            )
+            if visibility
+            else 0.0,
+            "blind_cameras": sorted(n for n, v in visibility.items() if v["visible_points"] == 0),
             "sfm_id": prov.get("sfm_id"),
             "sfm_model_sha256": prov.get("sfm_model_sha256"),
             "registered_images": len(model.images),
