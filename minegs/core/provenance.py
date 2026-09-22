@@ -149,14 +149,34 @@ def tool_versions(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _cli_version(cmd: str) -> str | None:
-    try:
-        out = subprocess.run(
-            [cmd, "--version"], capture_output=True, text=True, timeout=5, check=False
+    """The tool's version, or ``None`` when it could not be established.
+
+    This used to run the probe with ``check=False`` and record ``stdout or stderr`` whatever
+    happened, which meant a *failed* probe was written down as the version. COLMAP 3.9.1 does
+    not accept ``--version``, so every provenance record it touched carried
+
+        "E... colmap.cc:158] Command `--version` not recognize"
+
+    in the slot where the version of the engine that produced a reconstruction belongs, and
+    nothing said so. A probe that exits non-zero establishes nothing, and nothing is ``None``.
+
+    ``-h`` is tried second because that is where COLMAP prints its banner; it runs only after
+    ``--version`` has already failed, so a tool that answers the first question is never asked
+    the second.
+    """
+    for argv in ([cmd, "--version"], [cmd, "-h"]):
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            continue
+        line = next(
+            (ln.strip() for ln in (out.stdout or out.stderr).splitlines() if ln.strip()), ""
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    text = (out.stdout or out.stderr).strip().splitlines()
-    return text[0][:80] if text else None
+        if line:
+            return line[:80]
+    return None
 
 
 def make_id(prefix: str, when: datetime | None = None) -> str:

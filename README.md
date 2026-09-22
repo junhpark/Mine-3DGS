@@ -684,6 +684,11 @@ minegs eval compare-paths data/tls/dataset data/driftA/dataset \
   아무도 보고하지 않은 채 통과한다. 없는 key 는 "모른다" 이고, 모르면 거짓이다.
 * **CLI 에 SfM·프레임 추출을 대체하는 flag 는 없다.** trainer/renderer 와 같은 규칙이다.
 
+실제 COLMAP 은 **≥ 4.0** 이 필요하다. `apt install colmap` 이 주는 3.9.1 은 `global_mapper` 도
+`rig_configurator` 도 없고 특징 추출 옵션 이름이 다르므로, minegs 가 실행 전에 버전을 확인하고
+그 이유를 말하며 거부한다. 사람이 직접 한 번 통과시키는 절차는
+[docs/PHASE3_ACCEPTANCE.md](docs/PHASE3_ACCEPTANCE.md).
+
 ### 지금 검증된 것과 아닌 것
 
 `tests/test_phase3_gate.py` 가 합성 갱도 하나를 스캐너와 파노라마 양쪽으로 재구성하고, 실제 선별·

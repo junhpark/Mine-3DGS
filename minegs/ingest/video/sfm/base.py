@@ -21,6 +21,13 @@ from minegs.core.errors import ContractError
 MapperName = Literal["global", "incremental"]
 BackendName = Literal["colmap", "gluemap"]
 
+#: The COLMAP these commands are written against. 3.x is not an older version of the same
+#: interface: it has neither ``global_mapper`` nor ``rig_configurator``, and it names the
+#: feature-extraction options ``SiftExtraction.*`` where 4.0 names them ``FeatureExtraction.*``.
+#: So every command below is rejected by it — including by the 3.9.1 that `apt install colmap`
+#: puts on an Ubuntu 24.04 LTS machine, which is the COLMAP an operator is most likely to have.
+MIN_COLMAP: tuple[int, int] = (4, 0)
+
 MATCHERS: dict[str, list[str]] = {
     "sequential": ["colmap", "sequential_matcher"],
     "exhaustive": ["colmap", "exhaustive_matcher"],
@@ -81,6 +88,7 @@ class SfMBackend(ABC):
             raise MissingDependencyError(
                 "colmap", "video", "SfM (system binary >= 4.0, see docker/Dockerfile.cpu)"
             )
+        require_colmap_version()
         work_dir.mkdir(parents=True, exist_ok=True)
         # The mapper writes each reconstruction into a numbered subdirectory of --output_path
         # and expects that path to exist. Nothing created it before, so the first real run
@@ -102,6 +110,48 @@ class SfMBackend(ABC):
                         "smaller one, so nothing here is usable."
                     )
         return SfMRun(sparse_root=work_dir / "sparse", commands=executed, log=log)
+
+
+def colmap_version() -> tuple[int, ...] | None:
+    """The installed COLMAP's version, or ``None`` when it cannot be established.
+
+    Read from the banner rather than from ``--version``, which 3.x does not accept at all.
+    """
+    import re
+
+    from minegs.core.provenance import _cli_version
+
+    banner = _cli_version("colmap")
+    if not banner:
+        return None
+    m = re.search(r"COLMAP\s+v?(\d+)\.(\d+)(?:\.(\d+))?", banner)
+    return tuple(int(g) for g in m.groups() if g is not None) if m else None
+
+
+def require_colmap_version() -> None:
+    """Refuse a COLMAP known to be too old, before it fails on an unrecognised option.
+
+    Presence was the only thing checked, and presence is not enough: 3.9.1 is installed by
+    ``apt install colmap`` on the current Ubuntu LTS, and against it the very first command
+    dies with ``unrecognised option '--FeatureExtraction.use_gpu'`` and a pointer to a log —
+    which reads like a bug in this project rather than like the wrong COLMAP.
+
+    A version that cannot be established is *not* refused. Refusing what we failed to parse
+    would block a perfectly good 4.x behind a changed banner; what is refused is what we know
+    is wrong, and what we do not know is recorded as unknown (:func:`_cli_version`).
+    """
+    version = colmap_version()
+    if version is None or version >= MIN_COLMAP:
+        return
+    raise ContractError(
+        f"COLMAP {'.'.join(str(v) for v in version)} is installed, and these commands are "
+        f"written for COLMAP >= {MIN_COLMAP[0]}.{MIN_COLMAP[1]}. 3.x is not an older version "
+        "of the same interface: it has no `global_mapper` and no `rig_configurator`, and it "
+        "names the feature-extraction options `SiftExtraction.*` rather than "
+        "`FeatureExtraction.*`, so the first command would fail on an unrecognised option "
+        "rather than here. `apt install colmap` on Ubuntu 24.04 LTS gives 3.9.1; "
+        "docker/Dockerfile.cpu has the version this project drives."
+    )
 
 
 def get_sfm_backend(name: str = "colmap", mapper: str = "global") -> SfMBackend:
