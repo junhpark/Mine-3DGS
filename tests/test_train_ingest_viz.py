@@ -402,3 +402,87 @@ def test_splat_export(tmp_path, rng):
     extra.update({f"rot_{i}": (np.ones(n) if i == 0 else np.zeros(n)) for i in range(4)})
     p = write_splat(PointCloud(rng.normal(size=(n, 3)), extra=extra), tmp_path / "a.splat")
     assert p.stat().st_size == 32 * n
+
+
+# ---------------------------------------------------------------- first contact with a real COLMAP
+#
+# Both of these were found by installing COLMAP and running the CLI against it for the first
+# time (Phase 3 manual acceptance, 2026-09-22). Neither needed real imagery to show itself.
+
+
+def test_a_failed_version_probe_is_not_recorded_as_the_version(monkeypatch):
+    """A probe that exits non-zero establishes nothing, and nothing is None.
+
+    COLMAP 3.9.1 does not accept `--version`: it exits 1 and prints an error. The probe took
+    `stdout or stderr` whatever the exit code was, so every provenance record it touched
+    carried "Command `--version` not recognize" in the slot where the version of the engine
+    that produced a reconstruction belongs.
+    """
+    import subprocess
+    from types import SimpleNamespace
+
+    from minegs.core.provenance import _cli_version
+
+    calls: list[list[str]] = []
+
+    def fake(argv, **kw):
+        calls.append(list(argv))
+        if argv[1] == "--version":
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="E2026 colmap.cc:158] Command `--version` not rec"
+            )
+        return SimpleNamespace(
+            returncode=0, stdout="COLMAP 3.9.1 -- Structure-from-Motion\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    assert _cli_version("colmap") == "COLMAP 3.9.1 -- Structure-from-Motion"
+    assert calls == [["colmap", "--version"], ["colmap", "-h"]]
+
+    # nothing answers -> unknown, not the last thing printed
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kw: SimpleNamespace(returncode=1, stdout="", stderr="no")
+    )
+    assert _cli_version("colmap") is None
+
+    # a tool that answers the first question is never asked the second
+    asked: list[list[str]] = []
+
+    def answers(argv, **kw):
+        asked.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="ffmpeg version 7.1\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", answers)
+    assert _cli_version("ffmpeg") == "ffmpeg version 7.1"
+    assert asked == [["ffmpeg", "--version"]]
+
+
+def test_a_colmap_too_old_for_these_commands_is_refused_by_name(monkeypatch):
+    """Presence is not enough, and the failure it caused did not look like the wrong COLMAP.
+
+    `apt install colmap` on Ubuntu 24.04 LTS gives 3.9.1, which has no `global_mapper`, no
+    `rig_configurator`, and names the feature-extraction options `SiftExtraction.*`. Only
+    presence was checked, so the first command died on `unrecognised option
+    '--FeatureExtraction.use_gpu'` with a pointer to a log — which reads like a bug here.
+    """
+    import minegs.ingest.video.sfm.base as base
+
+    def _parse(text):
+        import re
+
+        m = re.search(r"COLMAP\s+v?(\d+)\.(\d+)(?:\.(\d+))?", text) if text else None
+        return tuple(int(g) for g in m.groups() if g is not None) if m else None
+
+    assert _parse("COLMAP 3.9.1 -- Structure-from-Motion and Multi-View Stereo") == (3, 9, 1)
+    assert _parse("COLMAP 4.0 -- Structure-from-Motion") == (4, 0)
+    assert _parse("something else entirely") is None
+
+    monkeypatch.setattr(base, "colmap_version", lambda: (3, 9, 1))
+    with pytest.raises(ContractError, match=r"COLMAP 3\.9\.1 is installed"):
+        base.require_colmap_version()
+
+    # what this project drives passes, and so does a version nobody could parse: refusing what
+    # we failed to read would block a good 4.x behind a changed banner
+    for ok in ((4, 0), (4, 2, 1), None):
+        monkeypatch.setattr(base, "colmap_version", lambda v=ok: v)
+        base.require_colmap_version()

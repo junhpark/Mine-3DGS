@@ -908,6 +908,32 @@ T31–T36 이 이 여섯을 고정한다. 여섯 guard 모두 mutation check 로
 
 T37·T38 의 guard 4개도 mutation check 로 load-bearing 임을 확인했다.
 
+### 17.5d 실제 COLMAP 과의 첫 접촉 (2026-09-22)
+
+§16.5 가 열어 둔 질문 — "실제 COLMAP 과 처음 만나는 순간 플래그가 틀리면" — 에 대한 부분적
+답이다. acceptance 컨테이너에 COLMAP 을 설치해 CLI 를 처음으로 실물 바이너리에 물렸다.
+**설치된 것은 3.9.1 이고 이 프로젝트는 ≥ 4.0 을 구동하므로, 실제 재구성은 수행되지 않았다.**
+그럼에도 두 건이 드러났고 둘 다 실물 이미지도 사람의 눈도 필요하지 않았다.
+
+1. **실패한 version probe 가 version 으로 기록되고 있었다.** `_cli_version()` 은 `check=False`
+   로 실행하고 `stdout or stderr` 를 그대로 기록했다. COLMAP 3.9.1 은 `--version` 을 받지
+   않으므로, 그 바이너리를 거친 모든 provenance record 가 재구성을 만든 엔진의 버전 자리에
+   ``E... colmap.cc:158] Command `--version` not recognize`` 를 담았다. 조용히. 이제 종료
+   코드가 0 이 아니면 아무것도 확정되지 않은 것이고, 확정되지 않은 것은 `None` 이다 — 나중에
+   버전으로 읽힐 문장이 아니라. `-h`(COLMAP 이 배너를 찍는 곳) 는 `--version` 이 실패한 뒤에만
+   시도한다. 이 필드는 Phase 0–3 의 모든 `ProvenanceRecord.tool_versions` 와
+   `SfmRecord.backend_version` 에 들어간다.
+2. **버전 게이트가 없었다 — 존재 여부만 확인했다.** 현재 Ubuntu LTS 에서 `apt install colmap`
+   이 주는 것은 3.9.1 이고, 그것은 같은 인터페이스의 옛 버전이 아니다. `global_mapper` 도
+   `rig_configurator` 도 없고 `FeatureExtraction.*` 를 `SiftExtraction.*` 로 부른다. 그래서
+   첫 명령이 ``unrecognised option '--FeatureExtraction.use_gpu'`` 와 로그 경로만 남기고
+   죽었다 — 잘못된 COLMAP 이 아니라 이 프로젝트의 버그처럼 읽히는 실패였다. 이제 실행 전에
+   거부하고 이유를 말한다. **읽을 수 없는 버전은 거부하지 않는다**: 파싱에 실패했다고 멀쩡한
+   4.x 를 막는 것은 잘못된 것을 막는 것과 다르다.
+
+여전히 수행되지 않은 것: 실제 갱도 영상, 실제 COLMAP 재구성, 사람의 육안 확인. 절차는
+[PHASE3_ACCEPTANCE.md](PHASE3_ACCEPTANCE.md).
+
 ### 17.6 성숙도
 
 > Phase 3 image/360 independent reconstruction path is implemented and structurally tested.
