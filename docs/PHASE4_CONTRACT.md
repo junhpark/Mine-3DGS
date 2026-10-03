@@ -590,6 +590,16 @@ G3 = 같은 dataset/protocol 에서 baseline 대비 정량적 개선. 실제 데
   상속된 OMPI 환경을 쓰지 말 것 (기록).
 * render 해상도 차이 (§2.3-13) 를 고치려면 upstream 이 **첫 이미지 하나의** 크기 비율로 모든 카메라의
   K 를 다시 맞추는 것 (`colmap.py:262-273`) 까지 재현해야 한다.
+* upstream 그대로의 결함이라 MineGS 가 고치지 않고 기록하는 것 (모두 light/heavy 공통):
+  * DefaultStrategy 의 opacity reset 은 v1.5.3 에서 **발화하지 않는다** —
+    `step % self.reset_every == 0 & step > 0` (`default.py:195`) 는 연산자 우선순위 때문에 항상
+    거짓이다.
+  * `export_splats` 는 1-D opacity 에 `isnan(...).any(dim=0)` 을 써서, opacity 하나가 non-finite 면
+    **모든** splat 을 버린다 (`exporter.py:523-524`). 그 run 은 "model holds no gaussians" 로 FAILED
+    가 된다 (fail-closed 이지만 원인은 발산이다).
+  * MineGS 는 `--disable_video` 를 넘기지 않으므로 eval step 마다 `render_traj` 가
+    `camtoworlds[5:-5]` 로 경로를 만든다. staged 이미지가 11 장 이하이면 실패할 수 있다 (작은 합성
+    데이터에서만 해당, 실데이터는 아님).
 
 ### 14.2 C1 — depth supervision artifact
 
@@ -618,3 +628,22 @@ G3 = 같은 dataset/protocol 에서 baseline 대비 정량적 개선. 실제 데
 * run.json schema 1.2 (1.1 → 1.2 migration 은 아무것도 지어내지 않는다).
 * light 의 argv 는 Phase 0D 와 **바이트 단위로 같다** (테스트). light run 도 이제 cfg.yml 이 없거나
   요청과 다르면 FAILED 다 — 이것은 baseline 의 수치를 바꾸지 않고 evidence 만 강화한다.
+
+### 14.4 C3 — baseline ↔ advanced 비교
+
+`minegs/eval/compare/runs.py` (`compare_runs`, `RunComparison`), CLI `minegs eval compare-runs`.
+
+* 입력은 명시적인 artifact 다 (Phase 3 `compare-paths` 와 같은 방식): 두 run 디렉터리, 각 run 의
+  surface 에서 자른 section record, 기준 section, 선택적으로 geometry/render 보고서와 Phase 2 e2e 보고서.
+* 거부 순서: run 이 succeeded 가 아님 → 다른 dataset (id·hash 를 지금의 dataset 에서 재도출) →
+  LOCAL_METRIC 아님 / `T_local_from_internal ≠ I` → 같은 run 두 번 → section 이 그 run 의 surface 에서
+  온 것이 아님 → 다른 grid → 다른 기준 → geometry/render 측정 방식 다름 → 선언된 holdout 이 없는데
+  범위도 주지 않음.
+* 모든 수치는 두 run 이 **모두** 관측한 구간에서 `compare_to_reference` 를 다시 불러 얻는다. 한쪽에 없는
+  값은 그쪽과 차이 모두 `null`. training loss 는 읽지 않는다. verdict 필드는 없고 `g3_status:
+  PENDING`.
+* "real" 은 각 쪽의 e2e 보고서가 `real_gpu_execution` 과 `real_renderer_execution` 을 **둘 다** 참으로
+  말할 때만이다. 보고서가 없거나 하나라도 대체되었으면 structural.
+* 주석으로 남기는 것: data_factor 가 다르면 renderer 해상도 차이 (§2.3-13), strategy 가 다르면 mcmc
+  preset 전체 (init_opa/init_scale/opacity_reg/scale_reg) 가 차이에 섞임, appearance run 의 render
+  지표는 zero-embedding 정책을 포함함, 명시 범위면 diagnostic.

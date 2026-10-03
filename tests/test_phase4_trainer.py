@@ -612,10 +612,12 @@ def test_heavy_runs_pass_the_phase1_render_gate_and_antialiased_ones_do_not(tmp_
         kw = {}
         if profile.requests.get("depth_loss"):
             kw = {"depth_supervision_dir": Path("/x"), "depth_supervision_sha256": "0" * 64}
-        cmd = get_backend("gsplat").build_command(Path("/s"), Path("/o"), profile,
-                                                  trainer=Path("/t.py"), **kw)
-        return SimpleNamespace(run_id="r", command=cmd.argv,
-                               profile=profile.model_dump(mode="json"))
+        cmd = get_backend("gsplat").build_command(
+            Path("/s"), Path("/o"), profile, trainer=Path("/t.py"), **kw
+        )
+        return SimpleNamespace(
+            run_id="r", command=cmd.argv, profile=profile.model_dump(mode="json")
+        )
 
     for name in ("heavy", "heavy-base", "heavy-appearance", "heavy-depth"):
         require_reproducible_render(record(load_profile(name)), tmp_path)
