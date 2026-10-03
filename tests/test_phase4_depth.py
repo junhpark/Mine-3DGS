@@ -453,3 +453,15 @@ def test_building_depth_evidence_does_not_touch_init_or_the_dataset_hash(tmp_pat
 def test_artifact_is_written_once(tls):
     with pytest.raises(ContractError, match="written once"):
         build_tls_projection(tls.dataset_dir, tls.cloud, tls.artifact.path)
+
+
+def test_a_file_the_record_does_not_name_is_refused(tls, tmp_path):
+    art = _copy(tls.artifact, tmp_path)
+    (art / "notes.txt").write_text("travels with the artifact hash, checked by nothing")
+    with pytest.raises(ContractError, match="does not name"):
+        verify_depth_supervision(tls.dataset_dir, art)
+    (art / "notes.txt").unlink()
+    (art / "sub").mkdir()
+    (art / "sub" / "samples.npy").write_bytes((art / "samples.npy").read_bytes())
+    with pytest.raises(ContractError, match="does not name"):
+        verify_depth_supervision(tls.dataset_dir, art)

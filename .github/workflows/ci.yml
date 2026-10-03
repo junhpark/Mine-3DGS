@@ -243,6 +243,38 @@ jobs:
             echo 'a dataset was compared against itself'; exit 1
           fi
           echo 'phase 3 fail-closed smoke ok'
+          # Phase 4: depth supervision is built from evidence, verified, and the only way depth
+          # reaches training; heavy builds an adapter command and refuses to run without it.
+          minegs dataset depth-supervision /tmp/syn/dataset --source tls_projection \
+            --cloud /tmp/syn/raw/tls_full.ply --out /tmp/p4/dsup
+          minegs dataset depth-supervision-verify /tmp/syn/dataset /tmp/p4/dsup > /tmp/p4/v.json
+          python -c "
+          import json; v = json.loads(open('/tmp/p4/v.json').read().split('\n', 1)[1])
+          assert v['frame'] == 'LOCAL_METRIC' and v['depth_semantics'] == 'camera_z', v
+          assert v['n_samples_in_loss'] > 0
+          print('phase 4 depth supervision smoke ok')"
+          minegs train command /tmp/syn/dataset --profile heavy --depth-supervision /tmp/p4/dsup \
+            > /tmp/p4/cmd.txt
+          grep -q 'minegs.train.trainers.advanced_gs' /tmp/p4/cmd.txt
+          grep -q -- '--mcmc-metric-compensation' /tmp/p4/cmd.txt
+          if grep -q -- '--depth_loss' /tmp/p4/cmd.txt; then
+            echo "upstream's depth flag reached a heavy command"; exit 1
+          fi
+          if minegs train command /tmp/syn/dataset --profile heavy > /tmp/p4/no.txt 2>&1; then
+            echo 'heavy built a command without its depth supervision'; exit 1
+          fi
+          if minegs train run /tmp/syn/dataset --profile heavy --runner runpod \
+               --depth-supervision /tmp/p4/dsup; then
+            echo 'RunPod accepted a run'; exit 1
+          fi
+          python -c "
+          import numpy as np
+          s = np.load('/tmp/p4/dsup/samples.npy'); s['depth_m'][0] += 1
+          np.save('/tmp/p4/dsup/samples.npy', s, allow_pickle=False)"
+          if minegs dataset depth-supervision-verify /tmp/syn/dataset /tmp/p4/dsup; then
+            echo 'tampered depth samples verified'; exit 1
+          fi
+          echo 'phase 4 fail-closed smoke ok'
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

@@ -176,7 +176,9 @@ def get_backend(name: str) -> TrainBackend:
     if name in ("splatfacto", "pgsr", "2dgs"):
         from minegs.core.errors import NotYetImplementedError
 
-        raise NotYetImplementedError(f"backend {name}", "4")  # advanced GS backends
+        # Advanced GS backends were Phase 4 candidates; the Phase 4 contract excludes them
+        # (docs/PHASE4_CONTRACT.md §1.2), so no phase is scheduled for them yet.
+        raise NotYetImplementedError(f"backend {name}", "TBD; excluded from Phase 4")
     if name == "inria":
         raise ContractError(
             "INRIA 3DGS is non-commercial and not shipped (§8.1); call it externally for baselines"

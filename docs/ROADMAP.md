@@ -26,8 +26,8 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 0D | Local GS Baseline | **0D.1 resume safety contract** 및 **0D.2 local GPU baseline execution contract** implemented + structurally tested. **실제 GPU baseline 미실행**. 0D 전체는 **NOT COMPLETE** (§0D) |
 | 1 | Metric Surface & Evaluation | **1A metric surface artifact + depth fusion** 및 **1B metric depth rendering: implemented + structurally tested** (§1). 검증된 depth manifest 가 있을 때만 `minegs_render` → `geometry_accuracy`; 외부 depth 는 diagnostic 전용. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), TSDF/mesh: NOT IMPLEMENTED, 실측 과학적 검증: NOT VALIDATED |
 | 2 | E57 End-to-End MVP | **implemented + structurally tested** — E57 한 개를 ingest→dataset→train→depth→surface→geometry→section/volume→report 로 관통하는 단일 orchestration (`minegs e2e`), stage checkpoint, paired TLS validation, Phase 2 report. 합성 structural gate 는 실제 E57 파일에서 돌지만 **trainer/renderer 는 대체**된다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** (§2) |
-| 3 | Image / 360 Independent Reconstruction | **implemented and structurally tested, 미검증** — 영상/360 → `FrameSetRecord` → `SfmRecord` → `RegistrationRecord` → image-only dataset → 기존 학습·depth·surface·sections·volume → TLS-assisted 대비 비교까지 한 workflow 로 이어진다. 합성 갱도 하나를 스캐너와 파노라마 양쪽으로 재구성하는 구조 게이트와 T1–T30 negative test 가 있다. **실제 COLMAP·GPU·렌더러·실측 영상은 한 번도 실행되지 않았다** — SfM·프레임 추출·학습·렌더러 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 기록된다. 계약: [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) (C0 freeze + §17 구현 기록) |
-| 4 | Advanced GS / Heavy Profile | 미착수 — `depth_loss` 는 여기서 설계 |
+| 3 | Image / 360 Independent Reconstruction | **implemented and structurally tested, 미검증** (manual acceptance: **DEFERRED**, [runbook](PHASE3_ACCEPTANCE.md)) — 영상/360 → `FrameSetRecord` → `SfmRecord` → `RegistrationRecord` → image-only dataset → 기존 학습·depth·surface·sections·volume → TLS-assisted 대비 비교까지 한 workflow 로 이어진다. 합성 갱도 하나를 스캐너와 파노라마 양쪽으로 재구성하는 구조 게이트와 T1–T30 negative test 가 있다. **실제 COLMAP·GPU·렌더러·실측 영상은 한 번도 실행되지 않았다** — SfM·프레임 추출·학습·렌더러 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 기록된다. 계약: [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) (C0 freeze + §17 구현 기록) |
+| 4 | Advanced GS / Heavy Profile | **implemented and structurally tested** — metric depth supervision artifact (`DepthSupervisionRecord`, init 과 분리, holdout leakage 재도출 검증), upstream `simple_trainer.py` 를 그대로 실행하는 MineGS trainer adapter (depth 항·MCMC metric 보정), 실행 가능한 heavy profile 과 ablation 셋, 요청↔실제 trainer config 대조, baseline↔advanced 비교 경로. **real GPU heavy training: NOT PERFORMED**, **baseline vs heavy 실측 비교: NOT PERFORMED**, **G3: PENDING**, 실측 과학적 검증: **NOT VALIDATED**. 계약: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) |
 | 5 | Long Tunnel & Chunking | 예약만 (manifest.chunks) |
 | 6 | RunPod / Reproducible Compute | **미구현, fail-closed** |
 | 7 | Multi-Epoch Change Detection | 미구현 — single manifest 는 change claim 불가 |
@@ -803,29 +803,33 @@ leakage·dataset·gate·비교의 거부를 고정한다.
 
 ### Phase 4 — Advanced GS / Heavy Profile
 
-Phase 2/3 에서 **실제로 관측된 failure mode** 를 근거로 품질을 개선한다.
-기술을 먼저 추가하지 않는다.
+계약: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) (C0 reality audit + freeze, §14 구현 기록).
 
-**후보**: appearance embedding, 조명 보정, bilateral grid, depth supervision,
-normal supervision, 2DGS, PGSR, surface-aware backend.
+원래 이 Phase 는 Phase 2/3 에서 **실제로 관측된 failure mode** 를 근거로 하기로 했다. Phase 2/3
+는 실제 GPU 에서 한 번도 돌지 않았으므로 관측된 failure mode 는 아직 없다. 그래서 Phase 4 는 최소
+기술만 넣고 성능 이득을 주장하지 않는다 (2DGS/PGSR/normal supervision/RunPod/chunking 은 범위 밖).
 
-**여기서 해결할 계약 부채 — `depth_loss`**: upstream gsplat 의 depth supervision 은 COLMAP
-image → point observation track 을 사용한다. 현재 staging 은 `init_points.ply` 를 `points3D`
-로 쓰면서 그 track 을 비우므로 둘은 구조적으로 양립하지 않는다. 그래서 Phase 0A/0D 에서
-`depth_loss` 요청은 `ContractError` 로 거부된다 (`minegs/train/backends/gsplat.py`,
-`DEPTH_LOSS_REFUSAL`). Phase 4 에서 depth supervision 을 다시 설계할 때 다음을 명시해야 한다.
+| 항목 | 상태 |
+|---|---|
+| depth supervision 재설계 (`DepthSupervisionRecord`, `sfm_tracks` / `tls_projection`) | **implemented + structurally tested** |
+| holdout leakage (점·ray·held-out 이미지·held-out track, 위치 불명 support fail-closed) | **implemented + structurally tested** (고의 오염 negative test, mutation check) |
+| MineGS trainer adapter (upstream loop 그대로, depth 항 gradient 주입, MCMC metric 보정) | **implemented + structurally tested** — CI 에서 CPU torch 로 stand-in upstream 을 끝까지 실행 |
+| heavy profile + ablation (`heavy-base`/`-appearance`/`-depth`) | **implemented + structurally runnable** (local runner) |
+| appearance embedding | **implemented** (capability → `--app_opt`, cfg.yml 로 대조, init 색 clamp) |
+| 요청 ↔ 실제 trainer config / adapter evidence 대조 | **implemented + structurally tested** |
+| baseline ↔ advanced 비교 (`minegs eval compare-runs`) | **implemented + structurally tested** |
+| real GPU heavy training | **NOT PERFORMED** |
+| baseline vs heavy 실측 비교 | **NOT PERFORMED** |
+| G3 | **PENDING** |
 
-- depth 의 source (TLS 렌더 깊이 / SfM / 센서)
-- image correspondence 를 어떻게 유지할 것인가 (tracked SfM geometry 병행 등)
-- leakage 거동 — holdout 구간의 깊이가 학습에 들어가지 않는가
-- metric frame — 깊이가 어느 프레임의 m 인가
-- uncertainty — 깊이 신뢰도를 loss 에 어떻게 반영하는가
+C0 감사가 드러낸 **Phase 0D 부터의 결함**도 여기서 고쳤다 (실제 GPU 실행이 없어 숨어 있었다):
+고정된 pycolmap fork 는 MineGS 가 쓰던 COLMAP text 모델을 Python 3 에서 읽지 못한다 → staging 이
+binary 모델을 함께 쓴다. `data_factor > 1` 은 `images_<factor>/` 가 필요하다 → staging 이 만든다.
 
-**같은 Phase 의 별도 항목 — `normalize_world_space=true`**: 현재 거부된다
-(`NORMALIZE_REFUSAL`). 활성화하려면 upstream gsplat 정규화와의 **equivalence test** 가
-선행되어야 한다. 재구현한 `similarity_from_cameras` + `align_principle_axes` 가 실제 파서와
-동일한 변환을 만드는지 데이터셋별로 확인하고, 커맨드를 만드는 쪽과 변환을 계산하는 쪽이
-같은 파일시스템을 보는지(docker path 문제)도 함께 해결한다.
+계속 거부되는 것: upstream `depth_loss` (target 이 init 점 자체), `normalize_world_space=true`
+(계약 §8 의 7 조건 미충족), `normal_loss` (v1.5.3 3DGS trainer 에 없음), `--runner runpod` (Phase 6).
+알려진 미해결: depth renderer 가 학습 해상도가 아니라 full 해상도로 렌더한다 (Phase 1B 부터,
+SHOULD_FIX deferred, 계약 §2.3-13).
 
 **Gate (G3)**: 동일 dataset/protocol 에서 baseline 대비 정량적 개선.
 "학습이 됐다" 만으로 Phase complete 로 하지 않는다.
@@ -931,9 +935,11 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 |---|---|---|---|
 | `reconstruction` run 에 형상 정확도 요청 | `ProtocolViolation` (exit 3) | §5 성능 주장 불가 | 해당 없음 (설계) |
 | single manifest 의 change claim | `judge` 가 부여 안 함, `require` 는 `ProtocolViolation` | change = 2 epochs | Phase 7 pair protocol |
-| `depth_loss: true` | `ContractError` (exit 2) | TLS staging 이 COLMAP track 제거 | Phase 4 |
-| `normalize_world_space: true` | `ContractError` (exit 2) | upstream equivalence 미검증 | Phase 4 |
-| `--profile heavy` 실행 | `ContractError` — depth_loss 때문에 | 위와 동일 | Phase 4 |
+| upstream `depth_loss` (backend_args, 어떤 철자든) | `ContractError` (exit 2) | upstream depth target 은 init points3D 자체 (Phase 4 C0 Q6) | 해당 없음 (설계) — depth 는 `DepthSupervisionRecord` 로 |
+| depth 요청 profile 에 `--depth-supervision` 없음 / 반대로 요청 없는 profile 에 줌 | `ContractError` (exit 2) | 증거 없는 depth run, 조용히 무시되는 supervision 금지 | 해당 없음 (설계) |
+| holdout 안·holdout 을 지나는·위치 불명 depth 샘플, held-out 이미지 샘플, 변조된 artifact | `ContractError` (exit 2) | 재도출 검증 (Phase 4 AD-3) | 해당 없음 (설계) |
+| `normalize_world_space: true` | `ContractError` (exit 2) | upstream 은 변환을 저장하지 않고 출력을 되돌릴 수 없다 (Phase 4 계약 §8) | 7 조건 충족 시 |
+| run 후 cfg.yml / adapter evidence 가 요청과 다름 | run **FAILED** | 요청한 실험이 아님 (Phase 4 AD-8) | 해당 없음 (설계) |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
 | TSDF / mesh 추출 | `NotYetImplementedError` | 미구현 | Phase 1 후속 |
@@ -1036,7 +1042,7 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | option name 이 될 수 없는 `backend_args` key (내부 공백) | `ContractError` | flag 로 넘길 수 없고, 출력된 command 에서는 인자 두 개로 읽힌다 | 해당 없음 (설계) |
 | 읽을 수 없는/scan 없는 E57 | `E57*` (`ContractError`, exit 2) | 무엇이 문제인지 문장으로 보고 | 해당 없음 (설계) |
 | GLUEMAP SfM | `NotYetImplementedError` | 의존성 무거움, 보류 | Phase 3 |
-| `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | Phase 4 |
+| `pgsr` / `2dgs` / `splatfacto` backend | `NotYetImplementedError` | 미구현 | 미정 (Phase 4 non-goal) |
 | `inria` backend | `ContractError` | non-commercial 라이선스 | 해당 없음 |
 | gsplat trainer 미탐지 | `ContractError` | wheel 에 trainer 없음 | 해당 없음 (docker 로 해결) |
 | `raw/` push | `ContractError` | 원본은 로컬에만 (§1.4) | 해당 없음 (설계) |

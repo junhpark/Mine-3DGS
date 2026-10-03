@@ -344,6 +344,15 @@ def verify_depth_supervision(
     samples_path = art / record.samples_file
     if not samples_path.is_file():
         raise _refuse(art, f"{record.samples_file} is missing")
+    # The artifact's identity is the hash of its directory, and the trainer receives the whole
+    # directory. A file in it that the record does not name would travel with that identity
+    # without ever being checked, so it is refused (as Phase 3 refuses frame-set stowaways).
+    named = {art / RECORD_FILE, art / record.samples_file}
+    extra = sorted(
+        str(p.relative_to(art)) for p in art.rglob("*") if p.is_file() and p not in named
+    )
+    if extra:
+        raise _refuse(art, f"holds files its record does not name: {extra[:5]}")
     got = sha256_file(samples_path)
     if got != record.samples_sha256:
         raise _refuse(
