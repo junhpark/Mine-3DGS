@@ -367,6 +367,133 @@ def _read_rigs(model: ColmapModel, d: Path) -> None:
             model.frames[fid] = Frame(fid, rid, SE3.from_quat_t(q, t), ids)
 
 
+# ---------------------------------------------------------------- binary (COLMAP *.bin)
+#
+# gsplat v1.5.3's Parser reads models through the pycolmap fork it pins
+# (rmbrualla/pycolmap@cc7ea4b). That fork's text loaders are Python 2 code (``np.array(map(...))``)
+# and stop at the first blank line, which an image with no 2D points writes. So a text model
+# never reaches upstream intact on Python 3. The fork looks for ``*.bin`` first, so staging
+# writes these alongside the text (docs/PHASE4_CONTRACT.md §2.3-1). The layout is COLMAP's own,
+# little-endian: the struct formats below are the ones the fork unpacks.
+
+CAMERA_MODEL_IDS = {
+    "SIMPLE_PINHOLE": 0,
+    "PINHOLE": 1,
+    "SIMPLE_RADIAL": 2,
+    "RADIAL": 3,
+    "OPENCV": 4,
+    "OPENCV_FISHEYE": 5,
+    "FULL_OPENCV": 6,
+}
+_MODEL_NAMES = {v: k for k, v in CAMERA_MODEL_IDS.items()}
+INVALID_POINT3D_ID = 2**64 - 1
+
+
+def write_model_binary(model: ColmapModel, sparse_dir: str | Path) -> Path:
+    """``cameras.bin``, ``images.bin``, ``points3D.bin`` (COLMAP binary layout)."""
+    import struct
+
+    d = Path(sparse_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "cameras.bin", "wb") as f:
+        f.write(struct.pack("<Q", len(model.cameras)))
+        for c in model.cameras.values():
+            if c.model not in CAMERA_MODEL_IDS:
+                raise ContractError(f"camera model {c.model} has no COLMAP binary id here")
+            if len(c.params) != CAMERA_MODELS[c.model]:
+                raise ContractError(
+                    f"camera {c.id}: {c.model} takes {CAMERA_MODELS[c.model]} params"
+                )
+            f.write(struct.pack("<IiQQ", c.id, CAMERA_MODEL_IDS[c.model], c.width, c.height))
+            f.write(struct.pack(f"<{len(c.params)}d", *[float(p) for p in c.params]))
+    with open(d / "images.bin", "wb") as f:
+        f.write(struct.pack("<Q", len(model.images)))
+        for im in model.images.values():
+            f.write(
+                struct.pack(
+                    "<I4d3dI", im.id, *map(float, im.qvec), *map(float, im.tvec), im.camera_id
+                )
+            )
+            f.write(im.name.encode() + b"\x00")
+            xys = np.asarray(im.xys, dtype=np.float64).reshape(-1, 2)
+            ids = np.asarray(im.point3D_ids, dtype=np.int64).reshape(-1)
+            f.write(struct.pack("<Q", len(xys)))
+            for (x, y), pid in zip(xys, ids, strict=True):
+                f.write(struct.pack("<2dQ", x, y, INVALID_POINT3D_ID if pid < 0 else int(pid)))
+    with open(d / "points3D.bin", "wb") as f:
+        f.write(struct.pack("<Q", len(model.points3D)))
+        for p in model.points3D.values():
+            rgb = np.asarray(p.rgb, dtype=np.int64).reshape(3)
+            if np.any((rgb < 0) | (rgb > 255)):
+                raise ContractError(f"point {p.id}: colour {rgb.tolist()} is not 8-bit")
+            track = list(
+                zip(
+                    np.asarray(p.image_ids).tolist(),
+                    np.asarray(p.point2D_idxs).tolist(),
+                    strict=True,
+                )
+            )
+            f.write(
+                struct.pack(
+                    "<Q3d3BdQ", p.id, *map(float, p.xyz), *map(int, rgb), float(p.error), len(track)
+                )
+            )
+            for iid, j in track:
+                f.write(struct.pack("<II", int(iid), int(j)))
+    return d
+
+
+def read_model_binary(sparse_dir: str | Path) -> ColmapModel:
+    """Read a COLMAP binary model (the inverse of ``write_model_binary``)."""
+    import struct
+
+    d = Path(sparse_dir)
+    cameras: dict[int, Camera] = {}
+    with open(d / "cameras.bin", "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        for _ in range(n):
+            cid, mid, w, h = struct.unpack("<IiQQ", f.read(24))
+            model = _MODEL_NAMES[mid]
+            k = CAMERA_MODELS[model]
+            params = list(struct.unpack(f"<{k}d", f.read(8 * k)))
+            cameras[cid] = Camera(cid, model, int(w), int(h), params)
+    images: dict[int, Image] = {}
+    with open(d / "images.bin", "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        head = struct.Struct("<I4d3dI")
+        for _ in range(n):
+            vals = head.unpack(f.read(head.size))
+            name = b"".join(iter(lambda: f.read(1), b"\x00")).decode()
+            (m,) = struct.unpack("<Q", f.read(8))
+            xys = np.zeros((m, 2))
+            ids = np.zeros(m, dtype=np.int64)
+            for j in range(m):
+                x, y, pid = struct.unpack("<2dQ", f.read(24))
+                xys[j] = (x, y)
+                ids[j] = -1 if pid == INVALID_POINT3D_ID else pid
+            images[vals[0]] = Image(
+                vals[0], np.array(vals[1:5]), np.array(vals[5:8]), vals[8], name, xys, ids
+            )
+    points: dict[int, Point3D] = {}
+    with open(d / "points3D.bin", "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        head = struct.Struct("<Q3d3BdQ")
+        for _ in range(n):
+            vals = head.unpack(f.read(head.size))
+            t = vals[8]
+            track = np.array(struct.unpack(f"<{2 * t}I", f.read(8 * t)), dtype=np.int64)
+            track = track.reshape(-1, 2)
+            points[vals[0]] = Point3D(
+                vals[0],
+                np.array(vals[1:4]),
+                np.array(vals[4:7], dtype=np.uint8),
+                float(vals[7]),
+                track[:, 0],
+                track[:, 1],
+            )
+    return ColmapModel(cameras, images, points)
+
+
 # ---------------------------------------------------------------- helpers
 
 

@@ -28,7 +28,7 @@ from minegs.train.runner.base import (
     single_device_index,
     verify_postconditions,
 )
-from minegs.train.staging import stage_dataset
+from minegs.train.staging import STAGED_HASH_PATTERNS, stage_dataset, stage_depth_supervision
 
 
 def _now() -> str:
@@ -127,13 +127,20 @@ class LocalRunner(Runner):
         # whose ranks overwrite each other's point_cloud_<step>.ply (§0D.2 B2).
         device = single_device_index(self.config.gpus)
 
+        enabled = backend.resolve_requests(profile)
         staged = stage_dataset(
             dataset_dir,
             run_dir / "staged",
             manifest,
             max_images=profile.max_images,
             chunk_id=run.chunk_id,
+            data_factor=profile.data_factor,
+            clamp_init_rgb=bool(enabled.get("appearance_embedding")),
         )
+        verified = getattr(self, "_verified_supervision", None)
+        staged_supervision = None
+        if verified is not None:
+            staged_supervision = stage_depth_supervision(verified, staged.path)
         record.staged = {
             "path": "staged",
             "n_images": len(staged.images),
@@ -141,12 +148,24 @@ class LocalRunner(Runner):
             "subset": staged.subset,
             "init_source": staged.init_source,
             "init_points": staged.init_points,
-            "sha256": sha256_tree(staged.path, ("sparse/0/*.txt", "images/**/*", "masks/**/*")),
+            "downscale": staged.downscale,
+            "init_rgb_clamped": staged.init_rgb_clamped,
+            "depth_supervision": None
+            if staged_supervision is None
+            else str(staged_supervision.relative_to(staged.path)),
+            "sha256": sha256_tree(staged.path, STAGED_HASH_PATTERNS),
         }
         # No resume branch here on purpose: --resume-from is refused in Runner.prepare, before
         # this method runs and before the run directory exists (docs/ROADMAP.md §Phase 0D).
+        sup_sha = None if verified is None else verified.artifact_sha256
         if self.config.native:
-            cmd = backend.build_command(staged.path, work, profile)
+            cmd = backend.build_command(
+                staged.path,
+                work,
+                profile,
+                depth_supervision_dir=staged_supervision,
+                depth_supervision_sha256=sup_sha,
+            )
             argv = cmd.argv
             # No docker to narrow the device set here, so say it directly. gsplat's own docs
             # give CUDA_VISIBLE_DEVICES as the way to choose ranks.
@@ -165,6 +184,10 @@ class LocalRunner(Runner):
                 Path("/data/run/backend_out"),
                 profile,
                 check_trainer=False,  # the trainer lives inside the image
+                depth_supervision_dir=None
+                if staged_supervision is None
+                else Path("/data/run/staged") / staged_supervision.relative_to(staged.path),
+                depth_supervision_sha256=sup_sha,
             )
             argv = [
                 "docker",
@@ -191,12 +214,16 @@ class LocalRunner(Runner):
         record.command = argv
         record.command_env = dict(cmd.env)
         record.T_local_from_internal = cmd.T_local_from_internal.to_list()
+        record.trainer = dict(cmd.trainer)
+        record.expected_trainer_config = dict(cmd.expected_config)
         record.image = self.config.image or None
         record.max_steps = profile.max_steps
         record.runtime = (
             runtime_info()
             if self.config.native
-            else container_runtime_info(self.config.image, device, cmd.argv[1])
+            else container_runtime_info(
+                self.config.image, device, cmd.trainer.get("upstream_trainer", cmd.argv[1])
+            )
         )
         record.started_at = _now()
         record.status = RunStatus.RUNNING

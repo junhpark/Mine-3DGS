@@ -25,6 +25,11 @@ jobs:
           # real libE57 round trips in CI. PDAL is a separate extra: its bindings compile
           # against the PDAL C++ library and cannot be pip-installed on a bare runner.
           pip install -e ".[dev,e57]"
+          # Phase 4: the trainer adapter's torch code (depth term, gradient injection, the
+          # Runner subclass) runs against a stand-in upstream on the CPU. The CPU wheel is
+          # enough; gsplat and CUDA are not installed, and real training is not claimed.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -c "import torch; print('torch', torch.__version__)"
       - name: Lint
         run: ruff check .
       - name: Format check

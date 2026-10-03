@@ -390,12 +390,20 @@ def write_json(path: Path, data: Any) -> Path:
 def _train_inputs(ctx: StageContext) -> dict[str, Any]:
     cfg = ctx.config
     dataset_dir = ctx.upstream(Stage.DATASET)["dataset_dir"]
+    sup = None
+    if cfg.depth_supervision:
+        from minegs.core.provenance import sha256_tree
+
+        # The supervision's bytes are part of what is trained: a changed artifact is a
+        # different run, never a reusable one (Phase 4 AD-1).
+        sup = sha256_tree(Path(cfg.depth_supervision))
     return {
         **dataset_identity(dataset_dir),
         "profile": cfg.profile,
         "backend": cfg.backend,
         "runner": cfg.runner,
         "native": cfg.native,
+        "depth_supervision_sha256": sup,
     }
 
 
@@ -412,6 +420,7 @@ def _train_run(ctx: StageContext) -> StageOutcome:
         profile=cfg.profile,
         backend=cfg.backend,
         runner=cfg.runner,
+        depth_supervision=cfg.depth_supervision,
     )
     from minegs.core.provenance import make_id
 

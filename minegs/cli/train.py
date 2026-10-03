@@ -31,6 +31,9 @@ def command(
     profile: str = typer.Option("light"),
     backend: str = typer.Option("gsplat"),
     out_dir: Path = typer.Option(Path("/data/run/backend_out")),
+    depth_supervision: Path | None = typer.Option(
+        None, help="a verified DepthSupervisionRecord directory (profiles requesting depth_loss)"
+    ),
 ) -> None:
     """Print the backend command a run would execute (dry run, no GPU / trainer needed).
 
@@ -43,7 +46,20 @@ def command(
     def go() -> None:
         be = get_backend(backend)
         prof = load_profile(profile)
-        cmd = be.build_command(dataset_dir, out_dir, prof, check_trainer=False)
+        sup_dir = sup_sha = None
+        if depth_supervision is not None:
+            from minegs.train.supervision.depth import verify_depth_supervision
+
+            v = verify_depth_supervision(dataset_dir, depth_supervision)
+            sup_dir, sup_sha = v.path, v.artifact_sha256
+        cmd = be.build_command(
+            dataset_dir,
+            out_dir,
+            prof,
+            check_trainer=False,
+            depth_supervision_dir=sup_dir,
+            depth_supervision_sha256=sup_sha,
+        )
         # shlex.join, not " ".join: a value containing whitespace would otherwise print as two
         # arguments, so the line a reader copies would not be the command that runs.
         #
@@ -86,6 +102,12 @@ def run(
         "closed rather than silently restarting from iteration 0 (Phase 0D.3, docs/ROADMAP.md).",
     ),
     chunk: str | None = typer.Option(None),
+    depth_supervision: Path | None = typer.Option(
+        None,
+        "--depth-supervision",
+        help="a DepthSupervisionRecord directory (`minegs dataset depth-supervision`); required "
+        "by profiles that request depth_loss (heavy, heavy-depth), refused by the others",
+    ),
 ) -> None:
     """Run training to completion. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8).
 
@@ -125,6 +147,7 @@ def run(
                 runner=rname,
                 resume_from=str(resume_from) if resume_from else None,
                 chunk_id=chunk,
+                depth_supervision=str(depth_supervision) if depth_supervision else None,
             )
         )
         console.print(f"submitted [bold]{h.run_id}[/] -> {h.run_dir}")

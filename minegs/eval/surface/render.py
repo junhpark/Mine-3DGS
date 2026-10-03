@@ -334,6 +334,12 @@ RENDER_NEUTRAL_BACKEND_ARGS = frozenset(
         "packed",
         "batch_size",
         "steps_scaler",
+        # Phase 4 (docs/PHASE4_CONTRACT.md AD-11), reasoned from v1.5.3:
+        # which staged images upstream optimises vs. keeps as its own val split
+        # (colmap.py:366-369); the projection of every image is unchanged.
+        "test_every",
+        # the weight of the MineGS depth term (adapter); a loss weight, not a render input.
+        "depth_lambda",
     }
 )
 

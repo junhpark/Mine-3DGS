@@ -82,15 +82,53 @@ if cfg.get("write_ply", True):
     )
 
 if cfg.get("write_cfg", True):
-    # upstream dumps vars(cfg) with the default Dumper, so strategy carries a python tag
-    (result / "cfg.yml").write_text(
-        "data_dir: /staged\\n"
-        "max_steps: %d\\n" % max_steps
-        + "normalize_world_space: %s\\n" % cfg.get("normalize", "false")
-        + "strategy: !!python/object:gsplat.strategy.default.DefaultStrategy\\n"
-        + "  absgrad: false\\n"
-        + "global_scale: 1.0\\n"
-    )
+    # upstream dumps vars(cfg) with the default Dumper (simple_trainer.py:552-554): every
+    # Config field, the parsed CLI applied, strategy as a python-tagged object
+    import yaml
+    up = {"data_dir": None, "result_dir": None, "data_factor": 4, "test_every": 8,
+          "patch_size": None, "global_scale": 1.0, "normalize_world_space": True,
+          "camera_model": "pinhole", "batch_size": 1, "steps_scaler": 1.0, "max_steps": 30000,
+          "eval_steps": [7000, 30000], "save_steps": [7000, 30000], "save_ply": False,
+          "init_type": "sfm", "sh_degree": 3, "near_plane": 0.01, "far_plane": 1e10,
+          "antialiased": False, "pose_opt": False, "pose_noise": 0.0, "app_opt": False,
+          "use_bilateral_grid": False, "depth_loss": False, "depth_lambda": 0.01,
+          "with_ut": False, "with_eval3d": False, "disable_viewer": False, "scale_reg": 0.0}
+    sub, rest = argv[0], argv[1:]
+    strat = {"absgrad": False} if sub == "default" else {"noise_lr": 5e5, "cap_max": 1000000}
+    i = 0
+    while i < len(rest):
+        key = rest[i].lstrip("-").replace("-", "_")
+        vals = []
+        i += 1
+        while i < len(rest) and not rest[i].startswith("--"):
+            vals.append(rest[i]); i += 1
+        on = not key.startswith("no_")
+        key = key if on else key[3:]
+        if key.startswith("strategy."):
+            strat[key.split(".", 1)[1]] = on if not vals else float(vals[0])
+            continue
+        old = up.get(key)
+        if not vals:
+            up[key] = on
+        elif isinstance(old, list):
+            up[key] = [int(v) for v in vals]
+        elif isinstance(old, bool):
+            up[key] = vals[0] == "True"
+        elif isinstance(old, int):
+            up[key] = int(vals[0])
+        elif isinstance(old, float):
+            up[key] = float(vals[0])
+        else:
+            up[key] = vals[0]
+    if "normalize" in cfg:
+        up["normalize_world_space"] = cfg["normalize"] == "true"
+    up.update(cfg.get("cfg_override", {}))
+    cls = type("DefaultStrategy" if sub == "default" else "MCMCStrategy", (), {})
+    cls.__module__ = "gsplat.strategy." + ("default" if sub == "default" else "mcmc")
+    st = cls()
+    st.__dict__.update(strat)
+    up["strategy"] = st
+    (result / "cfg.yml").write_text(yaml.dump(up))
 
 if cfg.get("write_renders", True):
     (result / "renders").mkdir(parents=True, exist_ok=True)
@@ -577,6 +615,8 @@ def test_a_pre_0d2_run_record_still_loads():
         "provenance": {"git_commit": "abc", "source_assets": [], "tool_versions": {}},
     }
     rec = RunRecord.from_dict(old)
-    assert rec.schema_version == "1.1"
+    # 1.0 -> 1.1 (0D.2 evidence) -> 1.2 (Phase 4 trainer evidence)
+    assert rec.schema_version == "1.2"
     # a 1.0 run recorded no evidence, and the migration does not invent any
     assert rec.final_model is None and rec.observed_final_step is None and rec.extents == {}
+    assert rec.trainer == {} and rec.depth_supervision is None and rec.trainer_config == {}

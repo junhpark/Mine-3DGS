@@ -248,7 +248,8 @@ def test_cli_heavy_profile_fails_closed(tmp_path):
         == 0
     )
     r = runner.invoke(app, ["train", "command", str(root / "dataset"), "--profile", "heavy"])
-    assert r.exit_code == 2 and "depth_loss" in r.output and "Phase 4" in r.output
+    # Phase 4: heavy needs its depth supervision artifact, and says so
+    assert r.exit_code == 2 and "DepthSupervisionRecord" in " ".join(r.output.split())
     # light still builds a command
     r = runner.invoke(app, ["train", "command", str(root / "dataset"), "--profile", "light"])
     assert r.exit_code == 0 and "--no-normalize_world_space" in r.output
@@ -278,9 +279,11 @@ def test_cli_runpod_is_not_runnable(tmp_path):
         app, ["train", "run", str(root / "dataset"), "--profile", "light", "--runner", "runpod"]
     )
     assert r.exit_code == 4 and "Phase 6" in r.output
-    # heavy must report ITS OWN reason (depth_loss), not whatever its default runner says first
+    # heavy must report ITS OWN reason (no depth supervision given), not whatever its runner
+    # says first; its default runner is local now (RunPod is Phase 6)
     r = runner.invoke(app, ["train", "run", str(root / "dataset"), "--profile", "heavy"])
-    assert r.exit_code == 2 and "depth_loss" in r.output and "Phase 4" in r.output
+    assert r.exit_code == 2 and "depth_loss" in r.output
+    assert "DepthSupervisionRecord" in " ".join(r.output.split())
 
 
 def test_cli_phase0c_pipeline(tmp_path):

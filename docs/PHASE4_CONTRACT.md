@@ -558,4 +558,63 @@ G3 = 같은 dataset/protocol 에서 baseline 대비 정량적 개선. 실제 데
 
 ## 14. 구현 기록 — `phase-4-advanced-gs`
 
-(구현하면서 채운다.)
+### 14.1 C0 감사의 독립 검증 결과
+
+7 개 주제 (정규화, depth 의미, depth 독립성, appearance, render 의미, evidence, adapter flag) 의 모든
+답을 별도 skeptic 이 인용을 다시 읽어 반박을 시도했다. **반박(refuted) 된 답은 없다.** 정정
+(corrected) 은 세부 사항이고, 이 계약의 결정을 바꾸는 것은 없었다. 기록할 정정:
+
+* `noise_lr = 5e5` 가 "정규화 frame (scene ~1) 에서 맞춘 값" 이라는 말은 코드에 있는 사실이 아니라
+  `normalize_world_space=True` 기본값에서 나온 **추론**이다. MCMC noise 가 닿는 것은 opacity ≲ 0.05 의
+  Gaussian 이다 (`ops.py:360-365`, opacity 0.005 에서 gate 0.5, 0.05 에서 약 0.011). AD-6 의 보정은
+  차원 분석으로 맞고, 실제 갱도에서의 효과는 GPU 없이 측정되지 않았다 (§13).
+* 고정된 pycolmap fork 는 **numpy ≥ 2 에서 import 자체가 실패**한다 (`np.uint64(-1)`); 그래서
+  `examples/requirements.txt` 가 `numpy<2.0.0` 을 고정한다. `docker/Dockerfile.gpu` 는 그 뒤에
+  `pip install -e .` (extra 없음) 를 하므로 numpy 1.x 가 유지된다. MineGS 의 `video`/`all` extra 는
+  같은 배포 이름의 공식 `pycolmap` 을 끌어와 fork 를 대체할 수 있다 — GPU 이미지에 그 extra 를 넣지
+  말 것 (변경하지 않고 기록).
+* upstream depth loss 에서 이미지의 track 이 **아예 없으면** KeyError, track 은 있는데 필터 후 0 개면
+  `F.l1_loss` 가 빈 텐서에서 **NaN** 이 된다. MineGS 항은 둘 다 0 기여로 처리한다 (AD-4).
+* 정수 픽셀 인덱스의 샘플이 덮이지 않은 픽셀 (ED = 0) 위에 있으면 upstream 의 `torch.where(1/d)` 는
+  `grid_sample` backward 에서 이웃 픽셀로 NaN 을 흘릴 수 있다 (CPU torch 로 재현). MineGS 항은 분모를
+  먼저 안전화하므로 NaN gradient 가 없다 (테스트).
+* ED 는 alpha 정규화 값이라 alpha 가 아주 작은 픽셀도 큰 깊이를 낸다. upstream 은 alpha 로 거르지
+  않고 MineGS 항도 거르지 않는다 (upstream 의미 유지). `d ≤ 0` 샘플은 disparity 0 으로 평균에 남아 값만
+  키우고 gradient 는 없다 — upstream 과 같다.
+* 정규화 T2 의 고유벡터 부호는 numpy/LAPACK 구현에 따라 다를 수 있다 (`np.linalg.eigh`). §8 의
+  equivalence test 는 같은 수치 스택이거나 부호에 견고해야 한다.
+* `init_type=random` 의 위험은 과장되었다: MineGS 기본 원점은 station centroid 라 random cube 가 보통
+  카메라를 덮는다. 그래도 chunk 학습이나 명시 원점에서는 아니므로 거부는 유지한다 (fail-closed).
+* `gsplat.distributed.cli` 는 `OMPI_COMM_WORLD_SIZE` 가 있으면 device 수를 무시한다. adapter 경로의
+  `MineGSRunner` 는 `world_size != 1` 을 거부한다. plain upstream 경로 (light) 에는 같은 방어가 없다 —
+  상속된 OMPI 환경을 쓰지 말 것 (기록).
+* render 해상도 차이 (§2.3-13) 를 고치려면 upstream 이 **첫 이미지 하나의** 크기 비율로 모든 카메라의
+  K 를 다시 맞추는 것 (`colmap.py:262-273`) 까지 재현해야 한다.
+
+### 14.2 C1 — depth supervision artifact
+
+`minegs/train/supervision/{support,depth,build}.py`, CLI `minegs dataset depth-supervision` /
+`depth-supervision-verify`. 계약 §4·§5 그대로. 구현 중 정한 것:
+
+* 검증기는 record 의 `max_radial_m` / `ray_margin_m` 를 쓰되 **계약보다 느슨하면 거부**한다
+  (`max_radial_m ≤ 10`, `ray_margin_m ≥ 0.5`). 그렇지 않으면 record 가 자기에게 준 관용으로 판정된다.
+* builder 는 자기가 쓴 float32 샘플을 다시 역투영해서 support 를 판정한다 — 검증기와 같은 숫자로.
+* TLS projection 의 가림 허용치 기본값은 0.15 (비스듬한 벽에서 인접 셀 깊이가 5 % 이상 다르다).
+* sfm_tracks 의 샘플 픽셀은 metric 점을 dataset camera 로 재투영한 위치, 품질 기준 (track 길이,
+  관측 keypoint 와의 재투영 오차) 위반은 confidence 0.
+
+### 14.3 C2 — adapter, staging, heavy
+
+* adapter: `minegs/train/trainers/{advanced_gs,depth_term}.py`. depth 항은 numpy 정의와 torch 구현이
+  같고 (테스트), 주입한 gradient 는 `loss + term` 의 gradient 와 **정확히** 같으며 loss 값은 바뀌지
+  않는다 (테스트, CPU torch).
+* CI 에 CPU torch 를 설치하고, `tests/fake_upstream/` (upstream 모양의 stand-in trainer + stub
+  `gsplat.distributed`) 로 **실제 adapter 코드**를 끝까지 실행한다: hook, Runner 교체, MCMC 보정
+  (stand-in 이 upstream 의 `similarity_from_cameras` 원문을 쓰고 host 는 port 를 써서 비교), depth
+  gradient, evidence. stand-in 의 rasteriser 는 toy 다 — real gsplat 학습은 수행되지 않았다.
+* staging: `sparse/0/*.bin` (고정된 pycolmap fork 로 직접 읽어 확인: 카메라·이미지·빈 2D 점·track),
+  `images_<f>/`, appearance 시 RGB clamp, `use_init_points=False` track 필터, supervision 복사.
+  staged hash 패턴에 `*.bin`, `images_*/`, `supervision/` 추가.
+* run.json schema 1.2 (1.1 → 1.2 migration 은 아무것도 지어내지 않는다).
+* light 의 argv 는 Phase 0D 와 **바이트 단위로 같다** (테스트). light run 도 이제 cfg.yml 이 없거나
+  요청과 다르면 FAILED 다 — 이것은 baseline 의 수치를 바꾸지 않고 evidence 만 강화한다.

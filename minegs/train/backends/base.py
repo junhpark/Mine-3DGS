@@ -71,6 +71,14 @@ class TrainEvidence:
     #: The trainer's own record of the configuration it ran under, when it writes one.
     #: Direct evidence, where an extent ratio is only circumstantial.
     trainer_config: dict[str, str] = field(default_factory=dict)
+    #: The same file read in full, nested strategy fields included (tags not executed), and its
+    #: digest. ``trainer_config`` above stays the flat string view older checks read.
+    trainer_config_full: dict = field(default_factory=dict)
+    trainer_config_sha256: str | None = None
+    #: What the MineGS trainer adapter reported about itself, when it ran (Phase 4 AD-5).
+    adapter_evidence: dict | None = None
+    #: Gaussian count in the final stats file, before export dropped anything non-finite.
+    stats_gaussian_count: int | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -82,6 +90,10 @@ class TrainCommand:
     # LOCAL_METRIC <- BACKEND_INTERNAL (similarity: backends normalise scene scale), known
     # *before* training. Identity when the backend is told not to normalise.
     T_local_from_internal: Sim3 = field(default_factory=Sim3.identity)
+    #: Which program trains: the upstream trainer directly, or the MineGS adapter around it.
+    trainer: dict = field(default_factory=dict)
+    #: What the trainer's own config must say afterwards (compared in verify_postconditions).
+    expected_config: dict = field(default_factory=dict)
 
 
 class TrainBackend(ABC):

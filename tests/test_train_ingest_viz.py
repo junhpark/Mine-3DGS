@@ -30,10 +30,12 @@ def test_profiles_and_capabilities():
     light, heavy = load_profile("light"), load_profile("heavy")
     be = get_backend("gsplat")
     assert be.check_profile(light) == []
-    # heavy requires depth_loss, which this adapter cannot deliver under TLS staging (Phase 4)
-    assert be.check_profile(heavy) == ["depth_loss"]
-    assert heavy.required_capabilities() == ["antialiasing", "appearance_embedding", "depth_loss"]
-    assert be.capabilities().has("depth_loss") is False
+    # Phase 4: depth_loss is MineGS depth supervision through the adapter, so heavy resolves;
+    # antialiasing is off because the depth renderer reproduces classic mode only (AD-6)
+    assert be.check_profile(heavy) == []
+    assert heavy.required_capabilities() == ["appearance_embedding", "depth_loss"]
+    assert be.capabilities().has("depth_loss") is True
+    assert be.capabilities().has("normal_loss") is False
     with pytest.raises(ContractError):
         load_profile("nope")
     with pytest.raises(NotYetImplementedError):
@@ -58,7 +60,7 @@ def test_normalize_world_space_true_is_refused(synthetic, tmp_path):
     be = get_backend("gsplat")
     prof = load_profile("light")
     prof.backend_args["normalize_world_space"] = True
-    with pytest.raises(ContractError, match="normalize_world_space=true is not enabled"):
+    with pytest.raises(ContractError, match="normalize_world_space=true is refused"):
         be.build_command(synthetic.dataset_dir, tmp_path / "out", prof, check_trainer=False)
     # false stays the supported path: no normalisation, identity transform, explicit flag
     prof.backend_args["normalize_world_space"] = False
@@ -68,18 +70,22 @@ def test_normalize_world_space_true_is_refused(synthetic, tmp_path):
 
 
 def test_depth_loss_is_refused_under_tls_staging(synthetic, tmp_path):
-    """TLS staging clears COLMAP tracks that upstream depth supervision needs (Phase 4)."""
+    """Upstream depth supervision reads the init points3D themselves; it is never emitted.
+
+    Phase 4: a depth-requesting profile needs a verified DepthSupervisionRecord instead, and
+    without one it is refused before any command exists.
+    """
     be = get_backend("gsplat")
     heavy = load_profile("heavy")
-    with pytest.raises(ContractError, match="observation tracks"):
+    with pytest.raises(ContractError, match="no verified DepthSupervisionRecord"):
         be.build_command(synthetic.dataset_dir, tmp_path / "out", heavy, check_trainer=False)
-    # the refusal explains itself wherever the capability gap is reported
-    with pytest.raises(ContractError, match=r"deferred\s+to Phase 4"):
-        be.resolve_requests(heavy)
-    # a raw backend_args override cannot smuggle the flag past the capability check
+    # the capability resolves (MineGS supervision), and its note says what it needs
+    assert be.resolve_requests(heavy)["depth_loss"] is True
+    assert "--depth-supervision" in be.capability_notes["depth_loss"]
+    # a raw backend_args override cannot smuggle upstream's flag in
     sneaky = load_profile("light")
     sneaky.backend_args["depth_loss"] = True
-    with pytest.raises(ContractError, match="observation tracks"):
+    with pytest.raises(ContractError, match="upstream depth_loss is refused"):
         be.build_command(synthetic.dataset_dir, tmp_path / "out", sneaky, check_trainer=False)
     # light (depth_loss requested as optional=false) is unaffected
     light_cmd = be.build_command(
@@ -95,13 +101,13 @@ def test_refused_options_cannot_be_smuggled_by_spelling(synthetic, tmp_path):
     for key in ("depth_loss", "depth-loss"):
         prof = load_profile("light")
         prof.backend_args[key] = True
-        with pytest.raises(ContractError, match="observation tracks"):
+        with pytest.raises(ContractError, match="upstream depth_loss is refused"):
             be.build_command(ds, out, prof, check_trainer=False)
     for key in ("normalize_world_space", "normalize-world-space"):
         prof = load_profile("light")
         prof.backend_args.pop("normalize_world_space", None)
         prof.backend_args[key] = True
-        with pytest.raises(ContractError, match="normalize_world_space=true is not enabled"):
+        with pytest.raises(ContractError, match="normalize_world_space=true is refused"):
             be.build_command(ds, out, prof, check_trainer=False)
     # two spellings of one option is itself a contract error, not a last-one-wins merge
     clash = load_profile("light")
