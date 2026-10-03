@@ -107,10 +107,36 @@ def _sections(world, run_id: str, scale: float, **cut):
     return build_section_record(pts, src, world.ds, world.m, world.cl, **{**CUT, **cut})
 
 
-def _report(gpu: bool, renderer: bool) -> dict:
+def _report(run_id: str, gpu: bool, renderer: bool, **geometry) -> dict:
+    """A Phase 2 report about `run_id` and its surface."""
     return {
-        "training": {"real_gpu_execution": gpu},
-        "reconstruction": {"real_renderer_execution": renderer},
+        "training": {"run_id": run_id, "real_gpu_execution": gpu},
+        "reconstruction": {"surface_id": f"surface_{run_id}", "real_renderer_execution": renderer},
+        "geometry": geometry,
+    }
+
+
+#: What a run's own record says when a GPU ran the pinned upstream (runner.base.real_gpu_evidence).
+def _gpu_runtime() -> dict:
+    from minegs.train.backends.gsplat import PINNED_GSPLAT, UPSTREAM_TRAINER_SHA256
+
+    return {
+        "gpu_model": "NVIDIA RTX 6000",
+        "torch_cuda_available": True,
+        "gsplat": PINNED_GSPLAT,
+        "trainer_sha256": UPSTREAM_TRAINER_SHA256,
+    }
+
+
+def _distance(median: float, p95: float) -> dict:
+    return {
+        "n": 100,
+        "mean_m": median,
+        "rmse_m": median,
+        "median_m": median,
+        "p90_m": p95,
+        "p95_m": p95,
+        "max_m": 1.0,
     }
 
 
@@ -132,19 +158,20 @@ def pair(world):
 
 def test_two_runs_on_one_dataset_are_compared_over_what_both_observed(world, pair):
     base, sb, adv, sa = pair
+    # the shape `minegs eval geometry` writes (GeometryReport), not a hand-made one
     geo_b = {
         "max_dist_m": 1.0,
         "chainage_range_m": [38.0, 46.0],
         "frame": "TLS_GLOBAL",
         "claim": "geometry_accuracy",
-        "accuracy": {"median": 0.05, "p95": 0.2},
-        "completeness": {"median": 0.06, "p95": 0.3},
+        "accuracy": _distance(0.05, 0.2),
+        "completeness": _distance(0.06, 0.3),
         "chamfer_m": 0.07,
     }
     rep = compare_runs(
         world.ds,
-        _inputs(world, base, sb, geometry=geo_b, e2e_report=_report(False, False)),
-        _inputs(world, adv, sa, geometry=None, e2e_report=_report(False, False)),
+        _inputs(world, base, sb, geometry=geo_b, e2e_report=_report("run_base", False, False)),
+        _inputs(world, adv, sa, geometry=None, e2e_report=_report("run_adv", False, False)),
         comparison_id="c1",
     )
     assert rep.requested_intervals_m == [(38.0, 46.0)]
@@ -160,6 +187,8 @@ def test_two_runs_on_one_dataset_are_compared_over_what_both_observed(world, pai
     )
     # missing stays missing: one side has no geometry report, the other no peak memory
     assert rep.baseline.metrics["geometry"]["accuracy_median_m"] == 0.05
+    assert rep.baseline.metrics["geometry"]["completeness_p95_m"] == 0.3
+    assert any("attributed to run_base by the caller" in n for n in rep.notes)
     assert rep.advanced.metrics["geometry"]["accuracy_median_m"] is None
     assert rep.differences["geometry"]["accuracy_median_m"] is None
     assert rep.advanced.metrics["memory"]["peak_gpu_memory_gb"] is None
@@ -176,17 +205,25 @@ def test_two_runs_on_one_dataset_are_compared_over_what_both_observed(world, pai
     assert any("data_factor" in n for n in rep.notes) and any("preset" in n for n in rep.notes)
 
 
-def test_real_only_when_both_sides_report_both_stages_real(world, pair):
-    base, sb, adv, sa = pair
-    real = _report(True, True)
+def test_real_only_when_both_runs_recorded_it_and_both_sides_report_it(world, pair):
+    _, sb, _, sa = pair
+    base = _run(world, "run_base_gpu", "light", runtime=_gpu_runtime())
+    adv = _run(world, "run_adv_gpu", "heavy", runtime=_gpu_runtime())
+    sb = _sections(world, "run_base_gpu", 0.97)
+    sa = _sections(world, "run_adv_gpu", 0.99)
+    rb, ra = _report("run_base_gpu", True, True), _report("run_adv_gpu", True, True)
     rep = compare_runs(
         world.ds,
-        _inputs(world, base, sb, e2e_report=real),
-        _inputs(world, adv, sa, e2e_report=real),
+        _inputs(world, base, sb, e2e_report=rb),
+        _inputs(world, adv, sa, e2e_report=ra),
         comparison_id="c",
     )
     assert rep.real_execution is True
-    for b_rep, a_rep in ((real, _report(True, False)), (real, None), (_report(False, True), real)):
+    for b_rep, a_rep in (
+        (rb, _report("run_adv_gpu", True, False)),
+        (rb, None),
+        (_report("run_base_gpu", False, True), ra),
+    ):
         rep = compare_runs(
             world.ds,
             _inputs(world, base, sb, e2e_report=b_rep),
@@ -194,6 +231,145 @@ def test_real_only_when_both_sides_report_both_stages_real(world, pair):
             comparison_id="c",
         )
         assert rep.real_execution is False
+
+
+def test_a_report_cannot_make_a_run_real_that_its_record_does_not_show(world, pair):
+    """Phase 4 C4: the flags are the run's own evidence; a report can only lower them."""
+    base, sb, adv, sa = pair  # records with no GPU and no pinned trainer recorded
+    rep = compare_runs(
+        world.ds,
+        _inputs(world, base, sb, e2e_report=_report("run_base", True, True)),
+        _inputs(world, adv, sa, e2e_report=_report("run_adv", True, True)),
+        comparison_id="c",
+    )
+    assert rep.real_execution is False
+    assert any("not counted as real" in n for n in rep.notes)
+    assert any("structural" in n for n in rep.notes)
+    # a trainer that is not the pinned upstream file is not real gsplat training either
+    other = {**_gpu_runtime(), "trainer_sha256": "0" * 64}
+    b2 = _run(world, "run_b_other", "light", runtime=other)
+    rep = compare_runs(
+        world.ds,
+        _inputs(
+            world,
+            b2,
+            _sections(world, "run_b_other", 0.97),
+            e2e_report=_report("run_b_other", True, True),
+        ),
+        _inputs(world, adv, sa, e2e_report=_report("run_adv", True, True)),
+        comparison_id="c",
+    )
+    assert rep.real_execution is False
+
+
+@pytest.mark.parametrize(
+    ("edit", "match"),
+    [
+        (lambda r: r["training"].__setitem__("run_id", "some_other_run"), "not run_base"),
+        (lambda r: r.__setitem__("dataset", {"dataset_hash": "f" * 64}), "another dataset"),
+        (lambda r: r["reconstruction"].__setitem__("surface_id", "surface_x"), "surface_x"),
+    ],
+)
+def test_an_e2e_report_about_something_else_is_refused(world, pair, edit, match):
+    base, sb, adv, sa = pair
+    r = _report("run_base", True, True)
+    edit(r)
+    with pytest.raises(ContractError, match=match):
+        compare_runs(
+            world.ds,
+            _inputs(world, base, sb, e2e_report=r),
+            _inputs(world, adv, sa),
+            comparison_id="c",
+        )
+
+
+def test_geometry_is_checked_against_the_run_s_own_report(world, pair):
+    base, sb, adv, sa = pair
+    geo = {
+        "max_dist_m": 1.0,
+        "chainage_range_m": [38.0, 46.0],
+        "accuracy": _distance(0.05, 0.2),
+        "completeness": _distance(0.06, 0.3),
+        "chamfer_m": 0.07,
+    }
+    recorded = {
+        "accuracy_median_m": 0.05,
+        "accuracy_p95_m": 0.2,
+        "completeness_median_m": 0.06,
+        "completeness_p95_m": 0.3,
+        "chamfer_m": 0.07,
+    }
+    ok = compare_runs(
+        world.ds,
+        _inputs(
+            world, base, sb, geometry=geo, e2e_report=_report("run_base", False, False, **recorded)
+        ),
+        _inputs(world, adv, sa, e2e_report=_report("run_adv", False, False, **recorded)),
+        comparison_id="c",
+    )
+    # bound by the report: no "attributed by the caller" note, and the advanced side's
+    # geometry comes from its own e2e report
+    assert not any("attributed" in n and "geometry" in n for n in ok.notes)
+    assert ok.advanced.metrics["geometry"]["chamfer_m"] == 0.07
+    with pytest.raises(ContractError, match="disagrees with the geometry"):
+        compare_runs(
+            world.ds,
+            _inputs(
+                world,
+                base,
+                sb,
+                geometry=geo,
+                e2e_report=_report("run_base", False, False, **{**recorded, "chamfer_m": 0.5}),
+            ),
+            _inputs(world, adv, sa),
+            comparison_id="c",
+        )
+    with pytest.raises(ContractError, match="not over a range of this comparison"):
+        compare_runs(
+            world.ds,
+            _inputs(world, base, sb, geometry={**geo, "chainage_range_m": [0.0, 60.0]}),
+            _inputs(world, adv, sa),
+            comparison_id="c",
+        )
+    with pytest.raises(ContractError, match="not a GeometryReport"):
+        compare_runs(
+            world.ds,
+            _inputs(world, base, sb, geometry={"accuracy": {"median": 0.05}}),
+            _inputs(world, adv, sa),
+            comparison_id="c",
+        )
+
+
+def test_render_reports_are_validated_and_marked_as_attributed(world, pair):
+    base, sb, adv, sa = pair
+    groups = list(world.m.split.test_groups)
+    ren = {"test_groups": groups, "n_images": 3, "psnr": 20.0, "ssim": 0.7}
+    rep = compare_runs(
+        world.ds,
+        _inputs(world, base, sb, render=ren),
+        _inputs(world, adv, sa, render={**ren, "psnr": 21.0}),
+        comparison_id="c",
+    )
+    assert rep.differences["render"]["psnr"] == 1.0 and rep.differences["render"]["lpips"] is None
+    assert any("RenderReport, which names no run" in n for n in rep.notes)
+    with pytest.raises(ContractError, match="test groups"):
+        compare_runs(
+            world.ds,
+            _inputs(world, base, sb, render={**ren, "test_groups": ["nope"]}),
+            _inputs(world, adv, sa, render={**ren, "test_groups": ["nope"]}),
+            comparison_id="c",
+        )
+
+
+def test_a_run_s_own_prediction_is_not_a_reference(world, pair):
+    base, sb, adv, sa = pair
+    with pytest.raises(ContractError, match="not a scanned reference"):
+        compare_runs(
+            world.ds,
+            _inputs(world, base, sb, ref=sa),
+            _inputs(world, adv, sa, ref=sa),
+            comparison_id="c",
+        )
 
 
 def test_runs_on_different_datasets_are_refused(world, pair):
@@ -351,3 +527,27 @@ def test_cli_compare_runs_writes_the_comparison(world, pair, tmp_path):
     assert r.exit_code == 0, r.output
     data = json.loads((tmp_path / "out" / "run_comparison.json").read_text())
     assert data["g3_status"] == "PENDING" and data["baseline"]["run_id"] == "run_base"
+
+
+def test_depth_from_the_init_s_own_source_is_said_so(world, pair):
+    """Phase 4 C4: separate artifacts are not independent information (AD-1)."""
+    base, sb, _, _ = pair
+    rel = {"shared_source": "tls_survey", "fraction_of_samples_at_init_points": 0.5}
+    adv = _run(
+        world,
+        "run_adv_dsup",
+        "heavy",
+        depth_supervision={
+            "supervision_id": "d",
+            "artifact_sha256": "a" * 64,
+            "init_relation": rel,
+        },
+    )
+    rep = compare_runs(
+        world.ds,
+        _inputs(world, base, sb),
+        _inputs(world, adv, _sections(world, "run_adv_dsup", 0.99)),
+        comparison_id="c",
+    )
+    assert rep.advanced.configuration["depth_supervision"]["init_relation"] == rel
+    assert any("same tls_survey as its initialisation; 50%" in n for n in rep.notes)

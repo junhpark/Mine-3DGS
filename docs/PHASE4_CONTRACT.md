@@ -243,13 +243,22 @@ eval 의 `cc_psnr/cc_ssim/cc_lpips` 는 GT 에 affine 색 보정을 맞춘 뒤 �
 
 `DepthSupervisionRecord` (schema `1.0`) + `samples.npy`. 위치는 기본
 `<dataset>/supervision/depth/<supervision_id>/`. init geometry (`init_points.ply`, staged `points3D`)
-와 **파일도, 해시도, provenance 도 따로**다. 가짜 COLMAP track 을 init 점에 붙이지 않는다.
+와 **artifact 로서 따로**다 (파일, 해시, dataset binding). 가짜 COLMAP track 을 init 점에 붙이지 않는다.
 
 * init 을 바꿔도 depth artifact 의 바이트는 바뀌지 않고 여전히 검증을 통과한다 (dataset binding 이
   init 을 포함하지 않는다).
 * depth artifact 를 바꿔도 staged init 은 바뀌지 않는다.
 * supervision 바이트가 바뀌면 **학습 identity 가 바뀐다**: run.json 의 `depth_supervision`
   (artifact sha256, samples sha256) 과 staged tree hash 에 들어간다.
+* **init 이 depth 증거를 사칭할 수 없다** (C4): source asset 의 바이트가 dataset 의 init 파일과 같으면
+  builder 도 검증기도 거부한다.
+* **분리된 artifact 는 독립 정보가 아니다** (C4, 적대적 검토 S2 에서 정정): 두 source 모두 init 이
+  뽑힌 같은 측량에서 나온다. `sfm_tracks` 는 image-only dataset 의 init 이 voxel 샘플링된 바로 그
+  SfM 점을 재투영하고 (synthetic 에서 in-loss 샘플의 99 % 가 init 점 위), `tls_projection` 은 TLS
+  dataset 의 init 이 샘플링된 TLS 구름을 투영한다 (synthetic 에서 50 %). upstream 대비 MineGS 가
+  더하는 것은 독립 증거가 아니라 **leakage·품질 필터와 명시적 artifact** 다. 검증기는 이 관계를
+  선언이 아닌 측정으로 `init_relation` (`shared_source`, `fraction_of_samples_at_init_points`) 에
+  남기고, run.json 과 비교 artifact 가 그대로 싣는다.
 
 ### AD-2 — depth semantics
 
@@ -268,23 +277,34 @@ pinhole (`PINHOLE`, `SIMPLE_PINHOLE`) 카메라만 받는다 — renderer 와 �
 holdout 의 깊이는 학습에 도달하지 않는다. 판정은 실제 support 로 한다:
 
 1. **점 규칙**: 샘플의 3D 점 (LOCAL_METRIC) 의 chainage 가 holdout 범위 안이면 제외.
-2. **ray 규칙**: 카메라 중심 → 점 선분이 holdout 을 지나면 제외. 판정은
-   `[min(s_cam, s_pt) − margin, max(s_cam, s_pt) + margin]` 이 holdout 범위와 겹치는지로 한다
-   (`margin` 기록, 기본 0.5 m). 직선 centerline 에서는 선분 위 chainage 가 단조이므로 정확하고,
-   굽은 centerline 에서는 margin 이 덮는 근사다 (§14 에 기록). 이 규칙 때문에 builder 는 holdout
-   점을 아예 읽지 않아도 된다 — holdout 을 지나는 ray 는 남지 않으므로 빠진 holdout 기하가 남은
-   샘플을 틀리게 만들 수 없다.
+2. **ray 규칙**: 카메라 중심 → 점 선분이 holdout 을 지나면 제외. 두 판정 중 하나라도 걸리면 제외한다.
+   (a) 구간 판정: `[min(s_cam, s_pt) − margin, max(s_cam, s_pt) + margin]` 이 holdout 범위와 겹침
+   (`margin` 기록, 기본 0.5 m). 직선 centerline 에서는 선분 위 chainage 가 단조이므로 이것만으로
+   정확하다. (b) **표본 판정** (C4, 적대적 검토 S1 에서 추가): 굽은 centerline 에서는 bend 안쪽에서
+   chainage 가 이등분선을 넘으며 뛰므로, 양 끝이 holdout 밖이어도 선분이 holdout 을 지날 수 있다
+   (90° bend 에서 0.7–4 m 침투를 재현). 그래서 holdout 근처에 올 수 있는 모든 선분을 0.1 m 간격으로
+   위치시켜, 한 점이라도 위치 불명이거나 holdout ± margin 안이면 제외한다. 이것이 놓칠 수 있는 것은
+   0.1 m 보다 짧은 holdout 통과뿐이고, 그것은 chainage 불연속 (bend 의 이등분선) 에서만 생긴다.
+   (이전 문안의 "굽은 경우 margin 이 덮는다" 는 틀렸다.) 이 규칙 때문에 builder 는 holdout 점을 아예
+   읽지 않아도 된다 — holdout 을 지나는 ray 는 남지 않으므로 빠진 holdout 기하가 남은 샘플을 틀리게
+   만들 수 없다.
 3. **이미지 규칙**: 샘플은 manifest 의 `train_images()` 에만 달릴 수 있다. test group 이미지, holdout
    때문에 빠진 이미지, dataset 에 없는 이미지는 거부.
 4. **track 규칙 (sfm_tracks)**: track 에 train 이 아닌 이미지가 하나라도 있으면 그 점 전체를 제외한다
    — 그 깊이는 held-out 이미지의 관측으로 삼각측량된 값이기 때문이다.
-5. **support 를 모르면 fail closed**: holdout 이 선언되었는데 centerline 이 없으면 build 를 거부한다.
+5. **support 를 모르면 fail closed**: holdout 이 선언되었는데 centerline 이 없거나, holdout 이
+   centerline 범위 밖으로 나가면 (C4) build 와 검증을 거부한다.
    centerline 끝 밖이거나 반경 `max_radial_m` (기록, 기본 10 m) 보다 먼 점·카메라는 "위치를 알 수
    없음" 이다. builder 는 그런 샘플을 내보내지 않고 (개수 기록), **검증기는 그런 샘플이 하나라도 있는
    artifact 를 거부**한다. 경고가 아니다.
 6. 검증은 **재도출**이다: 저장된 (image, u, v, depth) 를 dataset camera 로 역투영해 3D 점과 카메라
    중심을 다시 계산하고 1–5 를 다시 판정한다. record 의 선언 (`excluded_holdout_ranges_m`, 개수) 을
-   믿지 않는다.
+   믿지 않는다. 4 (track 규칙) 도 검증기가 다시 판정한다 (C4): `sfm_tracks` 샘플은 역투영한 점이
+   dataset 의 SfM 모델 (registration 으로 metric 화) 의 한 점과 1 mm 안에서 일치하고, 그 점의 track 이
+   샘플의 이미지를 포함하며 track 의 모든 view 가 train 이미지여야 한다. source asset 은 역할별로
+   요구되고 (`sfm_tracks`: sfm_model 파일 전부 + registration, `tls_projection`: tls_cloud 하나),
+   dataset 안의 것 (`sfm_tracks`) 은 다시 해시해 대조한다. 검증은 각 파일을 **한 번** 읽어 그
+   바이트로 모든 판정을 하고, 돌려주는 identity 도 그 바이트의 해시다 (C4, TOCTOU 제거).
 7. **TLS depth 는 image-only dataset 에 붙일 수 없다** (`source ∈ {video, video360}` 이면 거부) —
    그 순간 image-only 경로가 TLS-assisted 가 된다 (Phase 3 독립성).
 
@@ -295,9 +315,14 @@ holdout 이 없는 dataset 에서는 1·2·5 가 할 일이 없다. centerline �
 
 * `binary_mask`: 값은 정확히 0 또는 1. 0 인 샘플은 artifact 에 남지만 (감사용, 이유별 개수)
   loss 에 들어가지 않는다.
-* `unit_interval_weight`: [0, 1] 의 유한값. loss 가 그대로 가중한다.
-* 그 밖의 값 (NaN, 음수, >1, binary 인데 0.5) → artifact 거부.
-* loss: `Σ w·|ρ(ED) − 1/z| / Σ w` (이미지별), `Σ w = 0` 인 이미지는 depth 항 0 (NaN 아님).
+* `unit_interval_weight`: `{0} ∪ [1e-6, 1]` 의 유한값. loss 가 그대로 가중한다.
+* 그 밖의 값 (NaN, 음수, >1, binary 인데 0.5, 0 < w < 1e-6) → artifact 거부. depth 는 trainer 의
+  near plane 0.01 m 이상이어야 한다 (C4).
+* loss: `Σ_{w>0} w·|ρ(ED) − 1/z| / N` (이미지별, `N` = w > 0 인 샘플 수). **가중치는 절대값이다**
+  (C4, 적대적 검토 S4 에서 정정: 이전의 `/ Σ w` 는 이미지 안의 상대 가중일 뿐이어서 모든 샘플이
+  w = 0.001 인 이미지도 w = 1 인 이미지와 같은 무게였고, `Σ w` 가 float32 에서 underflow 하면 NaN
+  gradient 를 냈다). w = 0 은 샘플이 아니므로 `N` 에서 빠진다. w > 0 샘플이 없는 이미지는 depth 항 0
+  (NaN 아님). binary_mask 에서는 두 정의가 같다.
 * Phase 4 의 두 builder 는 **`binary_mask` 만** 낸다. 연속 신뢰도를 보정할 데이터가 없으므로 연속
   가중치를 지어내지 않는다. 형식과 loss 는 `unit_interval_weight` 를 소비할 수 있다 (향후 sensor).
 
@@ -318,10 +343,17 @@ upstream 은 별도 depth 증거를 먹을 수 없다 (Q6) — 그래서 얇은 
   (`minegs_trainer.json`) 가 증거다.
 * adapter 가 소유하는 것: supervision 로딩·검증, 좌표 변환 (factor, half-pixel), 가중 loss,
   NaN-safe 역수, evidence 기록. 그 밖은 upstream.
-* depth 항: `λ · scene_scale · mean_images[ Σ w|ρ(ED(û)) − 1/z| / Σ w ]`, `λ = cfg.depth_lambda`
-  (upstream 필드를 그대로 쓰므로 cfg.yml 에 남는다), `scene_scale` 은 upstream Runner 의 값,
-  `û = u/f − 0.5` (half-pixel 보정, `align_corners=True` 인덱스), 샘플은 `û ∈ [0, W_f−1]` 만 (zero
-  padding 없음), `ρ(x) = 1/x (x > ε)`, 아니면 0 — gradient 가 NaN 이 되지 않게 분모를 먼저 안전화.
+* depth 항: `λ · scene_scale · mean_images[ Σ_{w>0} w|ρ(ED(û)) − 1/z| / N ]` (AD-4),
+  `λ = cfg.depth_lambda` (upstream 필드를 그대로 쓰므로 cfg.yml 에 남는다), `scene_scale` 은 upstream
+  Runner 의 값, `û = u · (fx_train / fx_full) − 0.5`, `v̂ = v · (fy_train / fy_full) − 0.5` (trainer 자신의
+  K 비율 — `data_factor` 와 upstream 의 첫 이미지 rescale `colmap.py:107, 262-273` 을 모두 포함 — 와
+  half-pixel 보정, `align_corners=True` 인덱스; C4 에서 문안을 코드와 맞춤, 이전 `u/f − 0.5` 는
+  rescale 을 빠뜨렸다), 샘플은 `û ∈ [0, W−1]` 만 (zero padding 없음), `ρ(x) = 1/x (x > 0)`, 아니면 0
+  — gradient 가 NaN 이 되지 않게 분모를 먼저 안전화.
+* (C4) 학습 렌더의 실제 크기가 샘플을 걸러 낸 parser 크기와 다르면 adapter 가 거부한다. staging 은
+  카메라 크기와 다른 이미지, `data_factor` 로 나누어떨어지지 않는 카메라 크기를 거부한다 — upstream
+  은 모든 카메라의 K 를 첫 이미지의 비율로 rescale 하므로, 그 둘이 아니면 학습 K 가 이미지의 K 가
+  아니다. adapter 는 값 검사 (유한, 범위, binary, depth 하한) 를 host 와 별도로 다시 한다.
 
 ### AD-6 — heavy profile
 
@@ -365,8 +397,15 @@ strategy·data_factor·max_steps·sh_degree·test_every·init_type·normalize �
 adapter evidence 의 supervision sha256 ≠ run 이 기록한 값 / adapter sha256 ≠ 이 MineGS 의 adapter
 (이미지 안 MineGS 와 host MineGS 의 version skew) / MCMC 보정값 불일치 / 마지막 stats `num_GS` ≠ PLY
 vertex 수 / container 가 보고한 gsplat 버전 ≠ pin.
-"real" 은 선언으로 바뀌지 않는다: real GPU 여부는 기존처럼 run 의 runtime evidence 와 seam 대체
-여부로만 정해진다.
+C4 에서 추가: 마지막 stats 의 `num_GS` 를 읽을 수 없음 / adapter evidence 의 depth 기록이 불가능한
+조합 (최적화하지 않은 이미지의 샘플, 이미지 안 샘플 0, 학습 렌더 수보다 많은 depth 적용 단계, run 이
+기록하지 않은 depth) / cfg.yml 의 중복 키 / adapter 가 실행한 upstream trainer 해시 ≠ runner 가 기록한
+해시 / `steps_scaler` (기록과 다른 단계 수를 학습시킨다) 는 build 단계에서 거부.
+"real" 은 선언으로 바뀌지 않는다 (C4 에서 강화): real GPU 여부는 run 자신의 runtime evidence 로만
+정해진다 — GPU 가 있었고 **고정된 upstream** 이 학습했다는 것, 즉 runtime 의 `gsplat == 1.5.3` 이고
+`trainer_sha256` 이 v1.5.3 `simple_trainer.py` 의 해시 (`79319e1c…62c05`) 와 같아야 한다 (native 는
+host 가, docker 는 이미지 안에서 해시). 그 밖의 trainer (fake upstream 포함) 는 SUCCEEDED 일 수는
+있어도 real 이 아니다 (`runner.base.real_gpu_evidence`, e2e 와 비교가 같은 규칙).
 
 ### AD-9 — `normalize_world_space`: 거부 유지 (§8)
 
@@ -389,6 +428,17 @@ Phase 1 render gate 를 우회하지 않는다. `RENDER_NEUTRAL_BACKEND_ARGS` �
 section/volume/coverage/runtime/peak memory) 을 재사용한다. 없는 값은 `null` (0 아님). loss 감소를
 개선으로 읽지 않는다 — 비교는 training loss 를 아예 읽지 않는다. verdict 를 내리지 않고 차이만,
 `G3: PENDING`.
+
+입력은 자기 run 에 묶여야 한다 (C4, 적대적 검토 S7/S8 에서 추가):
+* e2e report 는 그 run (`training.run_id`), 그 dataset (`dataset_hash`), 그 surface
+  (`reconstruction.surface_id` = 예측 section 의 surface) 에 관한 것이어야 하고, 아니면 거부.
+  real 여부는 run 자신의 record (`real_gpu_evidence`) 가 정하고 report 는 낮출 수만 있다.
+* geometry 입력은 `GeometryReport` 로 검증하고 (`median_m`/`p95_m` 를 읽는다 — 이전에 `median` 을 읽어
+  실제 report 의 값이 null 이 되던 결함 수정), 측정 범위가 비교 범위 중 하나여야 한다. run 의 e2e
+  report 에 geometry 가 있으면 그것과 일치해야 하고, 없으면 "caller 가 귀속시킨 값, 검증 안 됨" 이라고
+  note 에 남는다. render 입력은 `RenderReport` 로 검증하고 test group 이 dataset 의 것과 같아야 하며,
+  run identity 가 없으므로 항상 같은 note 가 붙는다.
+* reference section 은 스캔 구름 (`raw_cloud`) 이어야 하고 어느 쪽 예측의 점과도 같으면 안 된다.
 
 ---
 
@@ -481,7 +531,16 @@ depth 를 요청하지 않고 strategy 가 `default` 인 profile (light) 은 지
 | confidence 값이 semantics 와 맞지 않음 | `ContractError` |
 | dataset 에 없는 이미지 / train 이 아닌 이미지 | `ContractError` |
 | holdout 안의 점 / holdout 을 지나는 ray / 위치 불명 support | `ContractError` |
-| holdout 이 있는데 centerline 없음 | `ContractError` |
+| holdout 이 있는데 centerline 없음 / holdout 이 centerline 범위 밖 | `ContractError` |
+| `sfm_tracks` 샘플이 선언된 SfM 모델의 track 점이 아니거나 그 track 이 held-out view 를 포함 | `ContractError` (검증기 재도출) |
+| source asset 역할 누락·미지의 역할 / dataset 안 source asset 의 바이트가 기록과 다름 | `ContractError` |
+| source asset 이 dataset 의 init 파일 (init 이 깊이 증거를 사칭) | `ContractError` (builder, 검증기) |
+| artifact 에 record 가 이름 붙이지 않은 파일 | `ContractError` |
+| 0 < weight < 1e-6 / depth < 0.01 m (near plane) | `ContractError` (host 검증기, adapter 둘 다) |
+| 카메라 크기와 다른 이미지 / `data_factor` 가 카메라 크기를 나누지 못함 | `ContractError` (staging) |
+| 학습 렌더 크기 ≠ 샘플을 거른 parser 크기 | `AdapterError` (run FAILED) |
+| `backend_args.steps_scaler` | `ContractError` |
+| `--config` 의 runner ≠ 실행될 runner | `ContractError` |
 | `sensor_depth` source | `ContractError` |
 | image-only dataset 에 `tls_projection` | `ContractError` |
 | upstream `--depth_loss` (어떤 profile 이든) | `ContractError` (영구) |
@@ -647,3 +706,49 @@ G3 = 같은 dataset/protocol 에서 baseline 대비 정량적 개선. 실제 데
 * 주석으로 남기는 것: data_factor 가 다르면 renderer 해상도 차이 (§2.3-13), strategy 가 다르면 mcmc
   preset 전체 (init_opa/init_scale/opacity_reg/scale_reg) 가 차이에 섞임, appearance run 의 render
   지표는 zero-embedding 정책을 포함함, 명시 범위면 diagnostic.
+* (C4 에서 바뀜) "real" 은 보고서가 아니라 run 자신의 record 가 정한다. 위 둘째 항목의 규칙은 C4 의
+  AD-12 문단이 대체한다.
+
+### 14.5 C4 — 한 번의 적대적 검토와 그 결과
+
+지시서 §22 대로 한 번, 8 개 진술 (S1 leakage, S2 init 분리, S3 깊이 의미, S4 confidence, S5 heavy
+실행 가능, S6 baseline 불변, S7 evidence, S8 claim·fail-closed) 각각을 반증하려는 검토자 8 명을 C3
+HEAD (+ 커밋 전 C4 문서) 에 대해 돌렸다. 7 개가 반증되었고 S6 만 유지되었다. 모든 지적은 검토자의
+재현 스크립트로 직접 다시 확인한 뒤 고쳤고, 고친 뒤 같은 스크립트로 거부를 확인했다.
+
+| 진술 | 지적 (심각도) | 조치 |
+|---|---|---|
+| S1 | bend 에서 holdout 을 지나는 ray 를 구간 규칙이 놓침 (BLOCKING) | 표본 ray 규칙 (AD-3 2b) |
+| S1 | track 규칙이 builder 에만 있음 | 검증기가 SfM 모델로 재도출 (AD-3 6) |
+| S1 | 검증 후 identity 해시를 디스크에서 다시 계산 (TOCTOU) | 한 번 읽은 바이트로 판정·해시 |
+| S1 | centerline 끝 밖 holdout (NIT) | 거부 |
+| S2 | image-only 에서 depth 증거 = init 이 나온 SfM 점 (BLOCKING 으로 보고) | 정정·공개: 지시서 §7 이 `sfm_tracks` 를 image dataset 의 source 로 지정하므로 거부하지 않는다. 대신 artifact 분리일 뿐 독립 정보가 아님을 AD-1 에 쓰고 `init_relation` 으로 측정해 run·비교에 싣는다 |
+| S2 | init 파일 자체를 TLS 구름으로 넣으면 검증·학습 통과 (BLOCKING) | builder·검증기가 init 바이트를 거부 |
+| S2 | source asset 미검증 | 역할 요구, dataset 안 asset 재해시 |
+| S3 | parser imsize ≠ 렌더 크기면 zero padding 이 섞임 | 렌더 크기 검사 + staging 크기 검사 |
+| S3 | 계약 문안 `u/f − 0.5` (NIT) | 코드와 같은 K 비율로 정정 |
+| S4 | denormal weight 에서 NaN gradient | weight 하한, `Σw` 로 나누지 않음 |
+| S4 | 이미지별 정규화가 절대 confidence 를 버림 | `/ N` 으로 정의 변경 (AD-4) |
+| S4 | adapter 가 값 검사를 host 에 의존 (NIT), 아주 작은 depth (NIT) | adapter 재검사, near-plane 하한 |
+| S5 | docker 경로에 host 의 `MINEGS_GSPLAT_TRAINER` 경로가 들어감 | 이미지 경로 고정 |
+| S5 | 이미지 크기 ≠ 카메라 크기를 staging 이 받아들임 | 거부 |
+| S5 | `--config` 의 runner 무시 (NIT) | 거부 |
+| S6 | run.json 이 schema "1.0" 으로 기록됨 (NIT) | 현재 schema 로 기록 |
+| S7 | 비교의 real 이 다른 run 의 보고서로 참이 됨 (BLOCKING) | 보고서를 run 에 묶고 real 은 record 가 정함 |
+| S7 | upstream trainer 신원 미검사, native 에서 gsplat 버전 미기록 | trainer 해시·gsplat 버전 기록, real 의 조건 |
+| S7 | stats 를 못 읽으면 export 검사 생략 | FAILED |
+| S7 | steps_scaler, depth evidence 일관성, cfg.yml 중복 키 (NIT) | 거부 |
+| S8 | (S7 BLOCKING 과 같음) | 위와 같음 |
+| S8 | geometry 키 오독 (`median` vs `median_m`) 으로 실제 값이 null | `GeometryReport` 로 검증, 올바른 키 |
+| S8 | geometry/render 보고서가 run 에 묶이지 않음 | e2e geometry 와 대조, 범위·test group 검사, 묶을 수 없는 것은 note |
+| S8 | run 자신의 예측을 기준으로 쓰면 오차 0 | 기준은 `raw_cloud`, 예측과 같으면 거부 |
+| S8 | 다른 경로의 normalize 거부 문구 (NIT) | §8 을 가리키도록 통일 |
+
+남은 것 (Deferred, 이 PR 에서 닫지 않음):
+* `RenderReport`·`GeometryReport` 에 run identity 가 없다. 비교는 이를 "caller 가 귀속" 으로 표시만
+  한다. 보고서에 provenance 를 넣는 것은 Phase 1/3 산출물 schema 변경이라 별도 작업.
+* 갈고리 모양 centerline 끝 너머의 점이 "위치 있음" 으로 판정될 수 있다. holdout 이 축 범위 안에
+  있어야 한다는 규칙으로 누출은 막았지만 locate 자체는 그대로다.
+* `tls_cloud` 는 dataset 밖의 materialised 증거라 검증 시 재해시하지 않는다 (해시는 record 에
+  기록되고 artifact identity 에 포함되며, init 바이트와의 동일성은 검사한다).
+* 표본 ray 규칙은 0.1 m 보다 짧은 holdout 통과 (bend 이등분선) 를 볼 수 없다.

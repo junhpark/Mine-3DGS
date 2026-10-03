@@ -12,8 +12,9 @@ import subprocess
 from pathlib import Path
 
 from minegs.core.errors import ContractError, NoGpuError
-from minegs.core.provenance import sha256_tree
+from minegs.core.provenance import sha256_file, sha256_tree
 from minegs.train.backends import get_backend
+from minegs.train.backends.gsplat import TRAINER_IMAGE_PATH
 from minegs.train.runner.base import (
     RunConfig,
     RunHandle,
@@ -183,7 +184,10 @@ class LocalRunner(Runner):
                 Path("/data/run/staged"),
                 Path("/data/run/backend_out"),
                 profile,
-                check_trainer=False,  # the trainer lives inside the image
+                # The trainer lives inside the image, at the image's path: a host override
+                # (MINEGS_GSPLAT_TRAINER, for --native) names a file the container does not have.
+                trainer=Path(TRAINER_IMAGE_PATH),
+                check_trainer=False,
                 depth_supervision_dir=None
                 if staged_supervision is None
                 else Path("/data/run/staged") / staged_supervision.relative_to(staged.path),
@@ -225,6 +229,13 @@ class LocalRunner(Runner):
                 self.config.image, device, cmd.trainer.get("upstream_trainer", cmd.argv[1])
             )
         )
+        if self.config.native:
+            # The file that will train, hashed where it lives; the image hashes its own.
+            script = Path(str(cmd.trainer.get("upstream_trainer") or ""))
+            record.runtime = {
+                **record.runtime,
+                "trainer_sha256": sha256_file(script) if script.is_file() else None,
+            }
         record.started_at = _now()
         record.status = RunStatus.RUNNING
         self.write_record(record, run_dir)

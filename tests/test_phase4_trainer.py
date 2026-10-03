@@ -493,6 +493,8 @@ def _record_and_evidence(scene, tmp_path, **cfg_over):
         },
         "depth_supervision": {
             "artifact_sha256": scene.supervision.artifact_sha256,
+            "training_calls": 10,
+            "n_samples_in_domain": 50,
             "steps_with_depth_term": 10,
             "images_with_samples": ["a"],
             "images_without_samples": [],
@@ -552,6 +554,23 @@ def test_matching_evidence_passes_and_is_recorded(scene, tmp_path):
         (lambda r, e: e.trainer_config_full["strategy"].update(noise_lr=5e5), "strategy.noise_lr"),
         (lambda r, e: setattr(e, "stats_gaussian_count", 101), "diverged"),
         (lambda r, e: r.runtime.update(gsplat="1.5.2"), "pinned 1.5.3"),
+        # Phase 4 C4: evidence that cannot have happened, or cannot be read
+        (lambda r, e: setattr(e, "stats_gaussian_count", None), "cannot be read"),
+        (
+            lambda r, e: e.adapter_evidence["depth_supervision"].update(
+                images_with_samples=["zzz"]
+            ),
+            "did not optimise",
+        ),
+        (
+            lambda r, e: e.adapter_evidence["depth_supervision"].update(n_samples_in_domain=0),
+            "no depth sample inside",
+        ),
+        (
+            lambda r, e: e.adapter_evidence["depth_supervision"].update(steps_with_depth_term=11),
+            "cannot have happened",
+        ),
+        (lambda r, e: setattr(r, "depth_supervision", None), "recorded none"),
     ],
 )
 def test_evidence_that_does_not_match_the_request_is_refused(scene, tmp_path, mutate, match):
@@ -625,3 +644,102 @@ def test_heavy_runs_pass_the_phase1_render_gate_and_antialiased_ones_do_not(tmp_
     aa.requests["antialiasing"] = True
     with pytest.raises(ContractError, match="antialiased"):
         require_reproducible_render(record(aa), tmp_path)
+
+
+# ================================================================ C4: hostile review findings
+
+
+def test_staging_refuses_an_image_that_is_not_its_cameras_size(scene, tmp_path):
+    """Upstream rescales K by the first image's size ratio, so a mismatch trains on bent K."""
+    from PIL import Image
+
+    ds = tmp_path / "ds"
+    shutil.copytree(scene.dataset_dir, ds)
+    name = sorted((ds / "images").iterdir())[0]
+    with Image.open(name) as im:
+        big = im.resize((im.size[0] * 2, im.size[1]))
+    big.save(name)
+    with pytest.raises(ContractError, match="do not match the intrinsics"):
+        stage_dataset(ds, tmp_path / "s")
+
+
+def test_staging_refuses_a_factor_that_does_not_divide_the_camera(scene, tmp_path):
+    cams = colmap_io.read_model(scene.dataset_dir / "sparse" / "0").cameras.values()
+    factor = next(f for f in range(3, 50) if any(c.width % f or c.height % f for c in cams))
+    with pytest.raises(ContractError, match=f"data_factor {factor} does not divide"):
+        stage_dataset(scene.dataset_dir, tmp_path / "s", data_factor=factor)
+
+
+def _sealed(scene, tmp_path, edit, semantics=None):
+    """A copy of the verified artifact, edited, with its own record made consistent again."""
+    import json
+
+    from minegs.core.provenance import sha256_file
+
+    art = tmp_path / "art"
+    shutil.copytree(scene.supervision.path, art)
+    s = np.load(art / "samples.npy")
+    edit(s)
+    np.save(art / "samples.npy", s, allow_pickle=False)
+    rec = json.loads((art / "depth_supervision.json").read_text())
+    rec["samples_sha256"] = sha256_file(art / "samples.npy")
+    if semantics:
+        rec["confidence_semantics"] = semantics
+    (art / "depth_supervision.json").write_text(json.dumps(rec))
+    return art, sha256_tree(art)
+
+
+@pytest.mark.parametrize(
+    ("edit", "semantics", "match"),
+    [
+        (lambda s: s["confidence"].__setitem__(0, np.inf), None, "non-finite confidence"),
+        (lambda s: s["confidence"].__setitem__(0, 0.5), None, "neither 0 nor 1"),
+        (lambda s: s["confidence"].__setitem__(0, 1e-9), "unit_interval_weight", "outside"),
+        (lambda s: s["confidence"].__setitem__(0, 7.0), "unit_interval_weight", "outside"),
+        (lambda s: s["depth_m"].__setitem__(0, 1e-40), None, "closer than"),
+    ],
+)
+def test_the_adapter_refuses_values_on_its_own(scene, tmp_path, edit, semantics, match):
+    """The host verifies first, but the adapter does not lean on that for finiteness."""
+    from minegs.train.trainers.advanced_gs import AdapterError, load_supervision
+
+    art, sha = _sealed(scene, tmp_path, edit, semantics)
+    with pytest.raises(AdapterError, match=match):
+        load_supervision(art, sha)
+
+
+def test_a_runner_config_for_another_runner_is_refused(scene, tmp_path):
+    from minegs.cli.main import app
+    from typer.testing import CliRunner
+
+    res = CliRunner().invoke(
+        app,
+        [
+            "train",
+            "run",
+            str(scene.dataset_dir),
+            "--profile",
+            "heavy",
+            "--depth-supervision",
+            str(scene.supervision.path),
+            "--config",
+            str(Path(__file__).resolve().parents[1] / "configs" / "runner" / "runpod.yaml"),
+        ],
+    )
+    assert res.exit_code != 0
+    assert "names runner 'runpod'" in res.output
+
+
+def test_a_cfg_yml_stating_a_key_twice_is_refused(tmp_path):
+    """yaml.dump never writes a key twice; "last one wins" would let either value stand."""
+    path = _cfg_yml(tmp_path / "cfg.yml")
+    path.write_text(path.read_text() + "normalize_world_space: true\n")
+    with pytest.raises(ContractError, match="duplicate key"):
+        read_trainer_config(path)
+
+
+def test_steps_scaler_is_refused():
+    prof = load_profile("light")
+    prof.backend_args = {**prof.backend_args, "steps_scaler": 3.0}
+    with pytest.raises(ContractError, match="steps_scaler"):
+        get_backend("gsplat").build_command(Path("/d"), Path("/o"), prof, trainer=Path("/t.py"))

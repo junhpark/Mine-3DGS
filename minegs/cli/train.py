@@ -136,6 +136,11 @@ def run(
         get_backend(backend or prof.backend).resolve_requests(prof)
         rname = runner or prof.default_runner
         rcfg = RunnerConfig.load(config) if config else RunnerConfig(runner=rname, native=native)
+        if rcfg.runner != rname:
+            raise ContractError(
+                f"--config names runner {rcfg.runner!r}, but this run would go to {rname!r}; "
+                f"pass --runner {rcfg.runner} to use that config, or a config for {rname}"
+            )
         if native:
             rcfg.native = True
         r = get_runner(rname, rcfg)

@@ -812,7 +812,8 @@ leakage·dataset·gate·비교의 거부를 고정한다.
 | 항목 | 상태 |
 |---|---|
 | depth supervision 재설계 (`DepthSupervisionRecord`, `sfm_tracks` / `tls_projection`) | **implemented + structurally tested** |
-| holdout leakage (점·ray·held-out 이미지·held-out track, 위치 불명 support fail-closed) | **implemented + structurally tested** (고의 오염 negative test, mutation check) |
+| holdout leakage (점·ray (bend 에서도 표본 판정)·held-out 이미지·held-out track (검증기 재도출), 위치 불명 support fail-closed) | **implemented + structurally tested** (고의 오염 negative test, mutation check) |
+| init ↔ depth 분리 (artifact 분리, init 파일 사칭 거부, 공유 출처를 `init_relation` 으로 측정·공개) | **implemented + structurally tested** — 두 source 모두 init 과 같은 측량에서 나오므로 **독립 정보는 아니다** |
 | MineGS trainer adapter (upstream loop 그대로, depth 항 gradient 주입, MCMC metric 보정) | **implemented + structurally tested** — CI 에서 CPU torch 로 stand-in upstream 을 끝까지 실행 |
 | heavy profile + ablation (`heavy-base`/`-appearance`/`-depth`) | **implemented + structurally runnable** (local runner) |
 | appearance embedding | **implemented** (capability → `--app_opt`, cfg.yml 로 대조, init 색 clamp) |
@@ -825,6 +826,12 @@ leakage·dataset·gate·비교의 거부를 고정한다.
 C0 감사가 드러낸 **Phase 0D 부터의 결함**도 여기서 고쳤다 (실제 GPU 실행이 없어 숨어 있었다):
 고정된 pycolmap fork 는 MineGS 가 쓰던 COLMAP text 모델을 Python 3 에서 읽지 못한다 → staging 이
 binary 모델을 함께 쓴다. `data_factor > 1` 은 `images_<factor>/` 가 필요하다 → staging 이 만든다.
+
+C4 의 한 번의 적대적 검토 (8 개 진술, 계약 §14.5) 는 7 개를 반증했고, 지적은 모두 재현 후 고쳤다:
+bend 에서 holdout 을 지나는 ray, 검증기의 track 규칙·source asset 미검증, init 파일의 깊이 증거 사칭,
+검증 identity 의 TOCTOU, 렌더 크기 ≠ parser 크기, denormal weight 의 NaN 과 상대적일 뿐인 confidence,
+docker 경로의 host trainer 경로, 다른 run 의 보고서로 "real" 이 되던 비교, geometry 키 오독, 자기
+예측을 기준으로 쓰는 비교, 고정되지 않은 upstream trainer 가 real 로 보고될 수 있던 것.
 
 계속 거부되는 것: upstream `depth_loss` (target 이 init 점 자체), `normalize_world_space=true`
 (계약 §8 의 7 조건 미충족), `normal_loss` (v1.5.3 3DGS trainer 에 없음), `--runner runpod` (Phase 6).
@@ -937,7 +944,10 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | single manifest 의 change claim | `judge` 가 부여 안 함, `require` 는 `ProtocolViolation` | change = 2 epochs | Phase 7 pair protocol |
 | upstream `depth_loss` (backend_args, 어떤 철자든) | `ContractError` (exit 2) | upstream depth target 은 init points3D 자체 (Phase 4 C0 Q6) | 해당 없음 (설계) — depth 는 `DepthSupervisionRecord` 로 |
 | depth 요청 profile 에 `--depth-supervision` 없음 / 반대로 요청 없는 profile 에 줌 | `ContractError` (exit 2) | 증거 없는 depth run, 조용히 무시되는 supervision 금지 | 해당 없음 (설계) |
-| holdout 안·holdout 을 지나는·위치 불명 depth 샘플, held-out 이미지 샘플, 변조된 artifact | `ContractError` (exit 2) | 재도출 검증 (Phase 4 AD-3) | 해당 없음 (설계) |
+| holdout 안·holdout 을 지나는·위치 불명 depth 샘플, held-out 이미지 샘플, held-out view 를 포함한 SfM track 의 샘플, 변조된 artifact 또는 source asset | `ContractError` (exit 2) | 재도출 검증 (Phase 4 AD-3) | 해당 없음 (설계) |
+| dataset 의 init 파일을 depth source 로 사용 | `ContractError` (exit 2) | init 이 깊이 증거를 사칭 (Phase 4 AD-1) | 해당 없음 (설계) |
+| 카메라 크기와 다른 이미지 / `data_factor` 가 나누지 못하는 카메라 크기 | `ContractError` (exit 2) | upstream 이 모든 K 를 첫 이미지 비율로 rescale (Phase 4 AD-5) | 해당 없음 (설계) |
+| 다른 run·dataset·surface 의 e2e 보고서, run 자신의 예측을 기준으로 한 비교 | `ContractError` (exit 2) | 비교 입력은 자기 run 에 묶여야 한다 (Phase 4 AD-12) | 해당 없음 (설계) |
 | `normalize_world_space: true` | `ContractError` (exit 2) | upstream 은 변환을 저장하지 않고 출력을 되돌릴 수 없다 (Phase 4 계약 §8) | 7 조건 충족 시 |
 | run 후 cfg.yml / adapter evidence 가 요청과 다름 | run **FAILED** | 요청한 실험이 아님 (Phase 4 AD-8) | 해당 없음 (설계) |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |

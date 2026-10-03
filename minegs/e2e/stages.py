@@ -488,12 +488,13 @@ def _real_gpu_execution(record: Any, substituted: bool) -> bool:
     report's claim is about hardware, and a claim about hardware is answered by the hardware's
     own evidence (§0D.2 D2-2), not by which code path this process happened to take. A
     substituted trainer is False whatever the host has; a real one with nothing recorded about
-    a GPU is False too, because nothing establishes that one was there.
+    a GPU is False too, because nothing establishes that one was there. So is a trainer whose
+    recorded gsplat version or ``simple_trainer.py`` hash is not the pinned one: whatever ran,
+    it was not the pinned upstream (``runner.base.real_gpu_evidence``).
     """
-    if substituted:
-        return False
-    evidence = dict(getattr(record, "runtime", None) or {})
-    return bool(evidence.get("gpu_model")) or evidence.get("torch_cuda_available") is True
+    from minegs.train.runner.base import real_gpu_evidence
+
+    return False if substituted else real_gpu_evidence(record)
 
 
 def _training_env(record: Any, substituted: bool) -> dict[str, Any]:

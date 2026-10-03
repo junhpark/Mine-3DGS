@@ -14,10 +14,15 @@ carries its own pixel convention and confidence:
   (``RasterizeToPixels3DGSFwd.cu:62-63``), the same convention as COLMAP and the artifact.
   Upstream samples with ``grid_sample(align_corners=True)`` at ``u / (W - 1)``, which treats
   ``u`` as an index, half a pixel off. Here the index is ``u - 0.5``. Samples whose index
-  falls outside ``[0, W - 1] x [0, H - 1]`` are dropped, so the zero padding never contributes.
-* **Weights.** Each sample's term is weighted by its confidence, per image
-  (``sum w |..| / sum w``). An image whose weights sum to zero contributes nothing; upstream
-  would take the mean of an empty tensor, which is NaN.
+  falls outside ``[0, W - 1] x [0, H - 1]`` of the trainer's image are dropped at load, and the
+  term refuses a sample outside the image it is given, so the zero padding never contributes.
+* **Weights.** Each sample's error is multiplied by its confidence and averaged over the
+  image's samples that train (``sum w |..| / N``, ``N`` = samples with ``w > 0``). The weight is
+  absolute: an image whose samples all have weight 0.001 counts a thousandth of one whose
+  samples have weight 1. Nothing divides by a sum of weights, so a tiny weight cannot overflow
+  a reciprocal. Weight 0 is not a sample (it is kept for audit and never trains), so ``N``
+  excludes it. An image with no such sample contributes nothing; upstream would take the mean
+  of an empty tensor, which is NaN.
 * **Safe reciprocal.** ``torch.where(d > 0, 1 / d, 0)`` evaluates ``1 / 0`` in the masked branch
   and back-propagates ``0 * inf = NaN``. The denominator is made safe before it is inverted.
 
@@ -32,8 +37,9 @@ from typing import Any
 import numpy as np
 
 FORMULA = (
-    "depth_lambda * scene_scale * mean_images[ sum_m w_m |rho(ED(u_m - 0.5, v_m - 0.5)) - 1/z_m| "
-    "/ sum_m w_m ], rho(x) = 1/x (x > 0) else 0, bilinear ED at pixel index (align_corners=True)"
+    "depth_lambda * scene_scale * mean_images[ sum_{m: w_m > 0} w_m |rho(ED(u_m', v_m')) - 1/z_m| "
+    "/ #{m: w_m > 0} ], (u', v') = (u * fx_train / fx_full - 0.5, v * fy_train / fy_full - 0.5), "
+    "rho(x) = 1/x (x > 0) else 0, bilinear ED at pixel index (align_corners=True)"
 )
 
 
@@ -86,14 +92,15 @@ def bilinear(img: np.ndarray, ui: np.ndarray, vi: np.ndarray) -> np.ndarray:
 def image_term_reference(
     ed: np.ndarray, ui: np.ndarray, vi: np.ndarray, z: np.ndarray, w: np.ndarray
 ) -> float | None:
-    """One image's weighted disparity error, or None when its weights sum to zero."""
+    """One image's weighted disparity error, or None when no sample has a positive weight."""
     w = np.asarray(w, dtype=np.float64)
-    if not len(w) or float(w.sum()) <= 0:
+    pos = w > 0
+    if not pos.any():
         return None
-    d = bilinear(np.asarray(ed, dtype=np.float64), ui, vi)
+    d = bilinear(np.asarray(ed, dtype=np.float64), np.asarray(ui)[pos], np.asarray(vi)[pos])
     disp = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
-    err = np.abs(disp - 1.0 / np.asarray(z, dtype=np.float64))
-    return float((w * err).sum() / w.sum())
+    err = np.abs(disp - 1.0 / np.asarray(z, dtype=np.float64)[pos])
+    return float((w[pos] * err).sum() / pos.sum())
 
 
 def depth_term_reference(
@@ -127,8 +134,10 @@ def depth_term_torch(
     """Same term on a rendered ``ED`` batch ``[B, H, W, 1]``; differentiable in ``ed``.
 
     ``samples[b]`` holds tensors ``(ui, vi, z, w)`` on ``ed``'s device, already restricted to
-    the image domain, or None. Returns ``(term, n_images)``; ``term`` is a 0-d tensor (0 when no
-    image contributed, still attached to the graph so the caller's code path is one path).
+    the image domain, or None; samples with ``w = 0`` are skipped, as in the reference. A sample
+    outside ``ed``'s own ``W x H`` is refused: ``grid_sample`` would mix its zero padding into
+    the target. Returns ``(term, n_images)``; ``term`` is a 0-d tensor (0 when no image
+    contributed, still attached to the graph so the caller's code path is one path).
     """
     import torch
     from torch.nn import functional as F  # noqa: N812 - torch's own convention
@@ -140,9 +149,15 @@ def depth_term_torch(
         if s is None:
             continue
         ui, vi, z, w = s
-        wsum = w.sum()
-        if float(wsum) <= 0:
+        pos = w > 0
+        if not bool(pos.any()):
             continue
+        ui, vi, z, w = ui[pos], vi[pos], z[pos], w[pos]
+        if bool(((ui < 0) | (ui > W - 1) | (vi < 0) | (vi > H - 1)).any()):
+            raise ValueError(
+                f"a depth sample of batch item {b} lies outside the rendered {W}x{H} image; "
+                "samples are filtered against the trainer's image size at load"
+            )
         gx = ui / max(W - 1, 1) * 2 - 1
         gy = vi / max(H - 1, 1) * 2 - 1
         grid = torch.stack([gx, gy], dim=-1).to(ed.dtype)[None, :, None, :]  # [1, M, 1, 2]
@@ -153,7 +168,7 @@ def depth_term_torch(
         safe = torch.where(valid, d, torch.ones_like(d))
         disp = torch.where(valid, 1.0 / safe, torch.zeros_like(d))
         err = (disp - 1.0 / z.to(ed.dtype)).abs()
-        terms.append((w.to(ed.dtype) * err).sum() / wsum.to(ed.dtype))
+        terms.append((w.to(ed.dtype) * err).sum() / len(w))
     if not terms:
         return ed.sum() * 0.0, 0
     return depth_lambda * scene_scale * torch.stack(terms).mean(), len(terms)

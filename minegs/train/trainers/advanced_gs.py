@@ -118,14 +118,18 @@ def load_supervision(path: str | Path, expected_sha256: str) -> SupervisionTable
 
     The full re-derivation (leakage, binding) ran on the host before the command was built
     (``verify_depth_supervision``); inside the container the dataset tree is the staged copy and
-    the evidence that matters is identity: the directory hash the run recorded.
+    the evidence that matters is identity: the directory hash the run recorded. The value checks
+    that decide whether the term is finite are repeated here, so the adapter refuses on its own.
     """
     from minegs.core.provenance import sha256_tree
     from minegs.train.supervision.depth import (
+        BINARY,
         CONFIDENCE_SEMANTICS,
         DEPTH_SEMANTICS,
         DEPTH_UNIT,
         FRAME,
+        MIN_DEPTH_M,
+        MIN_WEIGHT,
         PIXEL_CONVENTION,
         RECORD_FILE,
         SAMPLE_DTYPE,
@@ -153,8 +157,21 @@ def load_supervision(path: str | Path, expected_sha256: str) -> SupervisionTable
     if _sha256_file(samples_path) != rec["samples_sha256"]:
         raise AdapterError("samples.npy does not match its record")
     s = np.load(samples_path, allow_pickle=False)
-    if s.dtype != SAMPLE_DTYPE:
-        raise AdapterError(f"samples dtype {s.dtype} is not {SAMPLE_DTYPE}")
+    if s.dtype != SAMPLE_DTYPE or s.ndim != 1:
+        raise AdapterError(f"samples dtype {s.dtype} shape {s.shape} is not 1-D {SAMPLE_DTYPE}")
+    names = rec["images"]
+    for f in ("u", "v", "depth_m", "confidence"):
+        if not np.all(np.isfinite(s[f])):
+            raise AdapterError(f"non-finite {f} in the depth samples")
+    c = s["confidence"]
+    if np.any(s["depth_m"] < MIN_DEPTH_M):
+        raise AdapterError(f"a depth sample is closer than {MIN_DEPTH_M} m")
+    if np.any((c < 0) | (c > 1)) or np.any((c > 0) & (c < MIN_WEIGHT)):
+        raise AdapterError(f"a confidence is outside {{0}} U [{MIN_WEIGHT}, 1]")
+    if rec["confidence_semantics"] == BINARY and np.any(~np.isin(c, (0.0, 1.0))):
+        raise AdapterError(f"a confidence is neither 0 nor 1 under {BINARY}")
+    if len(s) and int(s["image"].max()) >= len(names):
+        raise AdapterError("a sample names an image outside the record's image list")
     table = SupervisionTable(
         path=art,
         artifact_sha256=got,
@@ -163,7 +180,6 @@ def load_supervision(path: str | Path, expected_sha256: str) -> SupervisionTable
         confidence_semantics=rec["confidence_semantics"],
         n_samples=len(s),
     )
-    names = rec["images"]
     keep = s["confidence"] > 0  # confidence 0 is recorded for audit and never trains (AD-4)
     s = s[keep]
     for k in np.unique(s["image"]):
@@ -246,6 +262,7 @@ def make_runner_class(
                 self._minegs_compensate(cfg)
             self._minegs_samples: dict[int, tuple] = {}
             self._minegs_device_samples: dict[int, tuple] = {}
+            self._minegs_size: dict[int, tuple[int, int]] = {}
             if table is not None:
                 self._minegs_load(cfg, table)
 
@@ -294,6 +311,7 @@ def make_runner_class(
                 state.samples_out_of_domain += int((~keep).sum())
                 if keep.any():
                     self._minegs_samples[item] = (ui[keep], vi[keep], s[2][keep], s[3][keep])
+                    self._minegs_size[item] = (int(W), int(H))
                     state.images_with_samples.append(name)
                 else:
                     state.images_without_samples.append(name)
@@ -356,6 +374,17 @@ def make_runner_class(
                 **kwargs,
             )
             colors, ed = renders[..., 0:3], renders[..., 3:4]
+            size = (int(ed.shape[2]), int(ed.shape[1]))
+            for item in image_ids.reshape(-1).tolist():
+                want = self._minegs_size.get(item)
+                if want is not None and want != size:
+                    # Upstream sizes every camera by the first image's ratio (colmap.py:262-273);
+                    # the samples were kept against that size, the render is the real one.
+                    raise AdapterError(
+                        f"image {item} renders at {size[0]}x{size[1]} but its depth samples were "
+                        f"filtered for the parser's {want[0]}x{want[1]}; the trainer's K for "
+                        "this camera is not the image's"
+                    )
             batch = self._minegs_batch(image_ids, ed.device)
             term, n = depth_term_torch(
                 ed, batch, float(self.scene_scale), float(self.cfg.depth_lambda)
@@ -431,7 +460,8 @@ def run(argv: list[str]) -> dict[str, Any]:
             )
         if getattr(cfg, "normalize_world_space", True):
             raise AdapterError(
-                "normalize_world_space must be false (BACKEND_INTERNAL == LOCAL_METRIC)"
+                "normalize_world_space must be false (BACKEND_INTERNAL == LOCAL_METRIC). Why it "
+                "stays refused: docs/PHASE4_CONTRACT.md §8"
             )
         g = fn.__globals__
         if "Runner" not in g:

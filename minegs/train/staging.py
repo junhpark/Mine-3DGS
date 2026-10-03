@@ -252,6 +252,28 @@ def stage_dataset(
         for cid, c in model.cameras.items()
         if any(im.camera_id == cid for im in images.values())
     }
+    # Upstream rescales every camera's K by the first image's actual/expected size ratio
+    # (colmap.py:262-273), so an image that is not its camera's size would silently train on
+    # distorted intrinsics. The Phase 1 render gate refuses the same thing after training.
+    from minegs.eval.surface.render import require_images_match_cameras
+
+    require_images_match_cameras(dataset_dir, model.cameras, images)
+    if data_factor > 1:
+        # Upstream divides K and the image size by data_factor, then rescales every camera by
+        # the first image's actual/expected ratio (colmap.py:107, 262-273). Only when each
+        # size divides exactly is that ratio 1 for every camera, so that the trainer's K is the
+        # image's K and its image size is the size it renders.
+        odd = sorted(
+            f"camera {cid} {c.width}x{c.height}"
+            for cid, c in cams.items()
+            if c.width % data_factor or c.height % data_factor
+        )
+        if odd:
+            raise ContractError(
+                f"data_factor {data_factor} does not divide {', '.join(odd)}. Upstream would "
+                "train those cameras with a K scaled by another camera's rounding; use a factor "
+                "that divides every camera size, or data_factor 1."
+            )
     clamped = None
     if clamp_init_rgb:
         lo, hi = APPEARANCE_RGB_RANGE

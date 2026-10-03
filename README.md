@@ -276,7 +276,10 @@ antialiasing 끔 (depth renderer 가 classic 만 재현), `default_runner: local
 검증된 `DepthSupervisionRecord` 가 필요하다. upstream `simple_trainer.py` 는 그대로 실행되고, MineGS
 adapter (`minegs.train.trainers.advanced_gs`) 가 depth 항만 더한다. ablation 은 `heavy-base` ·
 `heavy-appearance` · `heavy-depth` · `heavy` (두 request 만 다르다). **실제 GPU heavy 학습은 아직
-수행되지 않았다**; 개선을 주장하지 않는다 (G3: PENDING).
+수행되지 않았다**; 개선을 주장하지 않는다 (G3: PENDING). depth supervision 은 init 과 별도의
+artifact 지만 같은 측량 (SfM 재구성 또는 TLS) 에서 나오므로 독립 정보가 아니다 — 검증기가 그 관계를
+측정해 `run.json` 과 비교 결과에 남긴다 (`init_relation`). "real GPU" 는 run 자신의 기록이 GPU 와
+고정된 upstream trainer (gsplat 1.5.3, `simple_trainer.py` sha256) 를 보여 줄 때만이다.
 
 **지금 거부되는 것 (fail-closed, 전체 목록은 [docs/ROADMAP.md](docs/ROADMAP.md) §6)**
 
@@ -285,7 +288,8 @@ adapter (`minegs.train.trainers.advanced_gs`) 가 depth 항만 더한다. ablati
 | `normalize_world_space: true` | `ContractError` (exit 2) | upstream 은 정규화 변환을 메모리에만 두고 출력을 정규화 frame 으로 쓴다; 되돌릴 수 없다 (Phase 4 계약 §8, 7 조건 미충족) | 7 조건 충족 시 |
 | upstream `depth_loss` (backend_args) | `ContractError` (exit 2) | upstream depth target 은 init points3D 자체라 init 과 depth 증거가 분리되지 않는다 | 해당 없음 — depth 는 `--depth-supervision` |
 | `--profile heavy` (또는 heavy-depth) 에 `--depth-supervision` 없음 | `ContractError` (exit 2) | 증거 없는 depth run 금지 | — |
-| 오염·변조된 depth artifact (holdout 점/ray, held-out 이미지, 위치 불명 support, hash 불일치) | `ContractError` (exit 2) | 재도출 검증 | — |
+| 오염·변조된 depth artifact (holdout 점/ray, held-out 이미지, held-out view 를 포함한 SfM track, 위치 불명 support, hash 불일치) | `ContractError` (exit 2) | 재도출 검증 | — |
+| dataset 의 `init_points.ply` 를 `--cloud` 로 | `ContractError` (exit 2) | init 이 깊이 증거를 사칭한다 | — |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현. 필요한 단계는 `runner/runpod.py` docstring | Phase 6 |
 
 light 프로파일의 커맨드는 Phase 0D 와 바이트 단위로 같다: `--no-normalize_world_space`, depth 없음,

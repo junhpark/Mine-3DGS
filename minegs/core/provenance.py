@@ -12,7 +12,7 @@ import platform
 import secrets
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -62,6 +62,19 @@ def sha256_tree(root: str | Path, patterns: tuple[str, ...] = ("**/*",)) -> str:
     for p in files:
         h.update(str(p.relative_to(root)).encode())
         h.update(sha256_file(p).encode())
+    return h.hexdigest()
+
+
+def sha256_tree_of(files: dict[str, str]) -> str:
+    """``sha256_tree`` of a directory given as ``{relative path: content sha256}``.
+
+    For a caller that read the files itself: the identity it returns is then the hash of the
+    bytes it checked, not of whatever the directory holds by the time it is re-read.
+    """
+    h = hashlib.sha256()
+    for rel in sorted(files, key=PurePosixPath):
+        h.update(str(PurePosixPath(rel)).encode())
+        h.update(files[rel].encode())
     return h.hexdigest()
 
 

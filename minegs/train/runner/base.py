@@ -278,6 +278,7 @@ class Runner(ABC):
         refuse_used_run_dir(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         record = RunRecord(
+            schema_version=RunRecord.SCHEMA_VERSION,
             run_id=run.run_id,
             dataset_id=manifest.dataset_id,
             dataset_hash=sha256_tree(dataset_dir, DATASET_HASH_PATTERNS),
@@ -444,7 +445,40 @@ def runtime_info() -> dict[str, Any]:
         info["torch_cuda_available"] = bool(torch.cuda.is_available())
     except Exception:
         info["torch"] = None
+    try:  # the library the native trainer imports; None where it is not installed
+        import gsplat
+
+        info["gsplat"] = getattr(gsplat, "__version__", None)
+    except ImportError:
+        info["gsplat"] = None
     return info
+
+
+def pinned_upstream(record: Any) -> bool:
+    """Whether the run's own runtime evidence names the pinned gsplat and its pinned trainer.
+
+    Both are recorded by the runner from the machine that trained (the host on ``--native``, the
+    image on the docker route), never from the request.
+    """
+    from minegs.train.backends.gsplat import PINNED_GSPLAT, UPSTREAM_TRAINER_SHA256
+
+    rt = dict(getattr(record, "runtime", None) or {})
+    return (
+        str(rt.get("gsplat")) == PINNED_GSPLAT
+        and rt.get("trainer_sha256") == UPSTREAM_TRAINER_SHA256
+    )
+
+
+def real_gpu_evidence(record: Any) -> bool:
+    """A GPU was there, and the pinned upstream trained on it, as the run itself recorded.
+
+    The one rule for "real GPU training" (e2e report and run comparison alike). A trainer that
+    is not v1.5.3's ``simple_trainer.py``, or an unrecorded gsplat, is not real gsplat training,
+    whatever the host has.
+    """
+    rt = dict(getattr(record, "runtime", None) or {})
+    gpu = bool(rt.get("gpu_model")) or rt.get("torch_cuda_available") is True
+    return gpu and pinned_upstream(record)
 
 
 #: Asked of the image itself, so the recorded versions are the ones that trained.
@@ -456,6 +490,8 @@ _PROBE = (
     "d['gpu_model']=torch.cuda.get_device_name(0) if torch.cuda.is_available() else None;"
     "\ntry:\n import gsplat; d['gsplat']=gsplat.__version__\nexcept Exception as e:"
     " d['gsplat']=None\n"
+    "import hashlib\ntry:\n d['trainer_sha256']=hashlib.sha256(open(sys.argv[1],'rb').read())"
+    ".hexdigest()\nexcept (IndexError, OSError):\n d['trainer_sha256']=None\n"
     "print('MINEGS_PROBE'+json.dumps(d))"
 )
 
@@ -482,6 +518,7 @@ def container_runtime_info(image: str, device: str, trainer_path: str) -> dict[s
         image,
         "-c",
         _PROBE,
+        trainer_path,
     ]
     try:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
@@ -610,7 +647,7 @@ def verify_postconditions(
         raise ContractError(
             f"the trainer ran with normalize_world_space={declared!r}. BACKEND_INTERNAL must be "
             "LOCAL_METRIC for this baseline, so the output is in arbitrary units and the run is "
-            "not a metric one (§0D.2 D2-7)"
+            "not a metric one (§0D.2 D2-7). Why it stays refused: docs/PHASE4_CONTRACT.md §8"
         )
 
     # The span ratio corroborates; it does not lead. It is blind to rotation and translation by
@@ -728,6 +765,18 @@ def check_trainer_evidence(
                 f"{str(trainer.get('adapter_sha256'))[:12]}): the image and the host disagree"
             )
         record.optimised_images = len(adapter.get("optimised_images") or [])
+        ran = (adapter.get("upstream_trainer") or {}).get("sha256")
+        hashed = (record.runtime or {}).get("trainer_sha256")
+        if ran and hashed and ran != hashed:
+            raise ContractError(
+                f"the adapter ran upstream trainer {ran[:12]}, but the runner recorded "
+                f"{hashed[:12]} as the trainer of this run"
+            )
+        if record.depth_supervision is None and adapter.get("depth_supervision") is not None:
+            raise ContractError(
+                "the adapter reports depth supervision in a run that recorded none; the run "
+                "would be stated as something other than what trained"
+            )
     elif adapter is not None:
         raise ContractError("adapter evidence appeared in a run that did not use the adapter")
     else:
@@ -752,6 +801,17 @@ def check_trainer_evidence(
             )
         if not got.get("images_with_samples"):
             raise ContractError("no optimised image carried a depth sample")
+        optimised = set((adapter or {}).get("optimised_images") or [])
+        if not set(got.get("images_with_samples") or []) <= optimised:
+            raise ContractError("the trainer reports depth samples on images it did not optimise")
+        if not int(got.get("n_samples_in_domain") or 0) > 0:
+            raise ContractError("the trainer reports no depth sample inside its images")
+        calls = got.get("training_calls")
+        if not isinstance(calls, int) or not 0 < int(got["steps_with_depth_term"]) <= calls:
+            raise ContractError(
+                f"the trainer reports the depth term on {got.get('steps_with_depth_term')} steps "
+                f"of {calls} training renders; that cannot have happened"
+            )
         if not _close(got.get("depth_lambda"), float(expected.get("depth_lambda", 0.01))):
             raise ContractError("the depth weight the trainer used is not the one requested")
         sup = dict(sup)
@@ -797,7 +857,13 @@ def check_trainer_evidence(
             raise ContractError(f"MCMC metric compensation does not hold ({'; '.join(bad)})")
 
     # ---- export dropped nothing; the trained-with gsplat is the pinned one
-    if evidence.stats_gaussian_count is not None and evidence.stats_gaussian_count != n_final:
+    if evidence.stats_gaussian_count is None:
+        raise ContractError(
+            "the trainer's final gaussian count cannot be read from its last stats file; "
+            "upstream always writes an integer num_GS there, so whether the export dropped "
+            "diverged gaussians cannot be checked"
+        )
+    if evidence.stats_gaussian_count != n_final:
         raise ContractError(
             f"the trainer ended with {evidence.stats_gaussian_count} gaussians but its PLY holds "
             f"{n_final}: export drops non-finite splats silently (gsplat/exporter.py:515-538), "

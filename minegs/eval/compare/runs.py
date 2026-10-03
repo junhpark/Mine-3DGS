@@ -20,6 +20,13 @@ that measured them. A metric one side lacks is ``null`` on that side and in the 
 0. Training loss is not read at all: a lower loss is not a better tunnel, and with depth
 supervision the two losses are not even the same function.
 
+Every input has to be about its run. An e2e report naming another run, dataset or surface is
+refused. Whether real hardware ran is decided by the run's own record
+(``runner.base.real_gpu_evidence``); a report can lower that, never raise it. A geometry report
+is checked against the geometry the run's own e2e report recorded when there is one; a
+geometry or render report alone names no run, so the comparison says it was attributed by the
+caller. The reference is a scanned cloud, never either run's own prediction.
+
 There is no verdict field. Signed differences (advanced minus baseline) are stated, and
 ``G3: PENDING`` holds until real runs on a real survey are compared (§12).
 """
@@ -30,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from minegs.core.config import VersionedModel
@@ -195,22 +203,135 @@ def _configuration(rec) -> dict[str, Any]:
         if sup is None
         else {
             k: sup.get(k)
-            for k in ("supervision_id", "artifact_sha256", "source_kind", "confidence_semantics")
+            for k in (
+                "supervision_id",
+                "artifact_sha256",
+                "source_kind",
+                "confidence_semantics",
+                "init_relation",
+            )
         },
         "optimised_images": rec.optimised_images,
     }
 
 
-def _execution(report: dict[str, Any] | None) -> dict[str, bool]:
-    """Real-execution flags, read from the side's own Phase 2 report and nowhere else."""
+def _execution(
+    rec, report: dict[str, Any] | None, label: str, surface_id: str | None
+) -> tuple[dict[str, bool], list[str]]:
+    """Real-execution flags: the run's own record decides, and its own e2e report can lower them.
+
+    The report is bound to the run first (its run, dataset and surface), so another run's report
+    cannot speak for this one. A report saying a real GPU trained, about a run whose record
+    shows no GPU running the pinned upstream trainer, is outvoted by the record.
+    """
+    from minegs.train.runner.base import real_gpu_evidence
+
     if report is None:
-        return {}
-    return {
-        "real_gpu_execution": bool((report.get("training") or {}).get("real_gpu_execution")),
-        "real_renderer_execution": bool(
-            (report.get("reconstruction") or {}).get("real_renderer_execution")
-        ),
-    }
+        return {}, []
+    training = report.get("training") or {}
+    if training.get("run_id") != rec.run_id:
+        raise ContractError(
+            f"the {label} e2e report is about run {training.get('run_id')!r}, not {rec.run_id}; "
+            "its flags say nothing about this run"
+        )
+    ds_hash = (report.get("dataset") or {}).get("dataset_hash")
+    if ds_hash is not None and ds_hash != rec.dataset_hash:
+        raise ContractError(f"the {label} e2e report is about another dataset ({ds_hash[:12]})")
+    recon = report.get("reconstruction") or {}
+    if recon.get("surface_id") is not None and recon.get("surface_id") != surface_id:
+        raise ContractError(
+            f"the {label} e2e report reconstructed surface {recon.get('surface_id')!r}, not "
+            f"{surface_id!r}, which these sections were cut from"
+        )
+    notes = []
+    said_gpu = bool(training.get("real_gpu_execution"))
+    gpu = said_gpu and real_gpu_evidence(rec)
+    if said_gpu and not gpu:
+        notes.append(
+            f"the {label} e2e report says a real GPU trained, but run {rec.run_id}'s own record "
+            "shows no GPU running the pinned upstream trainer; it is not counted as real"
+        )
+    said_renderer = bool(recon.get("real_renderer_execution"))
+    renderer = said_renderer and recon.get("surface_id") == surface_id
+    if said_renderer and not renderer:
+        notes.append(f"the {label} e2e report names no surface for its real renderer run")
+    return {"real_gpu_execution": gpu, "real_renderer_execution": renderer}, notes
+
+
+_GEOMETRY_FIELDS = (
+    ("accuracy_median_m", "accuracy", "median_m"),
+    ("accuracy_p95_m", "accuracy", "p95_m"),
+    ("completeness_median_m", "completeness", "median_m"),
+    ("completeness_p95_m", "completeness", "p95_m"),
+)
+
+
+def _geometry(side, rec, label: str, ranges: list[Interval]) -> tuple[dict[str, Any], list[str]]:
+    """The side's geometry numbers, from a ``GeometryReport`` and/or its bound e2e report."""
+    from pydantic import ValidationError
+
+    from minegs.eval.geometry.metrics import GeometryReport
+
+    notes: list[str] = []
+    values: dict[str, Any] | None = None
+    if side.geometry is not None:
+        try:
+            g = GeometryReport.model_validate(side.geometry)
+        except ValidationError as e:
+            raise ContractError(f"the {label} geometry input is not a GeometryReport ({e})") from e
+        domain = None if g.chainage_range_m is None else tuple(float(x) for x in g.chainage_range_m)
+        if domain is None or not any(
+            np.allclose(domain, r, atol=1e-6) for r in [tuple(map(float, r)) for r in ranges]
+        ):
+            raise ContractError(
+                f"the {label} geometry report was measured over {domain}, not over a range of "
+                f"this comparison ({ranges}); it answers another question"
+            )
+        values = {k: getattr(getattr(g, part), attr) for k, part, attr in _GEOMETRY_FIELDS}
+        values["chamfer_m"] = g.chamfer_m
+    bound = dict((side.e2e_report or {}).get("geometry") or {})
+    keys = [k for k, _, _ in _GEOMETRY_FIELDS] + ["chamfer_m"]
+    if any(bound.get(k) is not None for k in keys):
+        recorded = {k: bound.get(k) for k in keys}
+        if values is None:
+            values = recorded
+        elif any(
+            (values[k] is None) != (recorded[k] is None)
+            or (values[k] is not None and not np.isclose(values[k], recorded[k]))
+            for k in keys
+        ):
+            raise ContractError(
+                f"the {label} geometry report disagrees with the geometry run {rec.run_id}'s "
+                "own e2e report recorded; it is not that run's measurement"
+            )
+    elif values is not None:
+        notes.append(
+            f"the {label} geometry numbers come from a GeometryReport, which names no run: they "
+            f"are attributed to {rec.run_id} by the caller, not verified"
+        )
+    return values or {}, notes
+
+
+def _render(side, rec, label: str, test_groups: list[str]) -> tuple[dict[str, Any], list[str]]:
+    from pydantic import ValidationError
+
+    from minegs.eval.render.metrics import RenderReport
+
+    if side.render is None:
+        return {}, []
+    try:
+        r = RenderReport.model_validate(side.render)
+    except ValidationError as e:
+        raise ContractError(f"the {label} render input is not a RenderReport ({e})") from e
+    if sorted(r.test_groups) != sorted(test_groups):
+        raise ContractError(
+            f"the {label} render report held out groups {r.test_groups}, not this dataset's "
+            f"test groups {test_groups}"
+        )
+    return {"psnr": r.psnr, "ssim": r.ssim, "lpips": r.lpips}, [
+        f"the {label} render numbers come from a RenderReport, which names no run: they are "
+        f"attributed to {rec.run_id} by the caller, not verified"
+    ]
 
 
 def _same_measurement(a: dict | None, b: dict | None, keys: tuple[str, ...], what: str) -> None:
@@ -289,6 +410,18 @@ def compare_runs(
         raise ContractError(f"the two runs' sections were cut on different grids ({diff})")
     ref_a = baseline.sections_reference.source.point_sha256
     ref_b = advanced.sections_reference.source.point_sha256
+    predicted = {
+        baseline.sections_predicted.source.point_sha256,
+        advanced.sections_predicted.source.point_sha256,
+    }
+    for label, side in (("baseline", baseline), ("advanced", advanced)):
+        src = side.sections_reference.source
+        if src.kind != "raw_cloud" or src.point_sha256 in predicted:
+            raise ContractError(
+                f"the {label} reference was cut from {src.kind} {src.point_sha256!s:.12}, which "
+                "is a reconstruction, not a scanned reference; a run measured against its own "
+                "prediction has no error to report"
+            )
     if ref_a != ref_b:
         raise ContractError(
             "the two runs are measured against different references "
@@ -320,21 +453,21 @@ def compare_runs(
     }
 
     sides = {}
+    side_notes: list[str] = []
     for label, side in (("baseline", baseline), ("advanced", advanced)):
         rec = recs[label]
         p = paired[label]
-        geo = side.geometry or {}
+        geo, geo_notes = _geometry(side, rec, label, list(ranges))
+        ren, ren_notes = _render(side, rec, label, list(manifest.split.test_groups))
+        execution, ex_notes = _execution(
+            rec, side.e2e_report, label, side.sections_predicted.source.surface_id
+        )
+        side_notes += geo_notes + ren_notes + ex_notes
         metrics = {
             "sections": {k: _num(getattr(p.sections, k)) for k in METRIC_KEYS["sections"]},
             "volume": {k: _num(getattr(p.volume, k)) for k in METRIC_KEYS["volume"]},
-            "geometry": {
-                "accuracy_median_m": _num((geo.get("accuracy") or {}).get("median")),
-                "accuracy_p95_m": _num((geo.get("accuracy") or {}).get("p95")),
-                "completeness_median_m": _num((geo.get("completeness") or {}).get("median")),
-                "completeness_p95_m": _num((geo.get("completeness") or {}).get("p95")),
-                "chamfer_m": _num(geo.get("chamfer_m")),
-            },
-            "render": {k: _num((side.render or {}).get(k)) for k in METRIC_KEYS["render"]},
+            "geometry": {k: _num(geo.get(k)) for k in METRIC_KEYS["geometry"]},
+            "render": {k: _num(ren.get(k)) for k in METRIC_KEYS["render"]},
             "runtime": {
                 "train_seconds": _num(rec.train_seconds),
                 "duration_s": _num(rec.duration_s),
@@ -350,7 +483,7 @@ def compare_runs(
             profile=(rec.profile or {}).get("name"),
             configuration=_configuration(rec),
             metrics=metrics,
-            execution=_execution(side.e2e_report),
+            execution=execution,
         )
 
     differences: dict[str, dict[str, float | None]] = {}
@@ -361,7 +494,7 @@ def compare_runs(
             b = sides["advanced"].metrics.get(group, {}).get(k)
             differences[group][k] = None if a is None or b is None else float(b - a)
 
-    notes: list[str] = [] if explicit_note is None else [explicit_note]
+    notes: list[str] = ([] if explicit_note is None else [explicit_note]) + side_notes
     real = True
     for label in ("baseline", "advanced"):
         ex = sides[label].execution
@@ -393,6 +526,17 @@ def compare_runs(
             "the strategies differ; the mcmc preset also sets init_opa, init_scale, opacity_reg "
             "and scale_reg, so a difference is attributable to the whole preset"
         )
+    for label in ("baseline", "advanced"):
+        sup = sides[label].configuration.get("depth_supervision") or {}
+        rel = sup.get("init_relation") or {}
+        if rel.get("shared_source"):
+            frac = rel.get("fraction_of_samples_at_init_points")
+            share = "" if frac is None else f"; {frac:.0%} of its samples sit on init points"
+            notes.append(
+                f"the {label} run's depth supervision comes from the same {rel['shared_source']} "
+                f"as its initialisation{share}. It is a filtered, separate artifact, not "
+                "independent evidence, so a difference is not attributable to new information"
+            )
     if (ca.get("app_opt") or cb.get("app_opt")) and any(
         sides[x].metrics["render"]["psnr"] is not None for x in sides
     ):

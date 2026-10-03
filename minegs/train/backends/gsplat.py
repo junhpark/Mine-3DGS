@@ -65,6 +65,9 @@ from minegs.train.backends.base import (
 from minegs.train.profiles import Profile
 
 PINNED_GSPLAT = "1.5.3"
+#: sha256 of v1.5.3's ``examples/simple_trainer.py`` (tag v1.5.3, commit 937e299; the file the
+#: pinned image runs, docs/ROADMAP.md). A run is real gsplat training only if its trainer is it.
+UPSTREAM_TRAINER_SHA256 = "79319e1cd7404e4d1ba0c425634235c39e6054f0643b904a01feea6179462c05"
 TRAINER_ENV = "MINEGS_GSPLAT_TRAINER"
 TRAINER_IMAGE_PATH = "/opt/gsplat/examples/simple_trainer.py"  # set in docker/Dockerfile.gpu
 STRATEGIES = ("default", "mcmc")
@@ -80,9 +83,10 @@ NORMALIZE_REFUSAL = (
 DEPTH_LOSS_REFUSAL = (
     "upstream depth_loss is refused for every profile: gsplat v1.5.3 derives its depth targets "
     "from the COLMAP tracks of the same points3D that init_type=sfm initialises from, so the "
-    "depth evidence would be the initialisation itself (docs/PHASE4_CONTRACT.md C0 Q6). Depth "
-    "supervision is requests.depth_loss: true with a verified DepthSupervisionRecord "
-    "(--depth-supervision), consumed by the MineGS trainer adapter."
+    "initialisation would stand in for depth evidence, unchecked against the holdout "
+    "(docs/PHASE4_CONTRACT.md C0 Q6, AD-1). Depth supervision is requests.depth_loss: true with "
+    "a verified DepthSupervisionRecord (--depth-supervision), consumed by the MineGS trainer "
+    "adapter."
 )
 DEPTH_SUPERVISION_NOTE = (
     "depth_loss is delivered as MineGS depth supervision: a DepthSupervisionRecord built by "
@@ -179,7 +183,18 @@ def read_trainer_config(path: Path) -> dict:
     import yaml
 
     class _Loader(yaml.SafeLoader):
-        pass
+        def construct_mapping(self, node, deep=False):
+            # yaml.dump never writes a key twice; a file that does was not written by it, and
+            # "last one wins" would let either value stand for the run.
+            seen: set[str] = set()
+            for k, _ in node.value:
+                key = repr(self.construct_object(k, deep=True))
+                if key in seen:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, f"duplicate key {key}", k.start_mark
+                    )
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
 
     _Loader.add_multi_constructor("tag:yaml.org,2002:python/", _python_tag)
     try:
@@ -345,6 +360,12 @@ class GsplatBackend(TrainBackend):
             raise ContractError(DEPTH_LOSS_REFUSAL)
         if str(args.get("init_type", "sfm")) != "sfm":
             raise ContractError(INIT_RANDOM_REFUSAL)
+        if "steps_scaler" in args:
+            raise ContractError(
+                "backend_args steps_scaler: upstream multiplies every step count by it, so the "
+                "run would train a number of steps its record and comparisons do not state; set "
+                "max_steps instead"
+            )
         for key, want in RENDERER_ASSUMED.items():
             if key in args and args[key] != want:
                 raise ContractError(

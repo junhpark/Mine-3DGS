@@ -465,3 +465,202 @@ def test_a_file_the_record_does_not_name_is_refused(tls, tmp_path):
     (art / "sub" / "samples.npy").write_bytes((art / "samples.npy").read_bytes())
     with pytest.raises(ContractError, match="does not name"):
         verify_depth_supervision(tls.dataset_dir, art)
+
+
+# ================================================================ C4: hostile review findings
+
+
+def _bend() -> Support:
+    """A 90-degree bend 2 m past holdout [38, 46]: leg one along +x to the vertex at s = 48,
+    leg two along +y. Chainage jumps across the bisector on the inner side of the bend."""
+    from minegs.core.centerline import Centerline
+
+    leg1 = [(-48.0 + k, 0.0, 0.0) for k in range(49)]
+    leg2 = [(0.0, float(k), 0.0) for k in range(1, 43)]
+    return Support(Centerline(np.array(leg1 + leg2), "LOCAL_METRIC"), [(38.0, 46.0)])
+
+
+def test_a_ray_through_the_holdout_at_a_bend_is_refused():
+    sup = _bend()
+    cam, pt = np.array([[-5.0, 5.5, 0.0]]), np.array([[-1.0, 0.5, 0.0]])
+    s_cam, _ = sup.locate(cam)
+    s_pt, _ = sup.locate(pt)
+    # Both ends sit well outside the holdout plus its margin, so the interval rule passes...
+    assert s_cam[0] == pytest.approx(53.5) and s_pt[0] == pytest.approx(47.0)
+    assert not sup.ray_crosses_holdout(s_cam, s_pt)[0]
+    # ...while the segment between them passes through held-out chainage.
+    seg = cam + np.linspace(0, 1, 401)[:, None] * (pt - cam)
+    s_seg, ok = sup.locate(seg)
+    assert (ok & sup.in_holdout(s_seg)).any()
+    keep, _, reasons = sup.classify(cam, pt)
+    assert not keep[0] and reasons["holdout_ray"][0]
+
+
+def test_the_sampled_ray_rule_does_not_refuse_rays_far_from_the_holdout():
+    sup = _bend()
+    cams = np.array([[-30.0, 1.0, 0.5], [0.5, 20.0, 0.0], [-20.0, -2.0, 1.0]])
+    pts = np.array([[-25.0, -2.0, -1.0], [-1.5, 26.0, 1.0], [-14.0, 2.5, 0.0]])
+    keep, _, _ = sup.classify(cams, pts)
+    assert keep.all()
+
+
+def test_a_holdout_reaching_past_the_centerline_is_refused(tls, tmp_path):
+    ds = tmp_path / "ds"
+    shutil.copytree(tls.dataset_dir, ds)
+    manifest = Manifest.load_dataset(ds)
+    end = Support.of_dataset(ds, manifest).centerline.s_end
+    manifest.split.geometry_holdout.chainage_ranges_m = [(end - 4.0, end + 6.0)]
+    manifest.save_dataset(ds)
+    with pytest.raises(ContractError, match="reaches past the centerline"):
+        Support.of_dataset(ds, Manifest.load_dataset(ds))
+
+
+def _tracks(video):
+    """Metric SfM points of the video dataset with their track image names."""
+    from minegs.core.frames import Sim3
+    from minegs.dataset.from_sfm import PROVENANCE_DIR, SFM_MODEL_DIR
+    from minegs.eval.register.models import RegistrationRecord
+
+    ds = video.dataset_dir
+    m = Manifest.load_dataset(ds)
+    sfm = colmap_io.read_model(ds / PROVENANCE_DIR / SFM_MODEL_DIR)
+    reg = RegistrationRecord.load(ds / PROVENANCE_DIR / "registration.json")
+    T = Sim3.from_se3(m.T_local_from_tls) @ reg.sim3()
+    name = {im.id: im.name for im in sfm.images.values()}
+    for p in sfm.points3D.values():
+        X = T.apply(np.asarray(p.xyz, float).reshape(1, 3))[0]
+        yield X, [name.get(int(i)) for i in p.image_ids]
+
+
+def test_a_sample_from_a_track_through_a_held_out_view_is_refused(video, tmp_path):
+    """The track rule is re-derived by the verifier, not trusted to the builder."""
+    ds = video.dataset_dir
+    m = Manifest.load_dataset(ds)
+    model = colmap_io.read_model(ds / "sparse" / "0")
+    support = Support.of_dataset(ds, m)
+    train = set(m.train_images()) - set(m.test_images())
+    names = video.artifact.record.images
+    col = {n: k for k, n in enumerate(names)}
+    extra = None
+    for X, track in _tracks(video):
+        held = [n for n in track if n is None or n not in train]
+        seen = [n for n in track if n in col]
+        if not held or not seen:
+            continue
+        r = _sample_at(model, seen[0], X, col[seen[0]])
+        cam = model.cameras[model.image_by_name()[seen[0]].camera_id]
+        if not (
+            0 <= r["u"][0] < cam.width and 0 <= r["v"][0] < cam.height and r["depth_m"][0] > 0.05
+        ):
+            continue
+        from minegs.train.supervision.depth import backproject_samples
+
+        pts, cams = backproject_samples(r, names, model)
+        if support.classify(cams, pts)[0][0]:
+            extra = r
+            break
+    assert extra is not None, "the scene has no admissible point on a held-out track"
+    art = _copy(video.artifact, tmp_path)
+    s = np.concatenate([np.load(art / SAMPLES_FILE), extra])
+    _reseal(ds, art, s[np.lexsort((s["v"], s["u"], s["image"]))])
+    with pytest.raises(ContractError, match="every view of the track a training image"):
+        verify_depth_supervision(ds, art)
+
+
+def test_an_sfm_sample_not_from_the_declared_model_is_refused(video, tmp_path):
+    art = _copy(video.artifact, tmp_path)
+    s = np.load(art / SAMPLES_FILE)
+    s["depth_m"][0] *= 1.01  # a centimetre off a 1 m track point: no longer that point
+    _reseal(video.dataset_dir, art, s)
+    with pytest.raises(ContractError, match="not the reprojection of a track point"):
+        verify_depth_supervision(video.dataset_dir, art)
+
+
+def test_source_assets_are_rehashed_and_their_roles_required(video, tmp_path):
+    from minegs.dataset.from_sfm import PROVENANCE_DIR, SFM_MODEL_DIR
+
+    ds = tmp_path / "ds"
+    shutil.copytree(video.dataset_dir, ds)
+    verify_depth_supervision(ds, video.artifact.path)
+    pts = ds / PROVENANCE_DIR / SFM_MODEL_DIR / "points3D.txt"
+    pts.write_text(pts.read_text() + "# appended after the samples were made\n")
+    with pytest.raises(ContractError, match="the samples were made from other bytes"):
+        verify_depth_supervision(ds, video.artifact.path)
+
+    art = _copy(video.artifact, tmp_path)
+    data = json.loads((art / RECORD_FILE).read_text())
+    data["source_assets"] = [a for a in data["source_assets"] if a["role"] != "registration"]
+    (art / RECORD_FILE).write_text(json.dumps(data))
+    with pytest.raises(ContractError, match="names 0 registration"):
+        verify_depth_supervision(video.dataset_dir, art)
+    data["source_assets"].append({"role": "tls_cloud", "path": "x.ply", "sha256": "0" * 64})
+    (art / RECORD_FILE).write_text(json.dumps(data))
+    with pytest.raises(ContractError, match="role 'tls_cloud' is not one of"):
+        verify_depth_supervision(video.dataset_dir, art)
+
+
+def test_the_initialisation_cannot_be_the_depth_source(tls, tmp_path):
+    init = tls.dataset_dir / "init_points.ply"
+    with pytest.raises(ContractError, match="is the dataset's initialisation"):
+        build_tls_projection(tls.dataset_dir, init, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+    art = _copy(tls.artifact, tmp_path)
+    data = json.loads((art / RECORD_FILE).read_text())
+    data["source_assets"][0]["sha256"] = sha256_file(init)
+    (art / RECORD_FILE).write_text(json.dumps(data))
+    with pytest.raises(ContractError, match="has the bytes of the dataset's initialisation"):
+        verify_depth_supervision(tls.dataset_dir, art)
+
+
+@pytest.mark.parametrize("which", ["tls", "video"])
+def test_the_relation_to_the_initialisation_is_measured_and_reported(which, request):
+    sc = request.getfixturevalue(which)
+    rel = sc.artifact.summary()["init_relation"]
+    assert rel["init_file"] == "init_points.ply"
+    assert rel["shared_source"] == {"tls": "tls_survey", "video": "sfm_reconstruction"}[which]
+    # Both sources measure the tunnel the init is sampled from, so samples do land on init
+    # points; the fraction is measured, not declared.
+    assert 0.0 < rel["fraction_of_samples_at_init_points"] <= 1.0
+    assert sc.artifact.summary()["source_assets"] == [
+        a.model_dump(mode="json") for a in sc.artifact.record.source_assets
+    ]
+
+
+def test_the_identity_returned_is_of_the_bytes_checked(tls, tmp_path, monkeypatch):
+    """A swap during verification cannot make the verified identity cover unverified bytes."""
+    import minegs.train.supervision.depth as depth_mod
+    from minegs.train.staging import stage_depth_supervision
+
+    art = _copy(tls.artifact, tmp_path, "victim")
+    clean = sha256_tree(art)
+    forged = _copy(tls.artifact, tmp_path, "forged")
+    s = np.load(forged / SAMPLES_FILE)
+    s["depth_m"][0] *= 1.5
+    _reseal(tls.dataset_dir, forged, s)
+    orig = depth_mod.recorded_support
+
+    def swap_then(*a, **k):
+        for f in (SAMPLES_FILE, RECORD_FILE):
+            shutil.copy2(forged / f, art / f)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(depth_mod, "recorded_support", swap_then)
+    v = verify_depth_supervision(tls.dataset_dir, art)
+    monkeypatch.setattr(depth_mod, "recorded_support", orig)
+    assert v.artifact_sha256 == clean != sha256_tree(art)
+    with pytest.raises(ContractError, match="not the verified"):
+        stage_depth_supervision(v, tmp_path / "staged")
+
+
+def test_weights_below_the_floor_and_depths_below_the_near_plane_are_refused(tls, tmp_path):
+    art = _copy(tls.artifact, tmp_path)
+    s = np.load(art / SAMPLES_FILE)
+    s["confidence"][3] = 1e-9
+    _reseal(tls.dataset_dir, art, s, confidence_semantics="unit_interval_weight")
+    with pytest.raises(ContractError, match="positive but below"):
+        verify_depth_supervision(tls.dataset_dir, art)
+    s = np.load(tls.artifact.path / SAMPLES_FILE)
+    s["depth_m"][3] = 0.005
+    _reseal(tls.dataset_dir, art, s)
+    with pytest.raises(ContractError, match="near plane"):
+        verify_depth_supervision(tls.dataset_dir, art)

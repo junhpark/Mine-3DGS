@@ -425,5 +425,8 @@ end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced G
   (`DepthSupervisionRecord`) 이고, 검증은 저장된 샘플을 dataset camera 로 역투영해 holdout 점·ray·
   held-out 이미지·위치 불명 support 를 **재도출**한다. upstream trainer 는 수정하지 않고 adapter 가
   depth 항만 더한다; 요청과 trainer 자신의 config 가 다르면 run 은 FAILED. `normalize_world_space`
-  는 7 조건 미충족으로 계속 거부. 근거: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md).
+  는 7 조건 미충족으로 계속 거부. artifact 분리는 정보 독립이 아니다 (두 source 모두 init 과 같은
+  측량에서 나온다) — 그 관계는 측정해 기록한다. "real GPU" 는 run 자신의 기록이 GPU 와 고정된 upstream
+  trainer (버전 + `simple_trainer.py` sha256) 를 보여 줄 때만이고, 비교 입력은 자기 run 에 묶인다.
+  근거: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) (§14.5 적대적 검토).
 * 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.

@@ -13,6 +13,7 @@ only if it can be shown to have trained.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -620,3 +621,59 @@ def test_a_pre_0d2_run_record_still_loads():
     # a 1.0 run recorded no evidence, and the migration does not invent any
     assert rec.final_model is None and rec.observed_final_step is None and rec.extents == {}
     assert rec.trainer == {} and rec.depth_supervision is None and rec.trainer_config == {}
+
+
+def test_a_fresh_run_record_is_written_at_the_current_schema(synthetic, tmp_path, gpu, trainer):
+    """The label on disk says which fields the record was written with, before any migration."""
+    from minegs.train.runner.base import RunRecord
+
+    h, run_dir = _run(synthetic, tmp_path)
+    h.wait(poll_s=0.01)
+    assert json.loads((run_dir / "run.json").read_text())["schema_version"] == (
+        RunRecord.SCHEMA_VERSION
+    )
+
+
+def test_the_docker_path_runs_the_image_trainer_even_with_a_host_override(
+    synthetic, tmp_path, gpu, trainer, monkeypatch
+):
+    """MINEGS_GSPLAT_TRAINER names a host file for --native; the container does not have it."""
+    from minegs.train.backends.gsplat import TRAINER_IMAGE_PATH
+
+    host = os.environ["MINEGS_GSPLAT_TRAINER"]
+    assert Path(host).is_file()
+    monkeypatch.setattr(runner_local, "docker_available", lambda: True)
+    asked: list[str] = []
+
+    def runtime(image, device, trainer_path, *a, **k):
+        asked.append(str(trainer_path))
+        return {"source": "container"}
+
+    monkeypatch.setattr(runner_local, "container_runtime_info", runtime)
+    seen: list[list[str]] = []
+    real_popen = runner_local.subprocess.Popen
+
+    def spy(argv, **kw):
+        if argv and argv[0] == "docker":
+            seen.append(list(argv))
+            return real_popen([sys.executable, "-c", ""], **kw)
+        return real_popen(argv, **kw)
+
+    monkeypatch.setattr(runner_local.subprocess, "Popen", spy)
+    r = get_runner(
+        "local",
+        RunnerConfig(runner="local", native=False, image="minegs:gpu@sha256:" + "a" * 64),
+    )
+    h = r.submit(
+        RunConfig(
+            dataset_dir=str(synthetic.dataset_dir),
+            profile="light",
+            run_dir=str(tmp_path / "runs" / "d2"),
+            overrides={"max_steps": 10, "max_images": 4},
+        )
+    )
+    argv = seen[0]
+    assert TRAINER_IMAGE_PATH in argv and host not in argv
+    assert asked == [TRAINER_IMAGE_PATH]
+    rec = json.loads((Path(h.run_dir) / "run.json").read_text())
+    assert host not in json.dumps(rec["trainer"]) and host not in json.dumps(rec["command"])

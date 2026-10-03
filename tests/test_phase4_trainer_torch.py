@@ -272,3 +272,88 @@ def test_adapter_refuses_supervision_that_is_not_the_recorded_bytes(scene, tmp_p
 def test_adapter_drops_confidence_zero_and_keeps_the_rest(scene):
     t = advanced_gs.load_supervision(scene.supervision.path, scene.supervision.artifact_sha256)
     assert t.n_in_loss == scene.supervision.record.n_samples_in_loss
+
+
+# ================================================================ C4: hostile review findings
+
+
+def test_the_float32_term_the_adapter_runs_matches_the_definition():
+    rng = np.random.default_rng(3)
+    H, W, M = 9, 13, 60
+    ed = rng.uniform(1, 5, (H, W))
+    ui, vi = rng.uniform(0, W - 1, M), rng.uniform(0, H - 1, M)
+    z, w = rng.uniform(1, 5, M), rng.uniform(1e-6, 1, M)
+    ref, _ = depth_term_reference([ed], [(ui, vi, z, w)], 2.5, 0.01)
+    t, _ = depth_term_torch(
+        torch.tensor(ed, dtype=torch.float32)[None, ..., None],
+        [tuple(torch.tensor(a, dtype=torch.float32) for a in (ui, vi, z, w))],
+        2.5,
+        0.01,
+    )
+    assert float(t) == pytest.approx(ref, rel=1e-5)
+
+
+def test_confidence_is_absolute_and_the_smallest_weight_stays_finite():
+    """An image of weight-0.001 samples counts a thousandth; nothing divides by a weight sum."""
+    ed = torch.full((2, 5, 5, 1), 2.0, requires_grad=True)
+    one = [torch.tensor(a, dtype=torch.float32) for a in ([1.0], [1.0], [1.0], [1.0])]
+
+    def term(w):
+        s = [tuple(one), (one[0], one[1], one[2], torch.tensor([w]))]
+        return depth_term_torch(ed, s, 1.0, 1.0)[0]
+
+    # each image's error is |1/2 - 1/1| = 0.5; the second is scaled by its weight
+    assert float(term(1.0)) == pytest.approx(0.5)
+    assert float(term(1e-3)) == pytest.approx(0.5 * (1 + 1e-3) / 2)
+    t = term(1e-6)
+    t.backward()
+    assert torch.isfinite(ed.grad).all()
+
+
+def test_a_sample_outside_the_rendered_image_is_refused():
+    s = [tuple(torch.tensor(a) for a in ([4.5], [1.0], [2.0], [1.0]))]
+    with pytest.raises(ValueError, match="outside the rendered 5x5 image"):
+        depth_term_torch(torch.ones(1, 5, 5, 1, dtype=torch.float64), s, 1.0, 1.0)
+
+
+def test_a_render_at_another_size_than_the_samples_were_kept_for_is_refused(monkeypatch):
+    """Upstream sizes every camera by the first image's ratio; the render is the real size."""
+    from types import SimpleNamespace
+
+    K = np.array([[4.0, 0, 4.0], [0, 4.0, 3.0], [0, 0, 1]])
+    monkeypatch.setattr(advanced_gs, "full_resolution_K", lambda _d: {1: K})
+
+    class Base:
+        def __init__(self, local_rank, world_rank, world_size, cfg):
+            self.cfg = cfg
+            self.scene_scale = 1.0
+            self.parser = SimpleNamespace(
+                image_names=["a.png"],
+                camera_ids=[1],
+                imsize_dict={1: (8, 6)},
+                Ks_dict={1: K.copy()},
+                camtoworlds=np.eye(4)[None],
+            )
+            self.trainset = SimpleNamespace(indices=[0])
+
+        def rasterize_splats(self, camtoworlds, Ks, width, height, **kw):
+            return torch.ones(1, height, width, 4, requires_grad=True), None, {}
+
+    table = advanced_gs.SupervisionTable(
+        path=Path("."),
+        artifact_sha256="x",
+        supervision_id="d",
+        source_kind="tls_projection",
+        confidence_semantics="binary_mask",
+        n_samples=1,
+        by_name={"a.png": tuple(np.array([v]) for v in (4.0, 3.0, 2.0, 1.0))},
+    )
+    cfg = SimpleNamespace(
+        data_dir=".", patch_size=None, pose_opt=False, pose_noise=0.0, depth_lambda=0.1
+    )
+    runner_cls = advanced_gs.make_runner_class(Base, table, False, advanced_gs.AdapterState())
+    r = runner_cls(0, 0, 1, cfg)
+    ids = torch.tensor([0])
+    r.rasterize_splats(None, None, 8, 6, image_ids=ids)  # the size the samples were kept for
+    with pytest.raises(advanced_gs.AdapterError, match="renders at 7x6"):
+        r.rasterize_splats(None, None, 7, 6, image_ids=ids)

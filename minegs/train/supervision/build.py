@@ -49,6 +49,7 @@ from minegs.train.supervision.depth import (
     VerifiedDepthSupervision,
     dataset_binding,
     recorded_support,
+    training_image_names,
     verify_depth_supervision,
 )
 from minegs.train.supervision.support import (
@@ -78,9 +79,7 @@ def _now() -> str:
 def _train_cameras(manifest: Manifest, model: colmap_io.ColmapModel) -> list[str]:
     """Training images present in the model, in a fixed order, all pinhole."""
     by_name = model.image_by_name()
-    names = sorted(
-        n for n in set(manifest.train_images()) - set(manifest.test_images()) if n in by_name
-    )
+    names = training_image_names(manifest, model)
     for n in names:
         cam = model.cameras[by_name[n].camera_id]
         if cam.model not in PINHOLE_MODELS:
@@ -388,6 +387,15 @@ def build_tls_projection(
         )
     if cell_px < 1 or occlusion_kernel_cells < 1 or occlusion_kernel_cells % 2 == 0:
         raise ContractError("cell_px >= 1 and an odd occlusion_kernel_cells >= 1 are required")
+    cloud_ply = Path(cloud_ply).resolve()
+    cloud_sha = sha256_file(cloud_ply)
+    init_path = ds / manifest.initialization.file
+    if init_path.is_file() and sha256_file(init_path) == cloud_sha:
+        raise ContractError(
+            f"{cloud_ply} is the dataset's initialisation {manifest.initialization.file}. "
+            "Depth projected from the initial geometry would be the init standing in for "
+            "evidence (contract AD-1); project the TLS cloud the init was sampled from."
+        )
     cloud = read_ply(cloud_ply)
     if cloud.frame == "LOCAL_METRIC":
         xyz = np.asarray(cloud.xyz, dtype=np.float64)
@@ -456,7 +464,7 @@ def build_tls_projection(
         sel = _budget(names[int(r["image"][0])], len(r), max_samples_per_image, seed)
         count(BUDGET, len(r) - len(sel))
         kept.append(r[sel])
-    assets = [SourceAssetRef(role="tls_cloud", path=str(cloud_ply), sha256=sha256_file(cloud_ply))]
+    assets = [SourceAssetRef(role="tls_cloud", path=str(cloud_ply), sha256=cloud_sha)]
     params = {
         "cloud_frame": cloud.frame,
         "cell_px": int(cell_px),

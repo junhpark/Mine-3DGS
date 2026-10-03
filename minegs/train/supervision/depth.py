@@ -3,7 +3,7 @@
 Upstream gsplat derives depth targets from the COLMAP tracks of ``points3D``. That is the same
 array its ``init_type=sfm`` initialises from (``simple_trainer.py:234-236`` and
 ``colmap.py:411-420`` at v1.5.3). Depth evidence and initial geometry are one object there.
-MineGS keeps them apart. Depth supervision is an artifact of its own:
+MineGS keeps them apart as artifacts. Depth supervision is an artifact of its own:
 
 ```
 <dataset>/supervision/depth/<supervision_id>/
@@ -13,7 +13,14 @@ MineGS keeps them apart. Depth supervision is an artifact of its own:
 
 Its identity is the hash of that directory. Its bytes do not depend on the initialisation, and
 its dataset binding does not include it. Changing ``init_points.ply`` therefore neither
-rewrites this artifact nor invalidates it, and the reverse holds too (AD-1).
+rewrites this artifact nor invalidates it, and the reverse holds too (AD-1). A source whose
+bytes are the initialisation file is refused: that would be the init impersonating evidence.
+
+Separate artifacts are not independent information. Both sources measure the same tunnel the
+init is drawn from: ``sfm_tracks`` reprojects the SfM points an image-only dataset's init is
+voxel-sampled from, and ``tls_projection`` projects a TLS cloud a TLS dataset's init is sampled
+from. The verifier measures how many samples sit on an init point and records it with the
+shared source (``init_relation``), so a run, and a comparison of runs, says so.
 
 ``verify_depth_supervision`` re-derives every sample rather than reading the record. It
 back-projects ``(u, v, depth)`` through the dataset camera into ``LOCAL_METRIC``, then asks
@@ -24,18 +31,19 @@ statements are compared with what comes out, never used in its place.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from minegs.core.config import VersionedModel, canonical_json
 from minegs.core.errors import ContractError
 from minegs.core.manifest import Manifest
-from minegs.core.provenance import sha256_file, sha256_tree
+from minegs.core.provenance import sha256_file, sha256_tree_of
 from minegs.ingest.common import colmap_io
 from minegs.train.supervision.support import (
     DEFAULT_MAX_RADIAL_M,
@@ -75,6 +83,22 @@ SUPPORTED_SOURCES = ("sfm_tracks", "tls_projection")
 SourceKind = Literal["sfm_tracks", "tls_projection", "sensor_depth"]
 IMAGE_ONLY_SOURCES = ("video", "video360")
 PINHOLE_MODELS = ("PINHOLE", "SIMPLE_PINHOLE")
+#: The asset roles each source must name, and how many ("+" is one or more).
+SOURCE_ROLES: dict[str, dict[str, int | str]] = {
+    "sfm_tracks": {"sfm_model": "+", "registration": 1},
+    "tls_projection": {"tls_cloud": 1},
+}
+#: The trainer's near plane (backends/gsplat.py RENDERER_ASSUMED): a surface closer than this is
+#: not rendered, so a target there cannot be met; ``1 / z`` of a smaller float32 overflows.
+MIN_DEPTH_M = 0.01
+#: The smallest positive weight under ``unit_interval_weight``. Below it a weight is noise at
+#: float32 precision, and float32 products and sums with it underflow.
+MIN_WEIGHT = 1e-6
+#: An sfm_tracks sample is the reprojection of a metric track point. Back-projecting its float32
+#: ``(u, v, depth)`` lands within ~1e-5 m of that point at 100 m; this is the match tolerance.
+TRACK_MATCH_TOL_M = 1e-3
+#: Distance at which a sample counts as sitting on an initialisation point.
+INIT_MATCH_TOL_M = 1e-3
 
 
 class _Strict(BaseModel):
@@ -228,12 +252,15 @@ class VerifiedDepthSupervision:
     samples: np.ndarray
     artifact_sha256: str
     record_sha256: str
+    init_relation: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         r = self.record
         return {
             "supervision_id": r.supervision_id,
             "source_kind": r.source_kind,
+            "source_assets": [a.model_dump(mode="json") for a in r.source_assets],
+            "init_relation": dict(self.init_relation),
             "artifact_sha256": self.artifact_sha256,
             "record_sha256": self.record_sha256,
             "samples_sha256": r.samples_sha256,
@@ -265,18 +292,218 @@ def _refuse(artifact: Path, why: str) -> ContractError:
     return ContractError(f"depth supervision {artifact}: {why}")
 
 
-def _load_samples(path: Path, artifact: Path) -> np.ndarray:
+def _parse_record(raw: bytes, artifact: Path) -> DepthSupervisionRecord:
     try:
-        arr = np.load(path, allow_pickle=False)
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise _refuse(artifact, f"{RECORD_FILE} is not JSON ({e})") from e
+    if not isinstance(data, dict):
+        raise _refuse(artifact, f"{RECORD_FILE}: expected a mapping at top level")
+    try:
+        return DepthSupervisionRecord.from_dict(data)
+    except ValidationError as e:
+        raise _refuse(artifact, f"{RECORD_FILE}: {e}") from e
+
+
+def _load_samples(raw: bytes, name: str, artifact: Path) -> np.ndarray:
+    try:
+        arr = np.load(io.BytesIO(raw), allow_pickle=False)
     except (OSError, ValueError) as e:
-        raise _refuse(artifact, f"{path.name} is not a readable sample array ({e})") from e
-    if arr.dtype != SAMPLE_DTYPE or arr.ndim != 1:
+        raise _refuse(artifact, f"{name} is not a readable sample array ({e})") from e
+    if not isinstance(arr, np.ndarray) or arr.dtype != SAMPLE_DTYPE or arr.ndim != 1:
         raise _refuse(
             artifact,
-            f"{path.name} has dtype {arr.dtype} and shape {arr.shape}; the contract is a 1-D "
-            f"array of {SAMPLE_DTYPE}",
+            f"{name} has dtype {getattr(arr, 'dtype', None)} and shape "
+            f"{getattr(arr, 'shape', None)}; the contract is a 1-D array of {SAMPLE_DTYPE}",
         )
     return arr
+
+
+def training_image_names(manifest: Manifest, model: colmap_io.ColmapModel) -> list[str]:
+    """Training images of the dataset that its model holds, in a fixed order."""
+    by_name = model.image_by_name()
+    return sorted(
+        n for n in set(manifest.train_images()) - set(manifest.test_images()) if n in by_name
+    )
+
+
+# ---------------------------------------------------------------- where the samples came from
+
+
+def _sfm_paths() -> tuple[str, str]:
+    from minegs.dataset.from_sfm import PROVENANCE_DIR, SFM_MODEL_DIR
+
+    return PROVENANCE_DIR, SFM_MODEL_DIR
+
+
+def _verify_sources(
+    ds: Path, manifest: Manifest, record: DepthSupervisionRecord, art: Path
+) -> str | None:
+    """The record names the assets its source needs, and none of them is the init.
+
+    Returns the initialisation file's sha256 (None when the dataset has no init file).
+    """
+    roles = SOURCE_ROLES[record.source_kind]
+    have: dict[str, list[SourceAssetRef]] = {}
+    for a in record.source_assets:
+        if a.role not in roles:
+            raise _refuse(
+                art,
+                f"source asset role {a.role!r} is not one of {sorted(roles)} for "
+                f"{record.source_kind}",
+            )
+        have.setdefault(a.role, []).append(a)
+    for role, n in roles.items():
+        k = len(have.get(role, []))
+        if (k < 1) if n == "+" else (k != n):
+            raise _refuse(
+                art,
+                f"{record.source_kind} names {k} {role} asset(s); it needs "
+                f"{'at least one' if n == '+' else n}. Which bytes the depth came from is part "
+                "of the evidence.",
+            )
+    init_path = ds / manifest.initialization.file
+    init_sha = sha256_file(init_path) if init_path.is_file() else None
+    for a in record.source_assets:
+        if init_sha is not None and a.sha256 == init_sha:
+            raise _refuse(
+                art,
+                f"its {a.role} {a.path} has the bytes of the dataset's initialisation "
+                f"{manifest.initialization.file}. Depth projected from the initial geometry is "
+                "the initialisation standing in for evidence (contract AD-1).",
+            )
+    if record.source_kind == "sfm_tracks":
+        # The image-only dataset holds its own sources, so they are checked, not trusted.
+        prov, sfm_dir = _sfm_paths()
+        model_dir = ds / prov / sfm_dir
+        want = (
+            {f"{prov}/{sfm_dir}/{f.name}" for f in model_dir.iterdir() if f.is_file()}
+            if model_dir.is_dir()
+            else set()
+        )
+        named = {a.path for a in have["sfm_model"]}
+        if named != want:
+            raise _refuse(
+                art,
+                f"names {sorted(named)} as its SfM model; the dataset's model is {sorted(want)}",
+            )
+        if have["registration"][0].path != f"{prov}/registration.json":
+            raise _refuse(art, f"its registration is not {prov}/registration.json")
+        for a in record.source_assets:
+            rel = PurePosixPath(a.path)
+            if rel.is_absolute() or ".." in rel.parts:
+                raise _refuse(art, f"source asset path {a.path!r} is not inside the dataset")
+            f = ds / rel
+            if not f.is_file():
+                raise _refuse(art, f"source asset {a.path} is missing from the dataset")
+            got = sha256_file(f)
+            if got != a.sha256:
+                raise _refuse(
+                    art,
+                    f"source asset {a.path} hashes to {got[:12]}, the record names "
+                    f"{a.sha256[:12]}: the samples were made from other bytes",
+                )
+    return init_sha
+
+
+def _verify_track_samples(
+    ds: Path,
+    manifest: Manifest,
+    model: colmap_io.ColmapModel,
+    names: list[str],
+    samples: np.ndarray,
+    art: Path,
+) -> None:
+    """Each sfm_tracks sample is a track point of the declared model, seen by its own track.
+
+    The point is re-derived: back-projected from ``(u, v, depth)`` and matched against the
+    dataset's SfM points, put into metres by its registration. The match must be a point whose
+    track holds the sample's image and only training images; a point triangulated with a
+    held-out view carries that view's information (AD-3, track rule).
+    """
+    from scipy.spatial import cKDTree
+
+    from minegs.core.frames import Sim3
+    from minegs.eval.register.models import RegistrationRecord
+
+    prov, sfm_dir = _sfm_paths()
+    reg = RegistrationRecord.load(ds / prov / "registration.json")
+    T = Sim3.from_se3(manifest.T_local_from_tls) @ reg.sim3()
+    sfm = colmap_io.read_model(ds / prov / sfm_dir)
+    ids = sorted(sfm.points3D)
+    if not ids:
+        raise _refuse(art, "the dataset's SfM model has no points; no sample can come from it")
+    X = T.apply(np.array([sfm.points3D[i].xyz for i in ids], dtype=np.float64).reshape(-1, 3))
+    train = set(training_image_names(manifest, model))
+    column = {n: k for k, n in enumerate(names)}
+    sfm_name = {im.id: im.name for im in sfm.images.values()}
+    allowed: list[int] = []
+    for j, pid in enumerate(ids):
+        track = [sfm_name.get(int(i)) for i in sfm.points3D[pid].image_ids]
+        if not track or any(n is None or n not in train for n in track):
+            continue
+        allowed.extend(j * len(names) + column[n] for n in set(track) if n in column)
+    pts, _ = backproject_samples(samples, names, model)
+    k = min(4, len(X))
+    d, nn = cKDTree(X).query(pts, k=k, distance_upper_bound=TRACK_MATCH_TOL_M)
+    d = np.asarray(d).reshape(len(pts), k)
+    nn = np.asarray(nn).reshape(len(pts), k)
+    hit = np.isfinite(d)
+    key = (
+        np.where(hit, nn, 0).astype(np.int64) * len(names)
+        + samples["image"].astype(np.int64)[:, None]
+    )
+    ok = (hit & np.isin(key, np.asarray(allowed, dtype=np.int64))).any(axis=1)
+    if not ok.all():
+        raise _refuse(
+            art,
+            f"{int((~ok).sum())} sfm_tracks sample(s) are not the reprojection of a track point of "
+            "the dataset's SfM model into an image of that track, with every view of the track a "
+            f"training image (first: sample {int(np.flatnonzero(~ok)[0])}). Depth triangulated "
+            "with a held-out view, or from geometry other than the declared model, is refused.",
+        )
+
+
+def _init_relation(
+    ds: Path,
+    manifest: Manifest,
+    model: colmap_io.ColmapModel,
+    record: DepthSupervisionRecord,
+    names: list[str],
+    samples: np.ndarray,
+    init_sha: str | None,
+) -> dict[str, Any]:
+    """How this evidence relates to the initialisation, measured rather than declared."""
+    from scipy.spatial import cKDTree
+
+    from minegs.core.pointcloud import read_ply
+
+    init = manifest.initialization
+    shared = None
+    if record.source_kind == "sfm_tracks" and init.source == "sfm_sparse":
+        shared = "sfm_reconstruction"
+    elif record.source_kind == "tls_projection" and init.source == "tls":
+        shared = "tls_survey"
+    fraction = None
+    path = ds / init.file
+    in_loss = samples[samples["confidence"] > 0]
+    if path.is_file() and len(in_loss):
+        cloud = read_ply(path)
+        xyz = np.asarray(cloud.xyz, dtype=np.float64)
+        if cloud.frame == "TLS_GLOBAL":
+            xyz = manifest.T_local_from_tls.apply(xyz)
+        if cloud.frame in ("LOCAL_METRIC", "TLS_GLOBAL") and len(xyz):
+            pts, _ = backproject_samples(in_loss, names, model)
+            d, _ = cKDTree(xyz).query(pts, distance_upper_bound=INIT_MATCH_TOL_M)
+            fraction = float(np.isfinite(d).mean())
+    return {
+        "init_file": init.file,
+        "init_source": init.source,
+        "init_sha256": init_sha,
+        "shared_source": shared,
+        "fraction_of_samples_at_init_points": fraction,
+        "match_tolerance_m": INIT_MATCH_TOL_M,
+    }
 
 
 def verify_depth_supervision(
@@ -295,7 +522,10 @@ def verify_depth_supervision(
     rec_path = art / RECORD_FILE
     if not rec_path.is_file():
         raise _refuse(art, f"no {RECORD_FILE}; this is not a depth supervision artifact")
-    record = DepthSupervisionRecord.load(rec_path)
+    # Each file is read once. Every check runs on those bytes, and the identity returned is
+    # their hash, so it cannot name bytes that changed on disk after they were checked.
+    rec_bytes = rec_path.read_bytes()
+    record = _parse_record(rec_bytes, art)
     manifest = manifest or Manifest.load_dataset(ds)
     model = model or colmap_io.read_model(ds / "sparse" / "0")
 
@@ -353,7 +583,8 @@ def verify_depth_supervision(
     )
     if extra:
         raise _refuse(art, f"holds files its record does not name: {extra[:5]}")
-    got = sha256_file(samples_path)
+    samples_bytes = samples_path.read_bytes()
+    got = hashlib.sha256(samples_bytes).hexdigest()
     if got != record.samples_sha256:
         raise _refuse(
             art,
@@ -361,7 +592,7 @@ def verify_depth_supervision(
             f"{record.samples_sha256[:12]}: the samples were changed after the record was "
             "written",
         )
-    samples = _load_samples(samples_path, art)
+    samples = _load_samples(samples_bytes, record.samples_file, art)
 
     # ---- the dataset is the dataset the samples were made against
     if record.dataset_id != manifest.dataset_id:
@@ -384,6 +615,8 @@ def verify_depth_supervision(
             f"(differs: {', '.join(differ) or 'binding digest'}). Depth measured through other "
             "cameras, or against another split, is not this dataset's evidence.",
         )
+
+    init_sha = _verify_sources(ds, manifest, record, art)
 
     # ---- images: training images of this dataset, and nothing else
     names = list(record.images)
@@ -420,8 +653,12 @@ def verify_depth_supervision(
     for f in ("u", "v", "depth_m", "confidence"):
         if not np.all(np.isfinite(samples[f])):
             raise _refuse(art, f"non-finite {f} in the samples")
-    if np.any(samples["depth_m"] <= 0):
-        raise _refuse(art, "a sample has depth <= 0; camera-z of a visible surface is positive")
+    if np.any(samples["depth_m"] < MIN_DEPTH_M):
+        raise _refuse(
+            art,
+            f"a sample has depth below {MIN_DEPTH_M} m, the trainer's near plane; camera-z of a "
+            "surface the renderer draws is at least that",
+        )
     conf = samples["confidence"]
     if record.confidence_semantics == BINARY:
         bad = ~np.isin(conf, (0.0, 1.0))
@@ -433,6 +670,12 @@ def verify_depth_supervision(
             )
     elif np.any((conf < 0) | (conf > 1)):
         raise _refuse(art, f"confidence outside [0, 1] under {WEIGHT}")
+    elif np.any((conf > 0) & (conf < MIN_WEIGHT)):
+        raise _refuse(
+            art,
+            f"a weight is positive but below {MIN_WEIGHT}; use 0 for a sample that should not "
+            "train",
+        )
     counts = np.bincount(idx, minlength=len(names)).tolist() if len(samples) else [0] * len(names)
     if counts != list(record.per_image_counts):
         raise _refuse(art, "per_image_counts does not match the samples")
@@ -478,17 +721,21 @@ def verify_depth_supervision(
                 f"the holdout {support.holdout}, or one whose place along the drift cannot be "
                 "established, is evidence about the geometry the evaluation is measured on.",
             )
+    if record.source_kind == "sfm_tracks" and len(samples):
+        _verify_track_samples(ds, manifest, model, names, samples, art)
     derived = recorded_support(samples, names, model, support)
     want = None if record.support_ranges_m is None else [tuple(r) for r in record.support_ranges_m]
     if not _same_ranges(derived, want):
         raise _refuse(art, f"support_ranges_m {want} does not follow from the samples ({derived})")
 
+    record_sha = hashlib.sha256(rec_bytes).hexdigest()
     return VerifiedDepthSupervision(
         path=art,
         record=record,
         samples=samples,
-        artifact_sha256=sha256_tree(art),
-        record_sha256=sha256_file(rec_path),
+        artifact_sha256=sha256_tree_of({RECORD_FILE: record_sha, record.samples_file: got}),
+        record_sha256=record_sha,
+        init_relation=_init_relation(ds, manifest, model, record, names, samples, init_sha),
     )
 
 
@@ -510,10 +757,13 @@ __all__ = [
     "DEPTH_SEMANTICS",
     "DEPTH_UNIT",
     "FRAME",
+    "MIN_DEPTH_M",
+    "MIN_WEIGHT",
     "PIXEL_CONVENTION",
     "RECORD_FILE",
     "SAMPLES_FILE",
     "SAMPLE_DTYPE",
+    "SOURCE_ROLES",
     "SUPERVISION_DIR",
     "SUPPORTED_SOURCES",
     "WEIGHT",
@@ -524,5 +774,6 @@ __all__ = [
     "backproject_samples",
     "dataset_binding",
     "recorded_support",
+    "training_image_names",
     "verify_depth_supervision",
 ]
