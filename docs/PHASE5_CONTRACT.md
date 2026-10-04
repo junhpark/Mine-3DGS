@@ -224,4 +224,90 @@ Phase 3 G2:                         PENDING
 
 ## 12. 구현 기록
 
-(C1–C4 에서 채운다.)
+### 12.1 checkpoint 와 commit
+
+한 branch (`phase-5-long-tunnel`), 중간 PR 없음.
+
+| checkpoint | commit | 내용 |
+|---|---|---|
+| C0 | `3705909` | reality audit (§2) + 계약 freeze |
+| C1 | `92914bc` | `ChunkPlanRecord`, planner, verifier, atomic group 선택, `dataset chunk-plan` / `chunk-plan-verify`, `dataset chunks --write` 거부 |
+| C2 | `de37662` | chunk-aware staging·학습 (`RunRecord` 1.3), `train run --chunk-plan`, `train chunks`, `compare-runs` 의 chunk binding 거부 |
+| C3 | `d22ea95` | `ChunkRunSet` 합성 (`stitch_sections`, coverage, holdout·seam), `eval chunk-set`, chunk run 의 render/surface view 한정 (`run_views`) |
+| C4 | `4fa4e04` + 이후 | 문서·CI smoke, hostile review (§12.4) 수정, 전체 gate |
+
+### 12.2 구현하며 정한 것 (계약이 비어 있던 곳)
+
+* **plan 이 남긴 짧은 꼬리.** overlap 이하의 나머지는 앞 core 에 합친다 (§5.1, C1). 합성 fixture 의 축은
+  300.06 m 라 이 규칙 없이는 0.06 m 짜리 이미지 없는 chunk 가 생겼다.
+* **학습 진입.** `--chunk` 와 `--chunk-plan` 은 함께만 받는다. plan 없는 `chunk_id` (legacy `manifest.chunks`)
+  는 prepare 에서, `stage_dataset(chunk_id=)` 단독 호출은 staging 에서 거부한다. legacy `chunk.T_tls_from_local`
+  은 더 이상 기록되지 않는다 — chunk run 의 `T_tls_from_local` 은 manifest 값이다 (§2 Q1 결함 수정).
+* **render·surface view.** chunk run 은 plan 이 정한 chunk view (support 와 겹치는 모든 그룹의 구성원, split
+  무관 — 렌더는 평가이지 학습이 아니다) 만 렌더하고 역투영한다. view 집합은 record 가 아니라 다시 검증한
+  plan 에서 도출하고, plan 경로가 다른 plan 을 담고 있으면 거부한다. surface 의 `depth_map_count`,
+  `expected_views`, `depth_sha256` 과 claim 경로의 재도출 (`rederive_depth_source`) 도 같은 집합을 쓴다
+  (C3 테스트가 찾은 결함: 처음에는 dataset 전체 view 로 digest 를 계산했다).
+* **section 짝짓기.** `eval chunk-set` 은 sections 파일을 그 파일이 이름 붙인 run (`source.run_id`) 으로
+  `--run` 과 짝짓는다. 성공한 run 에 sections 가 없거나, 주어지지 않은 run 의 sections 가 있으면 거부.
+* **grid.** reference 는 전체 축 grid (start/end 없음) 여야 하고, 모든 chunk core 가 grid station 을 하나
+  이상 소유해야 한다 — 아니면 그 core 는 읽히지 않은 채 coverage 1.0 으로 보고될 수 있다 (§12.4 F3).
+* **한 실험.** 한 set 의 run 은 profile (overrides 포함, canonical JSON) 과 depth-supervision artifact
+  sha256 이 같아야 한다. set 은 그 sha 를 `depth_supervision_sha256` 으로 기록한다.
+* **protocol.** `evaluation.protocol` 에 `judge()` 의 claims·protocols·refusals 를 기록한다. 선언된 holdout 이
+  있어도 protocol 이 `volume_accuracy` 를 허용하지 않으면 holdout 수치는 `diagnostic: true` 다.
+* **scene_scale (AD-9).** adapter 가 돌았으면 adapter 의 값, 아니면 (light 처럼 upstream 직접 실행) upstream
+  공식 (`1.1 × global_scale × max‖c_i − mean c‖`, staged 카메라) 의 host port (`staged_scene_scale`). 출처를
+  `scene_scale_source` 로 남긴다. torch 테스트가 두 값이 같음을 확인한다.
+* **profile 의 `max_images`.** plan 의 선택은 atomic 이지만 profile 의 균등 subsample (light: 100) 은 그
+  뒤에 적용된다 — 단일 run 과 같은 의미다. chunk evidence 에 `planned_images` 와 `staged_images` 를 남기고,
+  `ChunkRunSet` 은 솎인 chunk 를 notes 에 이름으로 적는다. 전체 그룹으로 학습하려면 `max_images: null`
+  (heavy 계열의 기본) 을 쓴다.
+* **§7 이름.** `chunks[].trainer` 대신 `chunks[].run_chunk` (run 의 chunk binding 에서 이미지·그룹 목록을
+  뺀 것: init/depth 선택 수, `scene_scale`, `planned_images`/`staged_images`).
+* **seam.** 공유 support 가 float slack (1e-9 m) 이하이면 비교하지 않고 수치를 비운다 (거부하지 않는다).
+
+### 12.3 negative test 대응 (지시서 §36–§40)
+
+| 지시서 | 테스트 |
+|---|---|
+| plan: core/overlap 값, gap, 중복 소유, dataset 변경, centerline 변경 | `test_phase5_plan.py` (`test_invalid_core_length_or_overlap_is_refused`, `test_a_forged_plan_is_refused`, `test_a_resealed_plan_…`, `test_a_changed_dataset_…`, `test_a_changed_centerline_…`, `test_a_plan_of_another_dataset_…`), `test_phase5_compose.py::test_a_plan_with_a_gap_or_a_changed_dataset_composes_nothing` |
+| group: 360·video atomic, test·holdout 이미지 부활 없음, 결정적 선택 | `test_capture_groups_are_atomic_…`, `test_video_groups_stay_whole`, `test_the_global_split_comes_first`, `test_images_the_holdout_removed_…`, `test_group_selection_is_deterministic_…` |
+| staging: plan 에 없는 chunk, hash 불일치, 다른 chunk identity, 선택 ≠ staged, init 증거 | `test_phase5_train.py` (prepare/staging 거부, init 선택, thinning 기록) |
+| composition: 다른 dataset·plan·profile, 중복·누락 chunk, FAILED run, 비 `LOCAL_METRIC`, `T ≠ I`, grid 불일치, 중복 chainage, core gap | `test_phase5_compose.py` (각 항목 한 테스트 이상, 부분 grid·coarse grid·depth artifact 포함) |
+| 단일 run 회귀 | `test_phase5_train.py` (argv == `build_command`, staged 에 chunk 없음), `test_phase4_trainer.py::test_the_adapters_own_image_count_…`, 기존 Phase 0D–4 테스트 전체 |
+
+### 12.4 C4 hostile review (한 번, bounded)
+
+진술 8 개 (S1 gap·중복 소유 없음, S2 split 완화 없음, S3 하나의 `LOCAL_METRIC`, S4 overlap 이중 집계 없음,
+S5 artifact 혼합 없음, S6 depth leakage 우회 없음, S7 단일 run 경로 불변, S8 실검증 승격 없음) 를 reviewer 4
+명이 둘씩 맡아 반증을 시도했고, 지적마다 독립 검증자가 반박을 시도했다. 지적 10, 확인 4, 기각 6.
+
+| # | 진술 | 확인된 지적 | 수정 | 회귀 테스트 |
+|---|---|---|---|---|
+| F1 | S7 (minor) | C2 가 `check_trainer_evidence` 의 adapter `if/elif/else` 사이에 chunk 분기를 넣어, 비 chunk adapter run 의 `optimised_images` 를 host 추정식이 덮어썼다 | chain 복원, chunk 갱신은 별도 블록 | `test_phase4_trainer.py::test_the_adapters_own_image_count_is_recorded_not_a_host_estimate` |
+| F2 | S3 (minor) | upstream 직접 실행 chunk run (기본 `train chunks --profile light`) 의 `scene_scale` 이 null | host port `staged_scene_scale` + `scene_scale_source` | `test_phase5_train.py` (값 = 공식, chunk 마다 다름), torch 테스트 (adapter 값 = host 값) |
+| F3 | S5 (major) | 부분 구간 grid 또는 core 보다 긴 간격의 grid 에서 station 을 하나도 소유하지 않는 core 가 있어도 `complete`·coverage 1.0 | reference 는 전체 축 grid, 모든 core 가 station ≥ 1 | `test_a_reference_cut_over_part_of_the_axis_is_refused`, `test_a_grid_too_coarse_for_a_core_is_a_gap_not_coverage` |
+| F4 | S8 (minor) | protocol 이 holdout claim 을 거부해도 holdout 평가가 `diagnostic: false` | `judge()` 결과 기록, 허용될 때만 non-diagnostic | `test_the_holdout_is_diagnostic_when_the_protocol_refuses_it` |
+
+기각된 6 개 중 둘은 진술 위반은 아니지만 범위 안이라 보강했다: chunk 마다 다른 depth artifact (S5/S6 로 두
+번 보고 — 이제 거부, `test_chunks_supervised_by_different_depth_artifacts_are_refused`), 1e-9 m 이하 overlap 의
+seam 이 set 전체를 거부 (이제 빈 수치, `test_a_seam_narrower_than_float_slack_…`). `max_images` 가 chunk 안에서
+그룹을 솎는 것 (S2/S5 로 두 번 보고) 은 split 을 넓히지 않고 다른 chunk 이미지를 넣지도 않아 기각됐으나,
+솎였다는 사실을 기록·보고하게 했다 (§12.2). 나머지 하나는 F1 의 중복 (S5 로 보고).
+
+### 12.5 검증
+
+TEST_COUNT_PLACEHOLDER
+
+### 12.6 한계와 미룬 것
+
+* real GPU chunk 학습·렌더 없음 — trainer 는 stand-in (CPU torch stand-in upstream 포함), renderer 는
+  대체. `real_execution` 은 모든 chunk 가 `real_gpu_evidence` 를 가질 때만 true 이고 테스트에서는 항상 false.
+* 실제 장거리 갱도 dataset 없음. 최적 chunk 크기는 결정하지 않았다 (사용자 매개변수).
+* `run.chunk.plan_path` 는 절대 경로다. dataset 을 옮기면 chunk run 의 render/surface 재도출이 거부된다
+  (fail-closed; 재배치 지원은 Phase 6 의 artifact 동기화와 함께).
+* e2e orchestration (`minegs e2e`) 은 chunk 를 모른다 — chunk 경로는 `train chunks` → `eval render-depth` /
+  `surface-depth` / `sections` (chunk 마다) → `eval chunk-set` 이다.
+* depth renderer 가 학습 해상도가 아니라 full 해상도로 렌더하는 문제 (Phase 4 계약 §2.3-13) 는 그대로다.
+* 범위 밖 그대로: Gaussian 병합, chunk ICP, 자동 chunk 크기, VRAM scheduler, retry/resume, RunPod, 분산.

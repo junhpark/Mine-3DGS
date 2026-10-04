@@ -102,6 +102,30 @@ def test_a_chunk_run_is_bound_to_its_plan_and_stays_in_the_dataset_frame(tunnel,
     lo, hi = c.support_range_m
     assert ok.all() and s.min() >= lo - 1e-6 and s.max() <= hi + 1e-6
     assert rec.staged["chunk"]["chunk_id"] == "K001"
+    # an upstream-direct run's scene_scale: upstream's formula on the cameras it staged
+    c2w = np.stack([im.world_from_cam.matrix() for im in staged.images.values()])
+    centres = c2w[:, :3, 3]
+    want = 1.1 * float(np.max(np.linalg.norm(centres - centres.mean(axis=0), axis=1)))
+    assert rec.chunk["scene_scale_source"] == "host_from_staged_cameras"
+    assert rec.chunk["scene_scale"] == pytest.approx(want) and want > 0
+    assert rec.chunk["staged_images"] == rec.chunk["planned_images"] == len(c.images)
+
+
+def test_a_profile_that_thins_a_chunk_says_so(tunnel, tmp_path, trainer):
+    h = _runner().submit(
+        RunConfig(
+            dataset_dir=str(tunnel.dataset_dir),
+            profile="light",
+            run_dir=str(tmp_path / "runs" / "thin"),
+            chunk_id="K001",
+            chunk_plan=str(tunnel.plan_path),
+            overrides={"max_steps": 10, "max_images": 10},
+        )
+    )
+    assert h.wait(poll_s=0.01) is RunStatus.SUCCEEDED, load_record(h.run_dir).failure_reason
+    rec = load_record(h.run_dir)
+    assert rec.chunk["staged_images"] == 10 < rec.chunk["planned_images"] == 93
+    assert rec.staged["subset"] is True
 
 
 def test_a_chunk_needs_its_plan_and_a_plan_needs_its_chunk(tunnel, tmp_path):
@@ -225,10 +249,14 @@ def test_train_chunks_runs_every_chunk_in_order(tunnel, tmp_path, trainer):
     )
     assert [d["chunk_id"] for d in done] == ["K000", "K001", "K002"]
     assert all(d["status"] == "succeeded" for d in done)
+    scales = []
     for d in done:
         rec = load_record(d["run_dir"])
         assert rec.chunk["chunk_id"] == d["chunk_id"]
         assert rec.chunk["plan_digest"] == tunnel.plan.plan_digest
+        scales.append(rec.chunk["scene_scale"])
+    # each chunk's own scene_scale, recorded and not equalised (AD-9)
+    assert all(s > 0 for s in scales) and len(set(scales)) == 3
 
 
 def test_train_chunks_stops_at_the_first_failure(tunnel, tmp_path, trainer):

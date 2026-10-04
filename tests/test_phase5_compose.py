@@ -219,6 +219,7 @@ def test_the_stitched_volume_is_the_integral_of_owned_sections_only(world, compl
 def test_the_holdout_is_evaluated_and_seams_are_numbers_not_verdicts(world, complete):
     ev = complete.evaluation
     assert ev["holdout"]["ranges_m"] == [list(HOLDOUT)] and ev["holdout"]["diagnostic"] is False
+    assert "volume_accuracy" in ev["protocol"]["claims"] and ev["protocol"]["refusals"] == []
     assert ev["holdout"]["paired_valid_count"] == 4  # 92, 94, 96, 98
     # K000 owns the holdout: its pull toward the axis is what the error measures
     assert ev["holdout"]["mean_signed_error_m2"] < 0
@@ -596,3 +597,88 @@ def test_a_chunk_run_whose_plan_moved_or_vanished_cannot_be_rendered(world, tmp_
     make_run(world.ds, run_dir, run_id="run_unbound", chunk_id="K001")
     with pytest.raises(ContractError, match="without a chunk plan"):
         render_depths(run_dir, world.ds, tmp_path / "d2", renderer=FakeRenderer())
+
+
+# ================================================================ C4 hostile-review fixes
+
+
+def test_a_reference_cut_over_part_of_the_axis_is_refused(world):
+    """S5: on a sub-range grid a core can own no station and the set would still say complete."""
+    sub = build_section_record(
+        world.cloud,
+        world.ref.source,
+        world.ds,
+        world.m,
+        world.cl,
+        **CUT,
+        start_m=0.0,
+        end_m=150.0,
+    )
+    inputs = [
+        ChunkInputs(world.runs[c], _sections(world, c, f"run_{c}", start_m=0.0, end_m=150.0))
+        for c in IDS
+    ]
+    with pytest.raises(ContractError, match="whole-axis grid"):
+        _compose(world, inputs, ref=sub)
+
+
+def test_a_grid_too_coarse_for_a_core_is_a_gap_not_coverage(world):
+    """S5: a whole-axis grid whose interval is longer than a core leaves that core unread."""
+    coarse = {"interval_m": 250.0}
+    ref = build_section_record(
+        world.cloud, world.ref.source, world.ds, world.m, world.cl, **{**CUT, **coarse}
+    )
+    inputs = [ChunkInputs(world.runs[c], _sections(world, c, f"run_{c}", **coarse)) for c in IDS]
+    with pytest.raises(ContractError, match=r"\['K001'\] own no station"):
+        _compose(world, inputs, ref=ref)
+
+
+def test_the_holdout_is_diagnostic_when_the_protocol_refuses_it(world, monkeypatch):
+    """S8: numbers over the holdout are only held out when the dataset protocol says so."""
+    from minegs.eval import protocol
+
+    real = protocol.judge
+
+    def refusing(manifest):
+        j = real(manifest)
+        return j.model_copy(
+            update={
+                "claims": [c for c in j.claims if c is not protocol.Claim.VOLUME_ACCURACY],
+                "refusals": [*j.refusals, "holdout points are in the init"],
+            }
+        )
+
+    monkeypatch.setattr(protocol, "judge", refusing)
+    cs = _compose(world)
+    assert cs.evaluation["holdout"]["diagnostic"] is True
+    assert cs.evaluation["protocol"]["refusals"] == ["holdout points are in the init"]
+    assert any("holdout numbers are diagnostic" in n for n in cs.notes)
+    assert not any("only the holdout evaluation is about held-out" in n for n in cs.notes)
+
+
+def test_chunks_supervised_by_different_depth_artifacts_are_refused(world):
+    sup = {"artifact_sha256": "d" * 64, "path": "/x"}
+    other = _run(world, "run_other_depth", "K001", depth_supervision=sup)
+    with pytest.raises(ContractError, match="depth artifact dddddddddddd"):
+        _compose(world, _inputs(world, K001=(other, world.sections["K001"])))
+    assert _compose(world).depth_supervision_sha256 is None
+
+
+def test_a_seam_narrower_than_float_slack_is_reported_empty_not_refused(world, tmp_path):
+    plan, path = build_chunk_plan(world.ds, 100.02, 4e-10, out_dir=tmp_path / "tiny")
+    assert [c.chunk_id for c in plan.chunks] == list(IDS)
+    inputs = []
+    for c in IDS:
+        name = f"run_tiny_{c}"
+        run = _run(world, name, c, chunk=_binding(plan, path, c))
+        inputs.append(ChunkInputs(run, _sections(world, c, name)))
+    cs = _compose(world, inputs, plan=path)
+    assert cs.complete and all(s["n_paired_sections"] is None for s in cs.seams)
+
+
+def test_a_chunk_the_profile_thinned_is_named_in_the_notes(world):
+    b = {**_binding(world.plan, world.plan_path, "K001"), "staged_images": 10, "planned_images": 93}
+    thin = _run(world, "run_thin", "K001", chunk=b)
+    cs = _compose(world, _inputs(world, K001=(thin, _sections(world, "K001", "run_thin"))))
+    assert any("K001 (10/93)" in n for n in cs.notes)
+    assert not any("max_images" in n for n in _compose(world).notes)

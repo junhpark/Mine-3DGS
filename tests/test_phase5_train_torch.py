@@ -18,7 +18,12 @@ torch = pytest.importorskip("torch", reason="the adapter executes torch code")
 from minegs.chunks.plan import build_chunk_plan  # noqa: E402
 from minegs.train.runner import RunConfig, get_runner  # noqa: E402
 from minegs.train.runner import local as runner_local  # noqa: E402
-from minegs.train.runner.base import RunnerConfig, RunStatus, load_record  # noqa: E402
+from minegs.train.runner.base import (  # noqa: E402
+    RunnerConfig,
+    RunStatus,
+    load_record,
+    staged_scene_scale,
+)
 from minegs.train.supervision.build import build_tls_projection  # noqa: E402
 
 from phase5_scene import CORE_M, OVERLAP_M, long_tunnel  # noqa: E402
@@ -59,5 +64,9 @@ def test_a_heavy_chunk_trains_with_the_global_depth_artifact(tmp_path, upstream)
     assert 0 < trainer["images_with_samples"] <= len(chunk.images)
     assert rec.chunk["depth_images_with_samples"] == len(sup.images_with_samples(chunk.images))
     assert rec.chunk["depth_samples_for_images"] < sup.record.n_samples_in_loss
-    # scene_scale is the chunk's own, recorded and not compensated
+    # scene_scale is the chunk's own, recorded and not compensated; the adapter's value is the
+    # same number the host port derives for an upstream-direct chunk run
     assert rec.chunk["scene_scale"] and rec.chunk["scene_scale"] > 0
+    assert rec.chunk["scene_scale_source"] == "adapter"
+    host = staged_scene_scale(Path(h.run_dir) / "staged", 1.0)
+    assert rec.chunk["scene_scale"] == pytest.approx(host, rel=1e-6)

@@ -157,6 +157,9 @@ class LocalRunner(Runner):
             chunk.update(
                 {k: v for k, v in ev.items() if k.startswith("init_points_")},
                 staged_images=len(staged.images),
+                # A profile's max_images thins the plan's (atomic) selection evenly; recorded so
+                # a chunk that trained on part of its groups says so.
+                planned_images=len(chunk.get("images") or []),
             )
             if verified is not None:
                 used = verified.images_with_samples(list(staged.images))

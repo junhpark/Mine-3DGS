@@ -754,6 +754,20 @@ def staged_metric_scale(staged_dir: Path) -> float:
     return metric_scale_from_cameras(c2w, similarity_from_cameras)
 
 
+def staged_scene_scale(staged_dir: Path, global_scale: float) -> float:
+    """``scene_scale`` upstream derives from the staged cameras (host-side port).
+
+    gsplat 1.5.3: ``Parser.scene_scale`` is the largest distance of a camera centre from their
+    mean over every parsed image, and the runner multiplies it by ``1.1 * global_scale``.
+    ``normalize_world_space`` is refused, so the centres are the staged ``LOCAL_METRIC`` ones.
+    """
+    from minegs.ingest.common import colmap_io
+
+    model = colmap_io.read_model(Path(staged_dir) / "sparse" / "0")
+    c = np.stack([im.world_from_cam.matrix()[:3, 3] for im in model.images.values()])
+    return float(np.max(np.linalg.norm(c - c.mean(axis=0), axis=1)) * 1.1 * global_scale)
+
+
 def check_trainer_evidence(
     record: RunRecord, evidence: Any, staged_dir: Path, n_final: int
 ) -> None:
@@ -827,18 +841,27 @@ def check_trainer_evidence(
             )
     elif adapter is not None:
         raise ContractError("adapter evidence appeared in a run that did not use the adapter")
-    if record.chunk is not None:
-        # Upstream derives scene_scale (the depth term's scale, and MCMC's) from the staged
-        # cameras, so it differs chunk to chunk. Recorded, not compensated (Phase 5 AD-9);
-        # only the adapter reports it, so an upstream-direct run records None.
-        record.chunk = {
-            **record.chunk,
-            "scene_scale": None if adapter is None else adapter.get("scene_scale"),
-        }
     else:
         n = int((record.staged or {}).get("n_images") or 0)
         te = int(expected.get("test_every") or 8)
         record.optimised_images = n - (-(-n // te)) if n else None
+    if record.chunk is not None:
+        # Upstream derives scene_scale (learning rates, densification thresholds, the depth
+        # term, MCMC's noise) from the staged cameras, so it differs chunk to chunk. Recorded,
+        # not compensated (Phase 5 AD-9): the adapter's own value when it ran, otherwise
+        # upstream's formula applied to the cameras this run staged.
+        if adapter is not None:
+            scale, source = adapter.get("scene_scale"), "adapter"
+        else:
+            global_scale = _cfg_value(cfg, "global_scale")
+            if global_scale is _MISSING or isinstance(global_scale, bool):
+                raise ContractError(
+                    "the trainer's cfg.yml has no global_scale, so this chunk's scene_scale "
+                    "cannot be stated"
+                )
+            scale = staged_scene_scale(staged_dir, float(global_scale))
+            source = "host_from_staged_cameras"
+        record.chunk = {**record.chunk, "scene_scale": scale, "scene_scale_source": source}
 
     # ---- depth supervision actually acted, on the artifact this run recorded
     sup = record.depth_supervision

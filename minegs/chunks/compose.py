@@ -70,6 +70,8 @@ class ChunkRunSet(VersionedModel):
     dataset_id: str
     dataset_hash: str
     profile: dict[str, Any]
+    #: sha256 of the one depth-supervision artifact every chunk run used (None: no depth).
+    depth_supervision_sha256: str | None = None
     frame: str = "LOCAL_METRIC"
     chunks: list[ChunkEntry]
     complete: bool
@@ -197,6 +199,13 @@ def stitch_sections(plan, sections: dict[str, Any], reference) -> tuple[Any, dic
     got = np.array([x.chainage_m for x in out], dtype=np.float64)
     if len(got) > 1 and not np.all(np.diff(got) > 0):
         raise _refuse("stitched chainages are not strictly increasing")
+    empty = [cid for cid, n in counts.items() if n == 0]
+    if empty:
+        raise _refuse(
+            f"chunk cores {empty} own no station of this grid ({len(stations)} stations, "
+            f"interval {ref_series.interval_m:g} m): a core with nothing to read is a gap in the "
+            "stitched series, not a covered stretch"
+        )
     series = SectionSeries(
         frame=ref_series.frame,
         interval_m=ref_series.interval_m,
@@ -226,9 +235,9 @@ def compose_chunk_set(
     ranges: list[tuple[float, float]] | None = None,
     allow_incomplete: bool = False,
 ) -> ChunkRunSet:
-    from minegs.chunks.plan import verify_chunk_plan
+    from minegs.chunks.plan import EPS_M, verify_chunk_plan
     from minegs.eval.geometry.evaluate import load_dataset_and_centerline
-    from minegs.eval.protocol import judge
+    from minegs.eval.protocol import Claim, judge
     from minegs.eval.sections.models import check_section_record
     from minegs.eval.volume.coverage import merge_intervals
     from minegs.eval.volume.paired import compare_to_reference, require_same_grid
@@ -252,6 +261,14 @@ def compose_chunk_set(
             f"the reference was cut from a {reference.source.kind}, not a scanned cloud; a "
             "reconstruction measured against a reconstruction has no error to report"
         )
+    whole = centerline.stations(float(reference.series.interval_m), None, None)
+    cut = np.sort(np.asarray(reference.series.chainages(), dtype=np.float64))
+    if len(cut) != len(whole) or (len(cut) and float(np.max(np.abs(cut - whole))) > EPS_M):
+        raise _refuse(
+            f"the reference sections cover {len(cut)} of the axis's {len(whole)} stations at "
+            f"{reference.series.interval_m:g} m; chunk sections are composed on the whole-axis "
+            "grid (no start/end), or part of a core would silently fall outside it"
+        )
 
     # ---- each chunk: its run, of this plan, with its own sections on the reference grid
     entries = {
@@ -265,6 +282,7 @@ def compose_chunk_set(
     }
     present: dict[str, tuple[Any, Any]] = {}
     profile = None
+    depth: tuple[str | None] | None = None
     run_ids: set[str] = set()
     for item in inputs:
         rec = load_record(item.run_dir)
@@ -299,6 +317,14 @@ def compose_chunk_set(
             raise _refuse(
                 f"run {rec.run_id} trained with profile {rec.profile.get('name')!r} settings "
                 f"different from the others ({profile.get('name')!r}); one set is one experiment"
+            )
+        sup = ((rec.depth_supervision or {}).get("artifact_sha256"),)
+        if depth is None:
+            depth = sup
+        elif sup != depth:
+            raise _refuse(
+                f"run {rec.run_id} was supervised by depth artifact {str(sup[0])[:12]}, the others "
+                f"by {str(depth[0])[:12]}; one set is one experiment"
             )
         entry = entries[rec.chunk_id]
         entry.run_id = rec.run_id
@@ -364,8 +390,20 @@ def compose_chunk_set(
 
     # ---- evaluation, every number from compare_to_reference
     notes: list[str] = []
-    holdout = sorted(tuple(r) for r in judge(manifest).holdout_ranges_m)
-    evaluation: dict[str, Any] = {"holdout": None, "extent": None, "per_chunk": {}}
+    j = judge(manifest)
+    held_out = j.allows(Claim.VOLUME_ACCURACY)
+    holdout = sorted(tuple(r) for r in j.holdout_ranges_m)
+    evaluation: dict[str, Any] = {
+        "protocol": {
+            "claims": [c.value for c in j.claims],
+            "protocols": [p.value for p in j.protocols],
+            "refusals": list(j.refusals),
+            "holdout_ranges_m": [list(r) for r in holdout],
+        },
+        "holdout": None,
+        "extent": None,
+        "per_chunk": {},
+    }
     if ranges is not None:
         notes.append(
             "explicit evaluation ranges were given: the stitched result over them is "
@@ -377,9 +415,15 @@ def compose_chunk_set(
             **_paired_summary(compare_to_reference(stitched, reference, list(ranges))),
         }
     elif holdout:
+        if not held_out:
+            notes.append(
+                "the dataset protocol does not allow a held-out volume claim here ("
+                + "; ".join(j.refusals)
+                + "): the holdout numbers are diagnostic"
+            )
         evaluation["holdout"] = {
             "ranges_m": [list(r) for r in holdout],
-            "diagnostic": False,
+            "diagnostic": not held_out,
             **_paired_summary(compare_to_reference(stitched, reference, holdout)),
         }
     else:
@@ -398,9 +442,14 @@ def compose_chunk_set(
         }
     notes.append(
         "extent and per-chunk evaluations include geometry the runs trained on (the init and "
-        "depth come from the same survey); only the holdout evaluation is about held-out "
-        "geometry. Per-chunk evaluations each include their closed core end, so their sums are "
-        "not the stitched totals."
+        "depth come from the same survey)"
+        + (
+            "; only the holdout evaluation is about held-out geometry"
+            if held_out and ranges is None and holdout
+            else ""
+        )
+        + ". Per-chunk evaluations each include their closed core end, so their sums are not "
+        "the stitched totals."
     )
 
     # ---- seams: adjacent chunks over their shared support (agreement, not accuracy)
@@ -417,7 +466,7 @@ def compose_chunk_set(
             "p95_abs_area_difference_m2": None,
             "mean_signed_area_difference_m2": None,
         }
-        if a.chunk_id in present and b.chunk_id in present and hi - lo > 0:
+        if a.chunk_id in present and b.chunk_id in present and hi - lo > EPS_M:
             p = compare_to_reference(present[b.chunk_id][1], present[a.chunk_id][1], [(lo, hi)])
             seam.update(
                 n_paired_sections=p.sections.paired_valid_count,
@@ -430,6 +479,21 @@ def compose_chunk_set(
         "seams compare two reconstructions with each other (right minus left over the shared "
         "support): agreement between chunks, not accuracy against the reference"
     )
+
+    thinned = [
+        f"{e.chunk_id} ({e.run_chunk['staged_images']}/{e.run_chunk['planned_images']})"
+        for e in entries.values()
+        if e.run_chunk
+        and isinstance(e.run_chunk.get("staged_images"), int)
+        and isinstance(e.run_chunk.get("planned_images"), int)
+        and e.run_chunk["staged_images"] < e.run_chunk["planned_images"]
+    ]
+    if thinned:
+        notes.append(
+            f"the profile's max_images staged an evenly spaced subset of the planned images of "
+            f"{', '.join(thinned)}: those chunks did not train on every member of the capture "
+            "groups the plan selected"
+        )
 
     real = not missing and all(e.real_gpu for e in entries.values())
     if not real:
@@ -445,6 +509,7 @@ def compose_chunk_set(
         dataset_id=manifest.dataset_id,
         dataset_hash=dataset_hash,
         profile=profile,
+        depth_supervision_sha256=depth[0] if depth else None,
         chunks=[entries[c.chunk_id] for c in plan.chunks],
         complete=not missing,
         requested_core_length_m=float(requested),
