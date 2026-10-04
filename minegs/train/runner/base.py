@@ -269,6 +269,7 @@ class Runner(ABC):
 
             plan = verify_chunk_plan(dataset_dir, run.chunk_plan, manifest=manifest)
             chunk = plan.chunk(run.chunk_id)
+            require_whole_chunk(chunk, profile.max_images)
             self._chunk = (plan, chunk)
             chunk_binding = {
                 "plan_id": plan.plan_id,
@@ -752,6 +753,21 @@ def staged_metric_scale(staged_dir: Path) -> float:
     by_name = model.image_by_name()
     c2w = np.stack([by_name[n].world_from_cam.matrix() for n in names])
     return metric_scale_from_cameras(c2w, similarity_from_cameras)
+
+
+def require_whole_chunk(chunk, max_images: int | None) -> None:
+    """A chunk trains on every image of its capture groups, or not at all (Phase 5 §5.3).
+
+    The plan selects groups atomically; a profile's ``max_images`` thins image by image, which
+    would leave part of a 360 ring or of a video segment. Refused rather than thinned.
+    """
+    if max_images is not None and max_images < len(chunk.images):
+        raise ContractError(
+            f"chunk {chunk.chunk_id} plans {len(chunk.images)} training images in "
+            f"{len(chunk.capture_groups)} capture groups, but the profile caps max_images at "
+            f"{max_images}; thinning image by image would split capture groups. Train the chunk "
+            "with max_images: null (or at least the planned count), or plan smaller chunks"
+        )
 
 
 def staged_scene_scale(staged_dir: Path, global_scale: float) -> float:

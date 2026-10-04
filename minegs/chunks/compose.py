@@ -83,7 +83,10 @@ class ChunkRunSet(VersionedModel):
     stitched: dict[str, Any] = Field(default_factory=dict)
     evaluation: dict[str, Any] = Field(default_factory=dict)
     seams: list[dict[str, Any]] = Field(default_factory=list)
-    real_execution: bool = False
+    #: Every chunk's *training* ran on a GPU with the pinned upstream (``real_gpu_evidence``).
+    #: Says nothing about the renderer, depth or surfaces behind the sections: a whole-pipeline
+    #: ``real_execution`` is not derived here (Phase 5 B3).
+    real_gpu_execution: bool = False
     g3_status: str = "PENDING"
     maturity_statement: str = MATURITY
     notes: list[str] = Field(default_factory=list)
@@ -480,22 +483,11 @@ def compose_chunk_set(
         "support): agreement between chunks, not accuracy against the reference"
     )
 
-    thinned = [
-        f"{e.chunk_id} ({e.run_chunk['staged_images']}/{e.run_chunk['planned_images']})"
-        for e in entries.values()
-        if e.run_chunk
-        and isinstance(e.run_chunk.get("staged_images"), int)
-        and isinstance(e.run_chunk.get("planned_images"), int)
-        and e.run_chunk["staged_images"] < e.run_chunk["planned_images"]
-    ]
-    if thinned:
-        notes.append(
-            f"the profile's max_images staged an evenly spaced subset of the planned images of "
-            f"{', '.join(thinned)}: those chunks did not train on every member of the capture "
-            "groups the plan selected"
-        )
-
     real = not missing and all(e.real_gpu for e in entries.values())
+    notes.append(
+        "real_gpu_execution is about chunk training only: whether the renderer, depth and "
+        "surfaces behind the sections ran for real is not derived by this set"
+    )
     if not real:
         notes.append(
             "not every chunk run recorded a GPU running the pinned upstream (or a chunk is "
@@ -525,7 +517,7 @@ def compose_chunk_set(
         },
         evaluation=json.loads(json.dumps(evaluation)),
         seams=seams,
-        real_execution=real,
+        real_gpu_execution=real,
         notes=notes,
         provenance=stamp(
             {"plan_id": plan.plan_id, "chunk_set_id": chunk_set_id},

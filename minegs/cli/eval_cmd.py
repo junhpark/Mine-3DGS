@@ -915,7 +915,7 @@ def chunk_set_cmd(
                 f"n={seam['n_paired_sections']} "
                 f"median |dA|={seam['median_abs_area_difference_m2']}"
             )
-        console.print(f"  real_execution={cs.real_execution}  G3: {cs.g3_status}")
+        console.print(f"  real_gpu_execution={cs.real_gpu_execution}  G3: {cs.g3_status}")
         for n in cs.notes:
             console.print(f"  [yellow]{n}[/]")
         console.print(f"[bold]{cs.maturity_statement}[/]")

@@ -241,7 +241,7 @@ def test_the_holdout_is_evaluated_and_seams_are_numbers_not_verdicts(world, comp
     for verdict in ('"pass"', '"passed"', '"PASS"', "seam_free", "seam-free"):
         assert verdict not in text
     assert not any(k in s for s in complete.seams for k in ("pass", "ok", "verdict"))
-    assert complete.real_execution is False and complete.g3_status == "PENDING"
+    assert complete.real_gpu_execution is False and complete.g3_status == "PENDING"
     assert any("agreement between chunks, not accuracy" in n for n in complete.notes)
 
 
@@ -284,7 +284,7 @@ def test_a_missing_chunk_is_refused_and_reported_as_missing_only_when_asked(worl
     assert len(k2_owned) == 51 and all(got[s] is None for s in k2_owned)
     unobserved = sum(a is None for a in got.values())
     assert cs.evaluation["extent"]["missing_prediction_count"] == unobserved >= 51
-    assert cs.real_execution is False
+    assert cs.real_gpu_execution is False
 
 
 def test_a_failed_chunk_run_is_refused_and_never_composed(world):
@@ -676,9 +676,18 @@ def test_a_seam_narrower_than_float_slack_is_reported_empty_not_refused(world, t
     assert cs.complete and all(s["n_paired_sections"] is None for s in cs.seams)
 
 
-def test_a_chunk_the_profile_thinned_is_named_in_the_notes(world):
-    b = {**_binding(world.plan, world.plan_path, "K001"), "staged_images": 10, "planned_images": 93}
-    thin = _run(world, "run_thin", "K001", chunk=b)
-    cs = _compose(world, _inputs(world, K001=(thin, _sections(world, "K001", "run_thin"))))
-    assert any("K001 (10/93)" in n for n in cs.notes)
-    assert not any("max_images" in n for n in _compose(world).notes)
+def test_the_gpu_flag_is_about_training_and_says_so(world):
+    """B3: GPU training evidence alone is not a real pipeline; the flag says only what it means."""
+    from test_phase4_compare import _gpu_runtime
+
+    inputs = []
+    for c in IDS:
+        name = f"run_gpu_{c}"
+        run = _run(world, name, c, runtime=_gpu_runtime())
+        inputs.append(ChunkInputs(run, _sections(world, c, name)))
+    cs = _compose(world, inputs)
+    # the sections came from a substituted renderer; nothing here claims they did not
+    assert cs.real_gpu_execution is True
+    assert "real_execution" not in ChunkRunSet.model_fields
+    assert any("chunk training only" in n for n in cs.notes)
+    assert cs.g3_status == "PENDING"

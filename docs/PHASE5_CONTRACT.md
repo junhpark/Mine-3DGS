@@ -152,7 +152,7 @@ evaluation: {holdout (선언된 holdout 위 stitched vs reference), extent (전�
              per_chunk (각 chunk core vs reference, diagnostic)},
 seams: [{left, right, overlap_m: [lo, hi], n_paired_sections, median_abs_area_difference_m2,
          p95_abs_area_difference_m2, mean_signed_area_difference_m2}],
-real_execution, g3_status: "PENDING", maturity_statement, notes, provenance
+real_gpu_execution (§12.7 B3 — 원래 real_execution), g3_status: "PENDING", maturity_statement, notes, provenance
 ```
 
 * 입력: plan, chunk 마다 (run 디렉터리, 그 run 의 surface 에서 전체 축 grid 로 자른 section), 스캔
@@ -259,12 +259,14 @@ Phase 3 G2:                         PENDING
 * **scene_scale (AD-9).** adapter 가 돌았으면 adapter 의 값, 아니면 (light 처럼 upstream 직접 실행) upstream
   공식 (`1.1 × global_scale × max‖c_i − mean c‖`, staged 카메라) 의 host port (`staged_scene_scale`). 출처를
   `scene_scale_source` 로 남긴다. torch 테스트가 두 값이 같음을 확인한다.
-* **profile 의 `max_images`.** plan 의 선택은 atomic 이지만 profile 의 균등 subsample (light: 100) 은 그
-  뒤에 적용된다 — 단일 run 과 같은 의미다. chunk evidence 에 `planned_images` 와 `staged_images` 를 남기고,
-  `ChunkRunSet` 은 솎인 chunk 를 notes 에 이름으로 적는다. 전체 그룹으로 학습하려면 `max_images: null`
-  (heavy 계열의 기본) 을 쓴다.
+* **profile 의 `max_images`.** chunk 는 계획된 이미지 전부로 학습하거나 학습하지 않는다. profile 의
+  `max_images` 가 계획된 이미지 수보다 작으면 prepare (run 디렉터리 생성 전) 와 staging 양쪽에서 거부한다
+  (§12.7 B1; 처음 구현은 이미지 단위로 솎고 notes 에 적기만 했다). chunk evidence 의 `planned_images` 와
+  `staged_images` 는 항상 같다.
 * **§7 이름.** `chunks[].trainer` 대신 `chunks[].run_chunk` (run 의 chunk binding 에서 이미지·그룹 목록을
   뺀 것: init/depth 선택 수, `scene_scale`, `planned_images`/`staged_images`).
+* **init frame.** chunk 의 init 은 chainage 로 잘리므로 `init_points.ply` 가 `LOCAL_METRIC` 을 선언해야 한다
+  (`UNKNOWN` 거부, §12.7 B2). 단일 run staging 의 `UNKNOWN` 허용은 그대로다.
 * **seam.** 공유 support 가 float slack (1e-9 m) 이하이면 비교하지 않고 수치를 비운다 (거부하지 않는다).
 
 ### 12.3 negative test 대응 (지시서 §36–§40)
@@ -293,8 +295,9 @@ S5 artifact 혼합 없음, S6 depth leakage 우회 없음, S7 단일 run 경로 
 기각된 6 개 중 둘은 진술 위반은 아니지만 범위 안이라 보강했다: chunk 마다 다른 depth artifact (S5/S6 로 두
 번 보고 — 이제 거부, `test_chunks_supervised_by_different_depth_artifacts_are_refused`), 1e-9 m 이하 overlap 의
 seam 이 set 전체를 거부 (이제 빈 수치, `test_a_seam_narrower_than_float_slack_…`). `max_images` 가 chunk 안에서
-그룹을 솎는 것 (S2/S5 로 두 번 보고) 은 split 을 넓히지 않고 다른 chunk 이미지를 넣지도 않아 기각됐으나,
-솎였다는 사실을 기록·보고하게 했다 (§12.2). 나머지 하나는 F1 의 중복 (S5 로 보고).
+그룹을 솎는 것 (S2/S5 로 두 번 보고) 은 split 을 넓히지 않는다는 이유로 기각됐고 기록·보고만 하게 했으나,
+독립 리뷰가 이것을 group atomicity 위반으로 판정해 거부로 바꿨다 (§12.7 B1). 나머지 하나는 F1 의 중복
+(S5 로 보고).
 
 ### 12.5 검증
 
@@ -314,7 +317,9 @@ C4 에서 한 번 (head `d315475`):
 ### 12.6 한계와 미룬 것
 
 * real GPU chunk 학습·렌더 없음 — trainer 는 stand-in (CPU torch stand-in upstream 포함), renderer 는
-  대체. `real_execution` 은 모든 chunk 가 `real_gpu_evidence` 를 가질 때만 true 이고 테스트에서는 항상 false.
+  대체. `real_gpu_execution` 은 모든 chunk 의 **학습**이 `real_gpu_evidence` 를 가질 때만 true 이고, renderer·
+  depth·surface 의 실제 실행 여부는 담지 않는다 (§12.7 B3). 전체 파이프라인의 `real_execution` 은 이 set 이
+  도출하지 않는다.
 * 실제 장거리 갱도 dataset 없음. 최적 chunk 크기는 결정하지 않았다 (사용자 매개변수).
 * `run.chunk.plan_path` 는 절대 경로다. dataset 을 옮기면 chunk run 의 render/surface 재도출이 거부된다
   (fail-closed; 재배치 지원은 Phase 6 의 artifact 동기화와 함께).
@@ -322,3 +327,11 @@ C4 에서 한 번 (head `d315475`):
   `surface-depth` / `sections` (chunk 마다) → `eval chunk-set` 이다.
 * depth renderer 가 학습 해상도가 아니라 full 해상도로 렌더하는 문제 (Phase 4 계약 §2.3-13) 는 그대로다.
 * 범위 밖 그대로: Gaussian 병합, chunk ICP, 자동 chunk 크기, VRAM scheduler, retry/resume, RunPod, 분산.
+
+### 12.7 독립 리뷰 (PR #17) — BLOCKING 3 건
+
+| # | 지적 | 수정 | 회귀 테스트 |
+|---|---|---|---|
+| B1 | staging 이 plan 의 atomic group 선택 뒤 `max_images` 로 이미지 단위 thinning — 360 ring 일부 crop 만 남을 수 있고, 테스트가 이를 성공으로 고정 | `require_whole_chunk`: `max_images < len(chunk.images)` 면 prepare (run 디렉터리 전) 와 staging 에서 `ContractError`; runner 는 staged == planned 를 요구; thinning note 와 그 테스트 제거 | `test_a_profile_that_would_split_capture_groups_is_refused` (multi-image group 확인, run 디렉터리 없음, staging 단독 거부, 계획 수 이상이면 전부 staged) |
+| B2 | init PLY 의 frame 이 `UNKNOWN` 이어도 LOCAL_METRIC 축에 투영해 chunk init 을 선택 | chunk 경로에서만 `LOCAL_METRIC` 강제; 단일 run 은 불변 | `test_a_chunk_init_of_unknown_frame_is_refused` (단일 run 은 여전히 통과) |
+| B3 | `ChunkRunSet.real_execution` 이 학습 GPU 증거만 보고 true — sections 뒤의 renderer 는 대체 (`StandInRenderer`) 일 수 있다 | `real_gpu_execution` 으로 이름을 바꿔 학습만 말하게 하고, notes 에 renderer·depth·surface 는 도출하지 않음을 명시; 전체 파이프라인 `real_execution` 은 만들지 않는다 | `test_the_gpu_flag_is_about_training_and_says_so` |

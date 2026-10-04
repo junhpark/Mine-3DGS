@@ -225,6 +225,9 @@ def stage_dataset(
                 f"chunk {chunk.chunk_id}: its images are not the training members of its groups "
                 f"{chunk.capture_groups}; a group is staged whole or not at all"
             )
+        from minegs.train.runner.base import require_whole_chunk
+
+        require_whole_chunk(chunk, max_images)
         train = [n for n in train if n in planned]
         chunk_evidence = {"chunk_id": chunk.chunk_id, "images": sorted(planned)}
     missing = [n for n in train if n not in by_name]
@@ -271,6 +274,14 @@ def stage_dataset(
         if pc.frame not in ("LOCAL_METRIC", "UNKNOWN"):
             raise ContractError(f"init_points.ply must be LOCAL_METRIC, got {pc.frame}")
         if chunk is not None:
+            # Chunking cuts the init by where the points are, so where they are must be known:
+            # an UNKNOWN-frame PLY projected onto the LOCAL_METRIC axis would select by accident.
+            if pc.frame != "LOCAL_METRIC":
+                raise ContractError(
+                    f"{manifest.initialization.file} declares frame {pc.frame}; a chunk's init is "
+                    "selected by chainage on the LOCAL_METRIC axis, so the init must say it is "
+                    "LOCAL_METRIC"
+                )
             pc = _chunk_init(dataset_dir, manifest, pc, chunk, chunk_evidence)
         pc = pc.subsample(MAX_INIT_POINTS)
         rgb = pc.rgb if pc.rgb is not None else np.full((len(pc), 3), 128, np.uint8)

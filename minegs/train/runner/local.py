@@ -152,13 +152,14 @@ class LocalRunner(Runner):
                     f"staged chunk {ev.get('chunk_id')} is not the run's chunk "
                     f"{chunk.get('chunk_id')}"
                 )
-            if not set(staged.images) <= set(chunk.get("images") or []):
-                raise ContractError("staged images are not the chunk's planned images")
+            if sorted(staged.images) != sorted(chunk.get("images") or []):
+                raise ContractError(
+                    "staged images are not exactly the chunk's planned images; capture groups "
+                    "are trained whole (Phase 5 §5.3)"
+                )
             chunk.update(
                 {k: v for k, v in ev.items() if k.startswith("init_points_")},
                 staged_images=len(staged.images),
-                # A profile's max_images thins the plan's (atomic) selection evenly; recorded so
-                # a chunk that trained on part of its groups says so.
                 planned_images=len(chunk.get("images") or []),
             )
             if verified is not None:

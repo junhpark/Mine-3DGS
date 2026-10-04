@@ -111,21 +111,58 @@ def test_a_chunk_run_is_bound_to_its_plan_and_stays_in_the_dataset_frame(tunnel,
     assert rec.chunk["staged_images"] == rec.chunk["planned_images"] == len(c.images)
 
 
-def test_a_profile_that_thins_a_chunk_says_so(tunnel, tmp_path, trainer):
-    h = _runner().submit(
+def test_a_profile_that_would_split_capture_groups_is_refused(tunnel, tmp_path):
+    """B1: max_images thins image by image; a chunk is trained with its groups whole or not."""
+    c = tunnel.plan.chunk("K001")
+    m = tunnel.manifest
+    # K001's groups are multi-image: six-crop 360 rings and the video segment
+    assert any(len(m.capture_groups[g].members) > 1 for g in c.capture_groups)
+    run_dir = tmp_path / "runs" / "thin"
+    with pytest.raises(ContractError, match="would split capture groups"):
+        _runner().submit(
+            RunConfig(
+                dataset_dir=str(tunnel.dataset_dir),
+                profile="light",
+                run_dir=str(run_dir),
+                chunk_id="K001",
+                chunk_plan=str(tunnel.plan_path),
+                overrides={"max_steps": 10, "max_images": 10},
+            )
+        )
+    assert not run_dir.exists()
+    # light's own cap (100) is above K001's 93 planned images, so it trains whole
+    _runner().prepare(
         RunConfig(
             dataset_dir=str(tunnel.dataset_dir),
             profile="light",
-            run_dir=str(tmp_path / "runs" / "thin"),
+            run_dir=str(tmp_path / "runs" / "whole"),
             chunk_id="K001",
             chunk_plan=str(tunnel.plan_path),
-            overrides={"max_steps": 10, "max_images": 10},
         )
     )
-    assert h.wait(poll_s=0.01) is RunStatus.SUCCEEDED, load_record(h.run_dir).failure_reason
-    rec = load_record(h.run_dir)
-    assert rec.chunk["staged_images"] == 10 < rec.chunk["planned_images"] == 93
-    assert rec.staged["subset"] is True
+    # and staging refuses on its own, not only behind prepare
+    with pytest.raises(ContractError, match="would split capture groups"):
+        stage_dataset(tunnel.dataset_dir, tmp_path / "s", m, max_images=len(c.images) - 1, chunk=c)
+    st = stage_dataset(tunnel.dataset_dir, tmp_path / "s2", m, max_images=len(c.images), chunk=c)
+    assert sorted(st.images) == c.images
+
+
+def test_a_chunk_init_of_unknown_frame_is_refused(tunnel, tmp_path):
+    """B2: chunking selects the init by position, so its frame must be LOCAL_METRIC."""
+    from minegs.core.pointcloud import write_ply
+
+    ds = tmp_path / "ds"
+    shutil.copytree(tunnel.dataset_dir, ds)
+    m = Manifest.load_dataset(ds)
+    init = read_ply(ds / m.initialization.file)
+    init.frame = "UNKNOWN"
+    write_ply(init, ds / m.initialization.file)
+    assert read_ply(ds / m.initialization.file).frame == "UNKNOWN"
+    with pytest.raises(ContractError, match="declares frame UNKNOWN"):
+        stage_dataset(ds, tmp_path / "s", m, chunk=tunnel.plan.chunk("K000"))
+    # the single-run path keeps its existing tolerance for an unlabelled init
+    st = stage_dataset(ds, tmp_path / "s2", m, max_images=None)
+    assert st.init_points > 0
 
 
 def test_a_chunk_needs_its_plan_and_a_plan_needs_its_chunk(tunnel, tmp_path):

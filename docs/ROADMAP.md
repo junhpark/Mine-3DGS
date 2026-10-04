@@ -974,6 +974,8 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | gap·중복 소유·support ⊉ core·digest 불일치 plan, plan 생성 뒤 dataset·centerline 변경 | `ContractError` (exit 2) | plan verifier 가 재도출로 확인 (Phase 5 §5.2) | 해당 없음 (설계) |
 | plan 없는 `--chunk`, `--chunk` 없는 `--chunk-plan`, plan 에 없는 chunk, legacy `manifest.chunks` 로 학습 | `ContractError` (exit 2) | chunk 는 검증된 plan 에서만 학습한다 (Phase 5 AD-1) | 해당 없음 (설계) |
 | `dataset chunks --write` | `ContractError` (exit 2) | manifest 를 바꿔 dataset identity 가 바뀐다 | 해당 없음 (설계) |
+| chunk 의 계획된 이미지보다 작은 `max_images` (capture group 을 이미지 단위로 솎게 됨) | `ContractError` (exit 2, run 디렉터리 생성 전) | capture group 은 atomic (Phase 5 §5.3, 리뷰 B1) | 해당 없음 (설계) — `max_images: null` 또는 더 작은 chunk |
+| frame 이 `LOCAL_METRIC` 이 아닌 (`UNKNOWN` 포함) `init_points.ply` 로 chunk staging | `ContractError` (exit 2) | chunk init 은 위치(chainage)로 선택된다 (리뷰 B2) | 해당 없음 (설계) |
 | depth profile chunk 인데 chunk 이미지에 depth 샘플 없음 | `ContractError` (exit 2, 학습 전) | 증거 없는 depth run 금지 | 해당 없음 (설계) |
 | 다른 dataset·plan·profile·chunk binding 의 run, 중복·누락 chunk, FAILED chunk run, 비 metric run, 다른 grid·그 run 이 아닌 section·스캔이 아닌 reference 로 `eval chunk-set` | `ContractError` (exit 2) — 누락·FAILED 는 `--allow-incomplete` 일 때만 incomplete set 으로 보고 | 하나의 실험만 합성한다 (Phase 5 §7) | 해당 없음 (설계) |
 | chunk binding 이 다른 두 run 의 `compare-runs` | `ContractError` (exit 2) | 갱도의 다른 부분을 비교하게 된다 | 해당 없음 (설계) |

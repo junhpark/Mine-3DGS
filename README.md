@@ -267,7 +267,7 @@ minegs eval chunk-set data/<id>/dataset --chunk-plan .. --run runs/<plan_id>/K00
 쪼개지 않고, test·holdout 제외 이미지는 되살아나지 않는다). init 은 기존 support locator 로, depth 는
 전역 artifact 그대로 쓴다. 합성은 각 station 을 소유 chunk 하나에서만 읽으므로 overlap 이 두 번 적분되지
 않고, 누락 chunk 는 0 이 아니라 누락으로 보고된다. seam 수치는 두 복원의 일치도이지 정확도가 아니다.
-Gaussian 병합·chunk ICP·자동 chunk 크기는 범위 밖이고, **실제 GPU chunk 학습은 아직 수행되지 않았다**.
+chunk 는 계획된 이미지 전부로 학습한다 — profile 의 `max_images` 가 그보다 작으면 거부한다 (light 의 100 을 넘는 chunk 는 `max_images: null` 로). Gaussian 병합·chunk ICP·자동 chunk 크기는 범위 밖이고, **실제 GPU chunk 학습은 아직 수행되지 않았다**. `ChunkRunSet.real_gpu_execution` 은 chunk **학습**의 GPU 증거만 말한다.
 
 프로파일은 backend 플래그가 아니라 **capability** 를 요청한다 (`requests: {antialiasing: true, ...}`).
 백엔드가 그 capability 를 *제공할 수 없으면* 이유와 함께 거부한다 (`capability_notes`).
