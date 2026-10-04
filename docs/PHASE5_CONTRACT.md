@@ -298,7 +298,18 @@ seam 이 set 전체를 거부 (이제 빈 수치, `test_a_seam_narrower_than_flo
 
 ### 12.5 검증
 
-TEST_COUNT_PLACEHOLDER
+C4 에서 한 번 (head `d315475`):
+
+| 검사 | 결과 |
+|---|---|
+| `ruff check .` | 통과 (exit 0) |
+| `ruff format --check .` | 178 파일 통과 (exit 0) |
+| `pytest` (torch 없는 환경) | **904 passed**, torch 모듈 2 개 skip (base 828 → +76: plan 30, train 12, compose 33, Phase 4 trainer 회귀 1) |
+| torch 테스트 (CPU torch, numpy 1 환경) | **16 passed** (base 15 → +1: `test_phase5_train_torch.py`) |
+| CI `CLI smoke` 전체 (CI 와 같은 `bash -e`) | 통과 — Phase 0B–4 단계 + 새 `phase 5 fail-closed smoke` |
+
+삭제된 테스트 없음. 동작이 바뀐 기존 테스트 3 개 (`test_gpu_baseline.py` 의 schema 1.3, `test_train_ingest_viz.py`
+의 plan 없는 `chunk_id` 거부 두 곳) 는 assertion 만 갱신했다.
 
 ### 12.6 한계와 미룬 것
 
