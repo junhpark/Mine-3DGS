@@ -371,6 +371,18 @@ def compare_runs(
         recs[label] = rec
     if recs["baseline"].run_id == recs["advanced"].run_id:
         raise ContractError("the baseline and the advanced run are the same run")
+    chunks = {
+        label: None
+        if r.chunk is None and r.chunk_id is None
+        else ((r.chunk or {}).get("plan_digest"), r.chunk_id)
+        for label, r in recs.items()
+    }
+    if chunks["baseline"] != chunks["advanced"]:
+        raise ContractError(
+            f"the runs trained different parts of the tunnel (baseline chunk "
+            f"{chunks['baseline']}, advanced chunk {chunks['advanced']}); a chunk is compared "
+            "with the same chunk of the same plan, or not at all (Phase 5)"
+        )
 
     # ---- one protocol: the declared holdout, unless the caller names ranges explicitly
     j = judge(manifest)

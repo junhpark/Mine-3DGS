@@ -55,6 +55,8 @@ class StagedDataset:
     downscale: dict | None = None
     #: How many init colour channels were moved off 0/255 for ``app_opt`` (None: no clamp).
     init_rgb_clamped: int | None = None
+    #: Phase 5: what a chunk stage selected (None for a run that is not a plan's chunk).
+    chunk: dict | None = None
 
 
 #: Every staged file the trainer reads, for the staged-tree hash in run.json.
@@ -180,22 +182,51 @@ def stage_dataset(
     chunk_id: str | None = None,
     data_factor: int = 1,
     clamp_init_rgb: bool = False,
+    chunk=None,
 ) -> StagedDataset:
+    """Stage a dataset, or one chunk of it, for the pinned upstream trainer.
+
+    ``chunk`` is a ``PlannedChunk`` of a verified ``ChunkPlanRecord`` (Phase 5): its images are the
+    plan's selection, which must be exactly the global training images of its groups, and its init
+    is the init points the existing support locator places inside the chunk's support. Poses and
+    points are not re-expressed: a chunk lives in the dataset's LOCAL_METRIC frame.
+    """
     dataset_dir = Path(dataset_dir)
     staged_dir = Path(staged_dir)
     manifest = manifest or Manifest.load_dataset(dataset_dir)
     model = colmap_io.read_model(dataset_dir / "sparse" / "0")
     by_name = model.image_by_name()
 
+    if chunk_id is not None and chunk is None:
+        raise ContractError(
+            f"chunk {chunk_id!r}: a chunk is staged from a verified chunk plan (Phase 5 AD-1), "
+            "not from the legacy manifest.chunks windows"
+        )
     train = manifest.train_images()
-    if chunk_id:
-        if manifest.chunks is None:
-            raise ContractError("chunk_id given but manifest has no chunks")
-        chunk = next((c for c in manifest.chunks.items if c.id == chunk_id), None)
-        if chunk is None:
-            raise ContractError(f"unknown chunk {chunk_id}")
-        allowed = set(manifest.images_of(chunk.groups))
-        train = [n for n in train if n in allowed]
+    chunk_evidence: dict | None = None
+    if chunk is not None:
+        if not use_init_points:
+            raise ContractError(
+                "a chunk's init is selected from init_points.ply by chainage; the SfM sparse-"
+                "track init path is not chunked"
+            )
+        global_train = set(train) - set(manifest.test_images())
+        planned = set(chunk.images)
+        if not planned <= global_train:
+            raise ContractError(
+                f"chunk {chunk.chunk_id} names {sorted(planned - global_train)[:3]} as training "
+                "images, which the dataset's split does not train on"
+            )
+        want = {
+            x for g in chunk.capture_groups for x in manifest.capture_groups[g].members
+        } & global_train
+        if want != planned:
+            raise ContractError(
+                f"chunk {chunk.chunk_id}: its images are not the training members of its groups "
+                f"{chunk.capture_groups}; a group is staged whole or not at all"
+            )
+        train = [n for n in train if n in planned]
+        chunk_evidence = {"chunk_id": chunk.chunk_id, "images": sorted(planned)}
     missing = [n for n in train if n not in by_name]
     if missing:
         raise ContractError(
@@ -239,6 +270,8 @@ def stage_dataset(
         pc = read_ply(dataset_dir / manifest.initialization.file)
         if pc.frame not in ("LOCAL_METRIC", "UNKNOWN"):
             raise ContractError(f"init_points.ply must be LOCAL_METRIC, got {pc.frame}")
+        if chunk is not None:
+            pc = _chunk_init(dataset_dir, manifest, pc, chunk, chunk_evidence)
         pc = pc.subsample(MAX_INIT_POINTS)
         rgb = pc.rgb if pc.rgb is not None else np.full((len(pc), 3), 128, np.uint8)
         points = {i + 1: colmap_io.Point3D(i + 1, pc.xyz[i], rgb[i]) for i in range(len(pc))}
@@ -298,4 +331,34 @@ def stage_dataset(
         init_source=init_src,
         downscale=downscale,
         init_rgb_clamped=clamped,
+        chunk=chunk_evidence,
     )
+
+
+def _chunk_init(dataset_dir: Path, manifest: Manifest, pc, chunk, evidence: dict):
+    """The init points the existing support locator places inside the chunk's support.
+
+    Chainage comes from ``Support.locate`` on the dataset centerline in LOCAL_METRIC, the rule
+    depth supervision uses. A point it cannot place (off the axis by more than the drift could
+    be, or past an end) is in no chunk; how many is recorded. The holdout is not re-read: the
+    init file is already free of it (Phase 0C/3).
+    """
+    from minegs.train.supervision.support import Support, dataset_centerline
+
+    cl = dataset_centerline(dataset_dir, manifest)
+    if cl is None:
+        raise ContractError("a chunk's init is selected by chainage; the dataset has no axis")
+    s, ok = Support(cl).locate(pc.xyz)
+    lo, hi = chunk.support_range_m
+    keep = ok & (s >= lo) & (s <= hi)
+    evidence.update(
+        init_points_total=len(pc),
+        init_points_located=int(ok.sum()),
+        init_points_unlocated=int((~ok).sum()),
+        init_points_selected=int(keep.sum()),
+    )
+    if not keep.any():
+        raise ContractError(
+            f"chunk {chunk.chunk_id}: no init point lies in its support {lo:g}-{hi:g} m"
+        )
+    return pc.select(np.flatnonzero(keep))

@@ -275,6 +275,12 @@ class VerifiedDepthSupervision:
             "dataset_binding_sha256": r.dataset_binding.binding_sha256,
         }
 
+    def samples_in_loss_for(self, names: list[str]) -> int:
+        """How many samples that enter the loss belong to these images."""
+        wanted = {k for k, n in enumerate(self.record.images) if n in set(names)}
+        img = self.samples["image"].astype(np.int64)
+        return int(((self.samples["confidence"] > 0) & np.isin(img, list(wanted))).sum())
+
     def images_with_samples(self, names: list[str] | None = None) -> list[str]:
         """Images carrying at least one sample that enters the loss."""
         counts = np.bincount(

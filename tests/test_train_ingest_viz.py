@@ -205,7 +205,8 @@ def test_stage_dataset_subset_and_tls_init(synthetic, tmp_path):
         and st2.init_source == "points3D.txt"
         and len(st2.images) == st.n_train_available
     )
-    with pytest.raises(ContractError, match="unknown chunk"):
+    # Phase 5: a chunk comes from a verified chunk plan, never from manifest.chunks windows
+    with pytest.raises(ContractError, match="staged from a verified chunk plan"):
         stage_dataset(synthetic.dataset_dir, tmp_path / "s3", m, chunk_id="C99")
 
 
@@ -277,13 +278,16 @@ def test_local_runner_refuses_without_gpu(synthetic, monkeypatch):
 def test_runner_prepare_writes_provenance(synthetic):
     r = get_runner("local", RunnerConfig(runner="local", image="x@sha256:abc"))
     run, manifest, _profile, record = r.prepare(
-        RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light", chunk_id="C01")
+        RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light")
     )
     assert run.run_id.startswith("gsplat_") and record.docker_digest == "sha256:abc"
     assert record.dataset_hash and record.provenance.parent_ids == [manifest.dataset_id]
-    assert record.T_tls_from_local is not None and record.chunk_id == "C01"
-    with pytest.raises(ContractError, match="unknown chunk"):
-        r.prepare(RunConfig(dataset_dir=str(synthetic.dataset_dir), chunk_id="C99"))
+    # the dataset's own frame: no run records a per-chunk origin its outputs are not in
+    assert record.T_tls_from_local == manifest.T_tls_from_local.to_list()
+    assert record.chunk_id is None and record.chunk is None
+    # Phase 5: the legacy manifest.chunks windows are not a training plan
+    with pytest.raises(ContractError, match="trained from a verified chunk plan"):
+        r.prepare(RunConfig(dataset_dir=str(synthetic.dataset_dir), chunk_id="C01"))
 
 
 def test_sync_never_pushes_raw(synthetic, tmp_path):
