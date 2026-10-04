@@ -335,3 +335,6 @@ C4 에서 한 번 (head `d315475`):
 | B1 | staging 이 plan 의 atomic group 선택 뒤 `max_images` 로 이미지 단위 thinning — 360 ring 일부 crop 만 남을 수 있고, 테스트가 이를 성공으로 고정 | `require_whole_chunk`: `max_images < len(chunk.images)` 면 prepare (run 디렉터리 전) 와 staging 에서 `ContractError`; runner 는 staged == planned 를 요구; thinning note 와 그 테스트 제거 | `test_a_profile_that_would_split_capture_groups_is_refused` (multi-image group 확인, run 디렉터리 없음, staging 단독 거부, 계획 수 이상이면 전부 staged) |
 | B2 | init PLY 의 frame 이 `UNKNOWN` 이어도 LOCAL_METRIC 축에 투영해 chunk init 을 선택 | chunk 경로에서만 `LOCAL_METRIC` 강제; 단일 run 은 불변 | `test_a_chunk_init_of_unknown_frame_is_refused` (단일 run 은 여전히 통과) |
 | B3 | `ChunkRunSet.real_execution` 이 학습 GPU 증거만 보고 true — sections 뒤의 renderer 는 대체 (`StandInRenderer`) 일 수 있다 | `real_gpu_execution` 으로 이름을 바꿔 학습만 말하게 하고, notes 에 renderer·depth·surface 는 도출하지 않음을 명시; 전체 파이프라인 `real_execution` 은 만들지 않는다 | `test_the_gpu_flag_is_about_training_and_says_so` |
+
+리뷰 수정 뒤 한 번 다시 (head `f2f63c7`): `ruff check`·`ruff format --check` 통과, `pytest` **905 passed**
+(904 − thinning 테스트 2 + B1·B2·B3 회귀 3), torch 테스트 **16 passed**, CI `CLI smoke` 전체 통과.
