@@ -12,7 +12,9 @@ from pydantic import Field
 from minegs.core.config import VersionedModel
 from minegs.core.errors import ContractError
 
-BUILTIN = ("light", "heavy")
+#: `heavy-base`, `heavy-appearance`, `heavy-depth` are the Phase 4 ablations of `heavy`: each
+#: differs from it only in requests.{appearance_embedding, depth_loss} (docs/PHASE4_CONTRACT.md).
+BUILTIN = ("light", "heavy", "heavy-base", "heavy-appearance", "heavy-depth")
 
 
 class Profile(VersionedModel):

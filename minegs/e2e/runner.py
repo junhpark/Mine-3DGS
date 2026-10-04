@@ -110,6 +110,8 @@ class E2EConfig(VersionedModel):
     backend: str = "gsplat"
     runner: str = "local"
     native: bool = False
+    #: A verified DepthSupervisionRecord for a profile that requests depth_loss (Phase 4).
+    depth_supervision: str | None = None
 
     # ---- depth / surface
     min_alpha: float | None = None
@@ -135,6 +137,7 @@ class E2EConfig(VersionedModel):
         "mapping",
         "vendor_manifest",
         "images_dir",
+        "depth_supervision",
     )
 
     def resolve_paths(self, base: str | Path) -> E2EConfig:

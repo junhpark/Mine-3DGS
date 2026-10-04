@@ -458,3 +458,64 @@ def golden_gate(
             )
 
     run_guarded(go)
+
+
+@app.command("depth-supervision")
+def depth_supervision(
+    dataset_dir: Path = typer.Argument(...),
+    source: str = typer.Option(..., help="sfm_tracks (image-only) | tls_projection (TLS)"),
+    cloud: Path | None = typer.Option(
+        None, help="tls_projection: a materialised TLS cloud PLY (frame LOCAL_METRIC/TLS_GLOBAL)"
+    ),
+    out: Path | None = typer.Option(None, help="default: <dataset>/supervision/depth/<id>"),
+    max_samples_per_image: int | None = typer.Option(None),
+) -> None:
+    """Build a DepthSupervisionRecord (Phase 4 C1), then verify what was written."""
+    from minegs.core.errors import ContractError
+    from minegs.train.supervision.build import build_sfm_tracks, build_tls_projection
+
+    def go() -> None:
+        if source == "sfm_tracks":
+            if cloud is not None:
+                raise ContractError("sfm_tracks takes no --cloud; its depth is the SfM's own")
+            v = build_sfm_tracks(dataset_dir, out, max_samples_per_image=max_samples_per_image)
+        elif source == "tls_projection":
+            if cloud is None:
+                raise ContractError("tls_projection needs --cloud, the TLS cloud to project")
+            kw = (
+                {}
+                if max_samples_per_image is None
+                else {"max_samples_per_image": max_samples_per_image}
+            )
+            v = build_tls_projection(dataset_dir, cloud, out, **kw)
+        else:
+            raise ContractError(
+                f"unknown source {source!r}: sfm_tracks or tls_projection (sensor_depth has no "
+                "builder and is refused)"
+            )
+        r = v.record
+        console.print(
+            f"[green]verified[/] {r.supervision_id} -> {v.path}\n"
+            f"  source={r.source_kind} samples={r.n_samples} in_loss={r.n_samples_in_loss} "
+            f"images={len(r.images)} confidence={r.confidence_semantics}\n"
+            f"  support_ranges_m={r.support_ranges_m} holdout={r.excluded_holdout_ranges_m}\n"
+            f"  exclusions={r.exclusions}\n  artifact_sha256={v.artifact_sha256}"
+        )
+
+    run_guarded(go)
+
+
+@app.command("depth-supervision-verify")
+def depth_supervision_verify(
+    dataset_dir: Path = typer.Argument(...),
+    artifact: Path = typer.Argument(..., help="a supervision/depth/<id> directory"),
+) -> None:
+    """Re-derive a depth supervision artifact against a dataset (Phase 4 AD-3/AD-4)."""
+    from minegs.train.supervision.depth import verify_depth_supervision
+
+    def go() -> None:
+        v = verify_depth_supervision(dataset_dir, artifact)
+        console.print(f"[green]verified[/] {v.record.supervision_id}")
+        dump_json(v.summary(), None)
+
+    run_guarded(go)

@@ -12,18 +12,18 @@ Executable contract (verified against gsplat v1.5.3 upstream):
   folder is missing, so the trainer must be pointed at a writable **staged** copy of the
   dataset (``minegs.train.staging``), never at the read-only dataset mount.
 
-Phase 0A/0D refuses two requests outright rather than supporting them partially:
+Two upstream options are refused outright rather than supported partially:
 
-* ``normalize_world_space: true`` — the baseline contract is BACKEND_INTERNAL == LOCAL_METRIC.
-  Our re-implementation of gsplat's normalisation below is *unvalidated* against upstream
-  (per-dataset orientation handling is not proven equivalent), and in the docker path the
-  command is built on the host from a container-side ``data_dir``, so the transform would be
-  computed from a path that does not exist there. Enabling it half-way would silently corrupt
-  every metric claim, so it raises ``ContractError``. The helpers stay for the future
-  equivalence test; nothing in the command path calls them.
-* ``depth_loss: true`` — upstream depth supervision reads COLMAP image→point observation
-  tracks, and TLS-initialised staging replaces ``points3D`` with ``init_points.ply`` and
-  clears those tracks (``minegs.train.staging``). Depth supervision is redesigned in Phase 4.
+* ``normalize_world_space: true``: the contract is BACKEND_INTERNAL == LOCAL_METRIC, and the
+  Phase 4 audit (docs/PHASE4_CONTRACT.md §8) found that upstream never persists the transform it
+  applies, writes checkpoints and PLYs in the normalised frame with no inverse, and that the
+  re-implementation below omits upstream's conditional flip. The units-bearing parts of
+  training that normalisation would have conditioned are handled in metres instead (AD-6).
+* upstream ``depth_loss``: its depth targets are the COLMAP tracks of the very ``points3D`` that
+  ``init_type=sfm`` initialises from (``colmap.py:411-420``). Turned on, it would supervise depth
+  with the initialisation. MineGS depth supervision is a separate, verified artifact, consumed
+  by the MineGS trainer adapter (``minegs.train.trainers.advanced_gs``). Requesting the
+  ``depth_loss`` capability means that, and upstream's flag is never emitted.
 
 A third refusal is forced by the pinned trainer itself: **v1.5.3 cannot resume training.**
 ``Config.ckpt`` is documented upstream as *"Path to the .pt files. If provide, it will skip
@@ -65,21 +65,62 @@ from minegs.train.backends.base import (
 from minegs.train.profiles import Profile
 
 PINNED_GSPLAT = "1.5.3"
+#: sha256 of v1.5.3's ``examples/simple_trainer.py`` (tag v1.5.3, commit 937e299; the file the
+#: pinned image runs, docs/ROADMAP.md). A run is real gsplat training only if its trainer is it.
+UPSTREAM_TRAINER_SHA256 = "79319e1cd7404e4d1ba0c425634235c39e6054f0643b904a01feea6179462c05"
 TRAINER_ENV = "MINEGS_GSPLAT_TRAINER"
 TRAINER_IMAGE_PATH = "/opt/gsplat/examples/simple_trainer.py"  # set in docker/Dockerfile.gpu
 STRATEGIES = ("default", "mcmc")
 
 NORMALIZE_REFUSAL = (
-    "normalize_world_space=true is not enabled in the Phase 0A/0D baseline. Mine-3DGS requires "
-    "BACKEND_INTERNAL == LOCAL_METRIC until upstream transform equivalence is validated "
-    "(docs/ROADMAP.md). Set backend_args.normalize_world_space: false."
+    "normalize_world_space=true is refused: gsplat v1.5.3 keeps the transform it applies only in "
+    "memory (parser.transform), writes checkpoints and PLYs in the normalised frame with no "
+    "inverse, and adds a conditional 180-degree flip the MineGS re-implementation does not "
+    "reproduce, so the outputs could not be returned to LOCAL_METRIC or rendered from the "
+    "dataset poses (docs/PHASE4_CONTRACT.md §8: none of the seven conditions is met). Set "
+    "backend_args.normalize_world_space: false; metric-unit training is the supported path."
 )
 DEPTH_LOSS_REFUSAL = (
-    "depth_loss requested, but TLS initialization staging removes the COLMAP observation "
-    "tracks required by upstream gsplat depth supervision (minegs.train.staging writes "
-    "init_points.ply as points3D and clears image point3D_ids). This capability is deferred "
-    "to Phase 4 (docs/ROADMAP.md); set requests.depth_loss: false to run this profile."
+    "upstream depth_loss is refused for every profile: gsplat v1.5.3 derives its depth targets "
+    "from the COLMAP tracks of the same points3D that init_type=sfm initialises from, so the "
+    "initialisation would stand in for depth evidence, unchecked against the holdout "
+    "(docs/PHASE4_CONTRACT.md C0 Q6, AD-1). Depth supervision is requests.depth_loss: true with "
+    "a verified DepthSupervisionRecord (--depth-supervision), consumed by the MineGS trainer "
+    "adapter."
 )
+DEPTH_SUPERVISION_NOTE = (
+    "depth_loss is delivered as MineGS depth supervision: a DepthSupervisionRecord built by "
+    "`minegs dataset depth-supervision`, verified against the dataset, and passed to the run "
+    "with --depth-supervision."
+)
+NORMAL_LOSS_NOTE = (
+    "gsplat v1.5.3 simple_trainer has no normal loss; normal consistency exists only in "
+    "simple_trainer_2dgs.py, and 2DGS is outside Phase 4 (docs/PHASE4_CONTRACT.md AD-10)."
+)
+INIT_RANDOM_REFUSAL = (
+    "init_type=random draws a cube around the world origin (simple_trainer.py:238). In "
+    "LOCAL_METRIC the origin is wherever the dataset put it, so the cube need not contain the "
+    "drift; only initialisation from points (init_type: sfm) is accepted."
+)
+#: Upstream values the depth renderer assumes the model was trained under. A profile may not
+#: change them: the run would train, and its depth would then be refused or, worse, rendered
+#: under the wrong projection (docs/PHASE4_CONTRACT.md AD-8, Q9).
+RENDERER_ASSUMED = {
+    "camera_model": "pinhole",
+    "near_plane": 0.01,
+    "far_plane": 1e10,
+    "with_ut": False,
+    "with_eval3d": False,
+    "pose_noise": 0.0,
+    "patch_size": None,
+}
+#: The mcmc preset's two units-bearing values, as v1.5.3 sets them (simple_trainer.py:1213-1221,
+#: gsplat/strategy/mcmc.py:50). The adapter rescales them for metres (AD-6).
+UPSTREAM_MCMC_NOISE_LR = 5e5
+UPSTREAM_MCMC_SCALE_REG = 0.01
+UPSTREAM_TEST_EVERY = 8
+UPSTREAM_SH_DEGREE = 3
+ADAPTER_MODULE = "minegs.train.trainers.advanced_gs"
 RESUME_REFUSAL = (
     f"gsplat v{PINNED_GSPLAT}'s examples/simple_trainer.py cannot continue training from a "
     "checkpoint: --ckpt is documented as 'If provide, it will skip training and run evaluation "
@@ -116,6 +157,61 @@ REFUSED_FLAGS = {
     "normalize_world_space": NORMALIZE_REFUSAL,
     "ckpt": RESUME_REFUSAL,
 }
+
+
+def _python_tag(loader, suffix, node):
+    """A ``!!python/...`` node read as data: mapping -> dict (tag kept), sequence -> list."""
+    import yaml
+
+    if isinstance(node, yaml.MappingNode):
+        out = loader.construct_mapping(node, deep=True)
+        out["__tag__"] = suffix
+        return out
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    return loader.construct_scalar(node)
+
+
+def read_trainer_config(path: Path) -> dict:
+    """The trainer's ``cfg.yml`` as data, nested strategy included, without executing a tag.
+
+    Upstream writes it with ``yaml.dump(vars(cfg))`` (simple_trainer.py:552-554), whose default
+    Dumper tags the strategy ``!!python/object:gsplat.strategy...`` and tuples
+    ``!!python/tuple``. ``safe_load`` refuses those, and ``unsafe_load`` would import gsplat to
+    rebuild them. This loader turns every python tag into plain data and keeps the tag name.
+    """
+    import yaml
+
+    class _Loader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            # yaml.dump never writes a key twice; a file that does was not written by it, and
+            # "last one wins" would let either value stand for the run.
+            seen: set[str] = set()
+            for k, _ in node.value:
+                key = repr(self.construct_object(k, deep=True))
+                if key in seen:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, f"duplicate key {key}", k.start_mark
+                    )
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    _Loader.add_multi_constructor("tag:yaml.org,2002:python/", _python_tag)
+    try:
+        data = yaml.load(Path(path).read_text(), Loader=_Loader)
+    except (OSError, yaml.YAMLError) as e:
+        raise ContractError(f"{path}: the trainer's config cannot be read ({e})") from e
+    if not isinstance(data, dict):
+        raise ContractError(f"{path}: the trainer's config is not a mapping")
+    return data
+
+
+def strategy_name(cfg: dict) -> str | None:
+    """``DefaultStrategy`` / ``MCMCStrategy`` from the strategy tag, or None."""
+    st = cfg.get("strategy")
+    if isinstance(st, dict) and isinstance(st.get("__tag__"), str):
+        return st["__tag__"].rsplit(".", 1)[-1]
+    return None
 
 
 #: ``ckpt_6999_rank0.pt`` -> 6999, ``point_cloud_6999.ply`` -> 6999, ``train_step6999_rank0``
@@ -182,7 +278,11 @@ def _assert_no_refused_flags(argv: list[str]) -> None:
 
 class GsplatBackend(TrainBackend):
     name = "gsplat"
-    capability_notes = {"depth_loss": DEPTH_LOSS_REFUSAL, "resume": RESUME_REFUSAL}
+    capability_notes = {
+        "depth_loss": DEPTH_SUPERVISION_NOTE,
+        "normal_loss": NORMAL_LOSS_NOTE,
+        "resume": RESUME_REFUSAL,
+    }
 
     def __init__(self, trainer: Path | None = None) -> None:
         self._trainer = trainer
@@ -199,10 +299,10 @@ class GsplatBackend(TrainBackend):
         return BackendCapabilities(
             appearance_embedding=True,
             bilateral_grid=True,
-            # upstream gsplat supports depth supervision, but this adapter cannot deliver it
-            # while staging replaces points3D with TLS points (see DEPTH_LOSS_REFUSAL).
-            depth_loss=False,
-            normal_loss=False,
+            # MineGS depth supervision, through the trainer adapter (Phase 4 AD-5). Upstream's
+            # own depth_loss flag stays refused (DEPTH_LOSS_REFUSAL).
+            depth_loss=True,
+            normal_loss=False,  # NORMAL_LOSS_NOTE
             antialiasing=True,
             absgrad=True,
             mcmc_strategy=True,
@@ -219,8 +319,16 @@ class GsplatBackend(TrainBackend):
         profile: Profile,
         trainer: Path | None = None,
         check_trainer: bool = True,
+        depth_supervision_dir: Path | None = None,
+        depth_supervision_sha256: str | None = None,
     ) -> TrainCommand:
-        """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring."""
+        """``dataset_dir`` must be the *staged* (writable) dataset; see module docstring.
+
+        ``depth_supervision_dir`` is where the trainer will find the staged, verified depth
+        artifact (a container path on the docker route), and ``depth_supervision_sha256`` the
+        directory hash the run recorded for it. Both are required exactly when the profile
+        requests ``depth_loss``.
+        """
         enabled = self.resolve_requests(profile)
         # Canonicalise every backend_args key first, so the refusals below and the argv scan at
         # the end are comparing the same thing the user wrote (see ``canonical_option``): one
@@ -248,14 +356,66 @@ class GsplatBackend(TrainBackend):
         # backend_args override that would otherwise be forwarded verbatim below.
         if bool(args.pop("normalize_world_space", False)):
             raise ContractError(NORMALIZE_REFUSAL)
-        if enabled.get("depth_loss") or bool(args.pop("depth_loss", False)):
+        if bool(args.pop("depth_loss", False)):
             raise ContractError(DEPTH_LOSS_REFUSAL)
+        if str(args.get("init_type", "sfm")) != "sfm":
+            raise ContractError(INIT_RANDOM_REFUSAL)
+        if "steps_scaler" in args:
+            raise ContractError(
+                "backend_args steps_scaler: upstream multiplies every step count by it, so the "
+                "run would train a number of steps its record and comparisons do not state; set "
+                "max_steps instead"
+            )
+        for key, want in RENDERER_ASSUMED.items():
+            if key in args and args[key] != want:
+                raise ContractError(
+                    f"backend_args {key}={args[key]!r}: the depth renderer reproduces a model "
+                    f"trained with {key}={want!r} only, so this run's depth could not be "
+                    "rendered as trained (docs/PHASE4_CONTRACT.md AD-8)"
+                )
+        depth = bool(enabled.get("depth_loss"))
+        if depth and (depth_supervision_dir is None or not depth_supervision_sha256):
+            raise ContractError(
+                "the profile requests depth supervision (requests.depth_loss: true) but no "
+                "verified DepthSupervisionRecord was given (--depth-supervision). Fake COLMAP "
+                "tracks are not a substitute: upstream's own depth flag is refused."
+            )
+        if not depth and depth_supervision_dir is not None:
+            raise ContractError(
+                "a depth supervision artifact was given to a profile that does not request "
+                "depth_loss; it would be ignored, and a run that silently ignores its "
+                "supervision is recorded as something it is not"
+            )
+        if not depth and "depth_lambda" in args:
+            raise ContractError("backend_args depth_lambda without requests.depth_loss: true")
+        if depth and enabled.get("pose_refinement"):
+            raise ContractError(
+                "depth supervision with pose refinement: the targets are computed from the "
+                "dataset poses and the render from refined ones, so they drift apart"
+            )
+        if enabled.get("bilateral_grid") is not True and bool(args.get("use_fused_bilagrid")):
+            raise ContractError(
+                "use_fused_bilagrid turns the bilateral grid on (simple_trainer.py:1228-1230); "
+                "request bilateral_grid explicitly instead"
+            )
+        compensate = strategy == "mcmc"
+        if compensate:
+            for key in ("strategy.noise_lr", "scale_reg"):
+                if key in args:
+                    raise ContractError(
+                        f"backend_args {key}: under mcmc MineGS sets this from the metric scale "
+                        "of the cameras (docs/PHASE4_CONTRACT.md AD-6), so a fixed value would "
+                        "be in the wrong units"
+                    )
+        test_every = args.get("test_every", UPSTREAM_TEST_EVERY)
+        if not (
+            isinstance(test_every, int) and not isinstance(test_every, bool) and test_every >= 1
+        ):
+            raise ContractError(f"test_every must be a positive integer, got {test_every!r}")
         script = trainer or self._trainer
         if script is None:
             script = locate_trainer(require=check_trainer) or Path(TRAINER_IMAGE_PATH)
-        argv = [
-            "python",
-            str(script),
+        upstream = [
             strategy,
             "--data_dir",
             str(dataset_dir),
@@ -275,26 +435,81 @@ class GsplatBackend(TrainBackend):
             ("bilateral_grid", "--use_bilateral_grid"),
             ("antialiasing", "--antialiased"),
             ("pose_refinement", "--pose_opt"),
-        ):  # depth_loss is refused above, never emitted
+        ):  # depth_loss is MineGS supervision, delivered by the adapter, never upstream's flag
             if enabled.get(cap):
-                argv.append(flag)
+                upstream.append(flag)
         if enabled.get("absgrad"):
             if strategy != "default":
                 raise ContractError("absgrad is a DefaultStrategy option; not available with mcmc")
-            argv.append("--strategy.absgrad")
+            upstream.append("--strategy.absgrad")
         for k, v in args.items():
             if isinstance(v, bool):
-                argv.append(f"--{k}" if v else f"--no-{k}")
+                upstream.append(f"--{k}" if v else f"--no-{k}")
             elif isinstance(v, (list, tuple)):
-                argv += [f"--{k}", *[str(x) for x in v]]
+                upstream += [f"--{k}", *[str(x) for x in v]]
             else:
-                argv += [f"--{k}", str(v)]
+                upstream += [f"--{k}", str(v)]
+
+        if depth or compensate:
+            from minegs.train.trainers.advanced_gs import ADAPTER_EVIDENCE, adapter_sha256
+
+            argv = [
+                "python",
+                "-m",
+                ADAPTER_MODULE,
+                "--trainer",
+                str(script),
+                "--evidence",
+                str(Path(out_dir) / ADAPTER_EVIDENCE),
+            ]
+            if depth:
+                argv += [
+                    "--depth-supervision",
+                    str(depth_supervision_dir),
+                    "--depth-supervision-sha256",
+                    str(depth_supervision_sha256),
+                ]
+            if compensate:
+                argv.append("--mcmc-metric-compensation")
+            argv += ["--", *upstream]
+            trainer_info = {
+                "entrypoint": "minegs_adapter",
+                "adapter_module": ADAPTER_MODULE,
+                "adapter_sha256": adapter_sha256(),
+                "upstream_trainer": str(script),
+            }
+        else:
+            argv = ["python", str(script), *upstream]
+            trainer_info = {"entrypoint": "upstream", "upstream_trainer": str(script)}
         _assert_no_refused_flags(argv)
+
+        steps_scaler = args.get("steps_scaler", 1.0)
+        expected: dict[str, object] = {
+            "normalize_world_space": False,
+            "depth_loss": False,
+            "data_factor": int(profile.data_factor),
+            "max_steps": int(int(profile.max_steps) * float(steps_scaler)),
+            "app_opt": bool(enabled.get("appearance_embedding")),
+            "use_bilateral_grid": bool(enabled.get("bilateral_grid")),
+            "antialiased": bool(enabled.get("antialiasing")),
+            "pose_opt": bool(enabled.get("pose_refinement")),
+            "init_type": "sfm",
+            "sh_degree": args.get("sh_degree", UPSTREAM_SH_DEGREE),
+            "test_every": test_every,
+            "strategy": "MCMCStrategy" if strategy == "mcmc" else "DefaultStrategy",
+            **RENDERER_ASSUMED,
+        }
+        if strategy == "default":
+            expected["strategy.absgrad"] = bool(enabled.get("absgrad"))
+        if depth:
+            expected["depth_lambda"] = float(args.get("depth_lambda", 0.01))
         # identity by construction: normalisation is refused above (BACKEND_INTERNAL == LOCAL_METRIC)
         return TrainCommand(
             argv=argv,
             env={"MINEGS_BACKEND": self.name},
             T_local_from_internal=Sim3.identity(),
+            trainer=trainer_info,
+            expected_config=expected,
         )
 
     def normalize_outputs(
@@ -317,6 +532,14 @@ class GsplatBackend(TrainBackend):
                 if dst.exists():
                     shutil.rmtree(dst)
                 shutil.copytree(out_dir / sub, dst)
+        # The trainer's own account of itself travels with the run, so the render gate and a
+        # later reader do not depend on backend_out surviving (Phase 4 C0 §2.3-12).
+        from minegs.train.trainers.advanced_gs import ADAPTER_EVIDENCE
+
+        for name in ("cfg.yml", ADAPTER_EVIDENCE):
+            if (out_dir / name).is_file():
+                (run_dir / "trainer").mkdir(exist_ok=True)
+                shutil.copy2(out_dir / name, run_dir / "trainer" / name)
         return produced
 
     def collect_evidence(self, out_dir: Path, profile: Profile) -> TrainEvidence:
@@ -365,9 +588,27 @@ class GsplatBackend(TrainBackend):
                 ev.train_seconds = _as_float(blob.get("ellipse_time"))
                 num_gs = blob.get("num_GS")
                 ev.gaussian_count = int(num_gs) if isinstance(num_gs, (int, float)) else None
+                ev.stats_gaussian_count = ev.gaussian_count
 
         ev.renders = sorted(p for p in out_dir.glob("renders/*") if p.is_file())
-        ev.trainer_config = _trainer_config(out_dir / "cfg.yml")
+        cfg = out_dir / "cfg.yml"
+        ev.trainer_config = _trainer_config(cfg)
+        if cfg.is_file():
+            from minegs.core.provenance import sha256_file
+
+            ev.trainer_config_sha256 = sha256_file(cfg)
+            try:
+                ev.trainer_config_full = read_trainer_config(cfg)
+            except ContractError as e:
+                ev.notes.append(str(e))
+        from minegs.train.trainers.advanced_gs import ADAPTER_EVIDENCE
+
+        adapter = out_dir / ADAPTER_EVIDENCE
+        if adapter.is_file():
+            try:
+                ev.adapter_evidence = json.loads(adapter.read_text())
+            except (OSError, ValueError) as e:
+                ev.notes.append(f"{ADAPTER_EVIDENCE} could not be read ({e})")
         return ev
 
 
@@ -438,6 +679,11 @@ def gsplat_normalization(sparse_dir: Path) -> Sim3:
 
     FUTURE WORK — not equivalence-tested against upstream and not reachable from
     ``build_command``; ``normalize_world_space=true`` is refused (see ``NORMALIZE_REFUSAL``).
+    It is **not** what the v1.5.3 Parser does: this composes ``T2 @ T1`` like
+    ``normalize.py::normalize``, while ``Parser.__init__`` adds a conditional 180-degree flip
+    ``T3`` (``colmap.py:229-244``). An equivalence test must take its reference from the Parser
+    (docs/PHASE4_CONTRACT.md §2.3-7). ``similarity_from_cameras`` itself matches upstream's
+    function, and the MCMC metric compensation check relies on that part only.
     """
     model = colmap_io.read_model(sparse_dir)
     c2w = np.stack([im.world_from_cam.matrix() for im in model.images.values()])

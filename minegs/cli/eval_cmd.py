@@ -760,3 +760,83 @@ def compare_paths_cmd(
         dump_json(rep, (out / COMPARISON_FILE) if out is not None else None)
 
     run_guarded(go)
+
+
+@app.command("compare-runs")
+def compare_runs_cmd(
+    dataset_dir: Path = typer.Argument(..., help="the one dataset both runs trained on"),
+    baseline_run: Path = typer.Option(..., help="runs/<baseline id>"),
+    advanced_run: Path = typer.Option(..., help="runs/<advanced id>"),
+    baseline_sections: Path = typer.Option(..., help="sections cut from the baseline's surface"),
+    advanced_sections: Path = typer.Option(..., help="sections cut from the advanced surface"),
+    baseline_reference_sections: Path = typer.Option(..., help="reference sections (baseline)"),
+    advanced_reference_sections: Path = typer.Option(..., help="reference sections (advanced)"),
+    baseline_geometry: Path | None = typer.Option(None, help="geometry report JSON"),
+    advanced_geometry: Path | None = typer.Option(None, help="geometry report JSON"),
+    baseline_render: Path | None = typer.Option(None, help="render report JSON"),
+    advanced_render: Path | None = typer.Option(None, help="render report JSON"),
+    baseline_e2e_report: Path | None = typer.Option(None, help="phase2_report.json"),
+    advanced_e2e_report: Path | None = typer.Option(None, help="phase2_report.json"),
+    ranges: str | None = typer.Option(None, help="default: the dataset's declared holdout"),
+    comparison_id: str = typer.Option("run-comparison"),
+    out: Path | None = typer.Option(None, help="directory for run_comparison.json"),
+) -> None:
+    """Baseline against advanced on one dataset, over what both observed (Phase 4 AD-12).
+
+    Refuses two datasets, two protocols, two frames or two grids. Copies existing metrics,
+    leaves a missing one null, never reads training loss, and says G3: PENDING.
+    """
+    import json as _json
+
+    from minegs.core.errors import ContractError
+    from minegs.eval.compare import RUN_COMPARISON_FILE, RunInputs, compare_runs
+    from minegs.eval.sections import load_section_input
+
+    def sections(path: Path):
+        rec, _ = load_section_input(path)
+        if rec is None:
+            raise ContractError(f"{path} is a bare section series; it names no run")
+        return rec
+
+    def maybe(path: Path | None):
+        return None if path is None else _json.loads(Path(path).read_text())
+
+    def go() -> None:
+        explicit = _ranges(ranges)
+        rep = compare_runs(
+            dataset_dir,
+            RunInputs(
+                baseline_run,
+                sections(baseline_sections),
+                sections(baseline_reference_sections),
+                maybe(baseline_geometry),
+                maybe(baseline_render),
+                maybe(baseline_e2e_report),
+            ),
+            RunInputs(
+                advanced_run,
+                sections(advanced_sections),
+                sections(advanced_reference_sections),
+                maybe(advanced_geometry),
+                maybe(advanced_render),
+                maybe(advanced_e2e_report),
+            ),
+            comparison_id=comparison_id,
+            ranges=explicit or None,
+        )
+        console.print(
+            f"comparison [bold]{rep.comparison_id}[/]: {rep.baseline.profile} "
+            f"({rep.baseline.run_id}) vs {rep.advanced.profile} ({rep.advanced.run_id}) over "
+            f"{rep.common_length_m:.2f} m"
+        )
+        for group, diffs in rep.differences.items():
+            shown = {k: v for k, v in diffs.items() if v is not None}
+            if shown:
+                console.print(f"  Δ {group} (advanced - baseline): {shown}")
+        console.print(f"  real_execution={rep.real_execution}  G3: {rep.g3_status}")
+        for n in rep.notes:
+            console.print(f"  [yellow]{n}[/]")
+        console.print(f"[bold]{rep.maturity_statement}[/]")
+        dump_json(rep, (out / RUN_COMPARISON_FILE) if out is not None else None)
+
+    run_guarded(go)

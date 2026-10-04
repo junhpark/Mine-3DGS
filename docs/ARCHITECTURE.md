@@ -130,6 +130,8 @@ dataset/
   init_points.ply      초기 가우시안 위치, LOCAL_METRIC
   masks/               선택 — 삼각대·작업자·나다르
   manifest.json
+  supervision/depth/<id>/   선택 (Phase 4) — DepthSupervisionRecord + samples.npy.
+                            init 과 분리된 depth 증거; dataset_hash 밖, run 마다 자기 hash 로 기록
 ```
 
 ### manifest.json — v1 필수 6 + 선택
@@ -271,10 +273,14 @@ source of truth 다.
 v0.1 은 **gsplat 하나**. `BackendCapabilities(appearance_embedding, bilateral_grid,
 depth_loss, ...)` 를 어댑터가 선언하고 프로파일은 capability 로 옵션을 요청한다 —
 gsplat 버전이 바뀌어도 프로파일 계약이 깨지지 않는다.
-Phase 0 은 pinned `simple_trainer` 래퍼, 장기적으로 gsplat 라이브러리 위의 얇은
-`MineGSTrainer`. splatfacto 는 rasterizer 만 같고 실행 계약이 다르므로 별도 어댑터
-(later). PGSR/2DGS 는 Phase 3. INRIA 원본은 non-commercial 라이선스 → 저장소·Docker
-미포함, 베이스라인 비교 시 외부 호출.
+Phase 0 은 pinned `simple_trainer` 래퍼. Phase 4 부터 depth supervision 또는 MCMC 를 쓰는 run 은
+얇은 MineGS adapter (`minegs.train.trainers.advanced_gs`) 를 거친다: upstream `simple_trainer.py`
+를 **그 파일 그대로** 실행하고 (`gsplat.distributed.cli` hook 으로 `Runner` 하위 클래스를 넣는다)
+바꾸는 것은 depth 항 (autograd 로 gradient 를 더함) 과 MCMC 의 길이 단위 parameter 뿐이다. upstream
+학습 loop 는 복사하지 않는다. upstream `depth_loss` 는 target 이 init 점 자체라 거부한다.
+splatfacto 는 rasterizer 만 같고 실행 계약이 다르므로 별도 어댑터 (later). PGSR/2DGS 는 Phase 4
+범위 밖 (미정). INRIA 원본은 non-commercial 라이선스 → 저장소·Docker 미포함, 베이스라인 비교 시
+외부 호출.
 
 어댑터 책임: `(dataset, profile) → 커맨드`, 그리고 **출력 .ply 를
 LOCAL_METRIC 으로 역변환**해 `runs/<id>/` 규약으로 정규화.
@@ -296,12 +302,16 @@ RunHandle.status() / .logs() / .fetch_artifacts()
   재시작은 "조금 느린 resume" 이 아니라 다른 실험이므로 fail closed 한다.
 
 ### 8.3 프로파일
-| | light | heavy |
+| | light | heavy (Phase 4) |
 |---|---|---|
-| 이미지 | ≤100 장 | 전체 (또는 청크) |
-| 해상도 | 1/4 | 1/2 또는 원본 |
+| 이미지 | ≤100 장 | 전체 |
+| 해상도 | 1/4 | 1/2 |
 | iter | 7k | 30k |
-| 기본 러너 | local | runpod |
+| 전략 | default | mcmc (metric 보정) |
+| appearance / depth supervision | 끔 / 끔 | 켬 / 켬 (`--depth-supervision`) |
+| 기본 러너 | local | local (RunPod 는 Phase 6) |
+
+heavy 의 ablation 은 `heavy-base` · `heavy-appearance` · `heavy-depth` (두 request 만 다르다).
 
 ## 9. 계보 (provenance)
 
@@ -411,4 +421,12 @@ end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced G
   360 crop 이름은 view 를 품는다(depth map 이름이 image stem 하나당 하나이므로); frame set 검사는
   `images/` 를 열거해 record 에 없는 파일을 거부한다(SfM 은 목록이 아니라 디렉토리를 본다).
   §17 구현 기록 참조.
+* 2026-10 — Phase 4: depth supervision 은 init 과 분리된 versioned artifact
+  (`DepthSupervisionRecord`) 이고, 검증은 저장된 샘플을 dataset camera 로 역투영해 holdout 점·ray·
+  held-out 이미지·위치 불명 support 를 **재도출**한다. upstream trainer 는 수정하지 않고 adapter 가
+  depth 항만 더한다; 요청과 trainer 자신의 config 가 다르면 run 은 FAILED. `normalize_world_space`
+  는 7 조건 미충족으로 계속 거부. artifact 분리는 정보 독립이 아니다 (두 source 모두 init 과 같은
+  측량에서 나온다) — 그 관계는 측정해 기록한다. "real GPU" 는 run 자신의 기록이 GPU 와 고정된 upstream
+  trainer (버전 + `simple_trainer.py` sha256) 를 보여 줄 때만이고, 비교 입력은 자기 run 에 묶인다.
+  근거: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) (§14.5 적대적 검토).
 * 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.

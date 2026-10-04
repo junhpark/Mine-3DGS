@@ -1,20 +1,17 @@
 schema_version: "1.0"
-name: heavy
+name: heavy-depth
 description: >-
-  Phase 4 advanced profile: all train images, half resolution, 30k iterations, MCMC, appearance
-  embedding and MineGS metric depth supervision (docs/PHASE4_CONTRACT.md AD-6). Runs locally
-  through the MineGS trainer adapter around upstream gsplat v1.5.3 simple_trainer.py; needs a
-  verified depth supervision artifact (`minegs dataset depth-supervision`, then
-  `minegs train run --profile heavy --depth-supervision <dir>`). Structurally tested only:
-  no real GPU heavy run has been performed, and no improvement over the baseline is claimed.
+  Phase 4 ablation: heavy with depth supervision only. Identical to `heavy`
+  in every other setting, so heavy-base, heavy-appearance, heavy-depth and heavy separate the
+  two effects. Structurally tested only; no real GPU run performed.
 backend: gsplat
 default_runner: local              # RunPod is Phase 6 and not implemented
 max_images: null                   # every train image (the dataset's holdout is never staged)
 data_factor: 2
 max_steps: 30000
 requests:
-  depth_loss: true                 # MineGS depth supervision (upstream's own flag stays refused)
-  appearance_embedding: true       # underground lighting variation; colour only, depth-neutral
+  depth_loss: true
+  appearance_embedding: false
   bilateral_grid: false            # not together with appearance (AD-6)
   antialiasing: false              # the depth renderer reproduces classic mode only (AD-6)
 backend_args:

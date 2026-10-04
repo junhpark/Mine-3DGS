@@ -62,11 +62,13 @@ minegs/
     common/  geometry(PanoConvention) · equirect(링 크롭) · colmap_io(rigs.txt/frames.txt 포함)
     e57/     _nodes(단일 pye57 seam) · inventory+models+exceptions(0B.1) · images+mapping(0B.2 증거 기반 매핑) · extract(0B.3 추출·마스크·manifest) · scan_split(deprecated) · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
     video/   frames(ffmpeg) · dedup_blur · masks · rig(360 → COLMAP rig) · sfm/{COLMAPIncremental,COLMAPGlobal,GLUEMAP(exp)}
-  train/     staging(쓰기 가능 복사본 + max_images 서브셋 + init_points→points3D)
+  train/     staging(쓰기 가능 복사본 + max_images 서브셋 + init_points→points3D + *.bin · images_<f>)
+    supervision/  depth(DepthSupervisionRecord · 재도출 검증) · build(sfm_tracks · tls_projection) · support(holdout 판정)
+    trainers/  advanced_gs(upstream trainer 그대로 + MineGS depth 항) · depth_term
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
     runner/    base · local(docker) · runpod(Phase 6, fail-closed) · sync(rclone)
-    profiles/  light.yaml · heavy.yaml
-  eval/      protocol · register(Sim3 → ICP → diagnostics) · surface(render=gsplat depth · depth 역투영 → surface artifact) · geometry(양방향) · sections(A(s) + section artifact) · volume(∫A ds gap-safe, 설계대비, coverage) · change · render(PSNR/SSIM/LPIPS)
+    profiles/  light.yaml · heavy.yaml (+ heavy-base · heavy-appearance · heavy-depth)
+  eval/      protocol · compare(paths · runs) · register(Sim3 → ICP → diagnostics) · surface(render=gsplat depth · depth 역투영 → surface artifact) · geometry(양방향) · sections(A(s) + section artifact) · volume(∫A ds gap-safe, 설계대비, coverage) · change · render(PSNR/SSIM/LPIPS)
   viz/       viewer(Viser) · overlay(규약 캘리브레이션 = 골든 게이트) · compare · export(.spz/.splat)
   cli/       ingest / dataset / train / eval / viz / sync
 docker/      Dockerfile.gpu · Dockerfile.cpu · entrypoint.sh
@@ -241,6 +243,14 @@ dataset/
 minegs train run data/<id>/dataset --profile light --runner local --config configs/runner/local.yaml
 minegs train command data/<id>/dataset --profile light   # 실행할 커맨드만 확인 (GPU·trainer 불필요)
 minegs train status  data/<id>/runs/<run_id>             # run.json: backend, digest, dataset_hash, staged, provenance
+
+# Phase 4 — metric depth supervision 과 heavy profile
+minegs dataset depth-supervision data/<id>/dataset --source tls_projection --cloud <TLS.ply>  # TLS dataset
+minegs dataset depth-supervision data/<id>/dataset --source sfm_tracks                       # image-only dataset
+minegs dataset depth-supervision-verify data/<id>/dataset data/<id>/dataset/supervision/depth/<dsup_id>
+minegs train run data/<id>/dataset --profile heavy --depth-supervision data/<id>/dataset/supervision/depth/<dsup_id>
+minegs eval compare-runs data/<id>/dataset --baseline-run <runs/a> --advanced-run <runs/b> \
+    --baseline-sections .. --advanced-sections .. --baseline-reference-sections .. --advanced-reference-sections ..
 ```
 
 프로파일은 backend 플래그가 아니라 **capability** 를 요청한다 (`requests: {antialiasing: true, ...}`).
@@ -256,18 +266,34 @@ minegs train status  data/<id>/runs/<run_id>             # run.json: backend, di
   때문에 read-only 데이터셋을 직접 넘길 수 없다. 스테이징 내용(이미지 수·서브셋 여부·init 출처·sha256)은 `run.json` 에 기록된다.
 - `absgrad` 는 `--strategy.absgrad`(default 전략 전용). `run.json` 의 `dataset_hash` 는
   manifest·sparse·init_points·**images·masks**·centerline 을 모두 덮는다.
+- 고정된 upstream 파서가 실제로 시작할 수 있도록 staging 은 `sparse/0/*.bin` (고정된 pycolmap fork 는
+  Python 3 에서 COLMAP text 를 읽지 못한다)과 `images_<factor>/` 를 함께 쓴다 (Phase 4 C0 에서 발견).
+- run 이 끝나면 trainer 자신의 `cfg.yml` (와 adapter evidence) 을 요청과 대조하고, 다르면 **FAILED** 다.
+
+**Phase 4 heavy profile** ([계약](docs/PHASE4_CONTRACT.md)) — 모든 train 이미지, `data_factor 2`, 30k,
+MCMC (noise_lr/scale_reg 를 metric 단위로 보정), appearance embedding, MineGS depth supervision,
+antialiasing 끔 (depth renderer 가 classic 만 재현), `default_runner: local`. depth 를 쓰는 profile 은
+검증된 `DepthSupervisionRecord` 가 필요하다. upstream `simple_trainer.py` 는 그대로 실행되고, MineGS
+adapter (`minegs.train.trainers.advanced_gs`) 가 depth 항만 더한다. ablation 은 `heavy-base` ·
+`heavy-appearance` · `heavy-depth` · `heavy` (두 request 만 다르다). **실제 GPU heavy 학습은 아직
+수행되지 않았다**; 개선을 주장하지 않는다 (G3: PENDING). depth supervision 은 init 과 별도의
+artifact 지만 같은 측량 (SfM 재구성 또는 TLS) 에서 나오므로 독립 정보가 아니다 — 검증기가 그 관계를
+측정해 `run.json` 과 비교 결과에 남긴다 (`init_relation`). "real GPU" 는 run 자신의 기록이 GPU 와
+고정된 upstream trainer (gsplat 1.5.3, `simple_trainer.py` sha256) 를 보여 줄 때만이다.
 
 **지금 거부되는 것 (fail-closed, 전체 목록은 [docs/ROADMAP.md](docs/ROADMAP.md) §6)**
 
 | 요청 | 결과 | 이유 | 해제 |
 |---|---|---|---|
-| `normalize_world_space: true` | `ContractError` (exit 2) | BACKEND_INTERNAL = LOCAL_METRIC 이 baseline 계약. 재구현한 정규화는 upstream 과 equivalence 미검증이고, docker 경로에서는 host 가 볼 수 없는 경로로 변환을 계산하게 된다 | Phase 4 (equivalence test 후) |
-| `depth_loss: true` | `ContractError` (exit 2) | upstream depth supervision 은 COLMAP image→point track 을 쓰는데 TLS 스테이징이 그 track 을 비운다 | Phase 4 (depth supervision 재설계) |
-| **`--profile heavy`** | 위와 같은 이유로 `ContractError` | heavy 가 `depth_loss` 를 필수로 요청한다 | Phase 4 |
+| `normalize_world_space: true` | `ContractError` (exit 2) | upstream 은 정규화 변환을 메모리에만 두고 출력을 정규화 frame 으로 쓴다; 되돌릴 수 없다 (Phase 4 계약 §8, 7 조건 미충족) | 7 조건 충족 시 |
+| upstream `depth_loss` (backend_args) | `ContractError` (exit 2) | upstream depth target 은 init points3D 자체라 init 과 depth 증거가 분리되지 않는다 | 해당 없음 — depth 는 `--depth-supervision` |
+| `--profile heavy` (또는 heavy-depth) 에 `--depth-supervision` 없음 | `ContractError` (exit 2) | 증거 없는 depth run 금지 | — |
+| 오염·변조된 depth artifact (holdout 점/ray, held-out 이미지, held-out view 를 포함한 SfM track, 위치 불명 support, hash 불일치) | `ContractError` (exit 2) | 재도출 검증 | — |
+| dataset 의 `init_points.ply` 를 `--cloud` 로 | `ContractError` (exit 2) | init 이 깊이 증거를 사칭한다 | — |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현. 필요한 단계는 `runner/runpod.py` docstring | Phase 6 |
 
-light 프로파일은 영향을 받지 않는다: `--no-normalize_world_space`, `--depth_loss` 없음,
-`T_local_from_internal` 은 항등이다.
+light 프로파일의 커맨드는 Phase 0D 와 바이트 단위로 같다: `--no-normalize_world_space`, depth 없음,
+upstream trainer 직접 실행, `T_local_from_internal` 은 항등이다.
 
 ## Metric surface artifact (Phase 1A) · metric depth rendering (Phase 1B)
 
@@ -726,8 +752,8 @@ renderer** — 이고 전부 기록된다. T1–T30 이 거부를 고정한다.
 | 0D Local GS baseline | **0D.1 resume safety contract** + **0D.2 local GPU baseline execution contract: implemented + structurally tested** — gsplat v1.5.3 training resume 은 unsupported 이고 fail closed; 성공한 run 은 checkpoint·PLY·step 진행·frame invariant 를 모두 통과한 것만 기록된다. **실제 GPU baseline 미실행** → 0D 전체 **NOT COMPLETE** (ROADMAP §Phase 0D) |
 | 1 Metric surface & evaluation | **1A metric surface artifact + depth fusion**, **1B metric depth rendering**, **1C section/volume evidence boundary: implemented + structurally tested** — 학습된 run → 렌더 depth + manifest → 검증된 surface artifact → section artifact → gap-safe 체적 → claim. 검증된 manifest 가 있을 때만 `minegs_render` 이고, 외부 depth·원시 PLY·bare series 는 diagnostic 전용이다. 결측 구간을 가로지르는 적분은 없다. **실제 GPU rendering 미실행** (CI 에 CUDA·gsplat 없음), **TSDF/mesh: NOT IMPLEMENTED**, 실측 데이터 과학적 검증: **NOT VALIDATED** |
 | 2 E57 end-to-end MVP (v0.1) | **implemented + structurally tested** — `minegs e2e run` / `status` / `report` 가 E57 한 개를 ingest→dataset→train→depth→surface→geometry→단면/체적→report 로 관통한다. stage 마다 입력 identity 를 다시 읽어 대조하므로 움직인 입력 위에 조용히 쌓지 않는다. 복원과 held-out TLS 를 같은 grid 에서 pair 하고 공통 구간에서만 체적을 비교한다. structural gate 는 테스트 시점에 쓴 실제 E57 에서 돌지만 **trainer·renderer 는 대체**되고 그 사실이 report 에 남는다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** ([runbook](docs/PHASE2_E57_G2.md)) |
-| 3 Image/360 독립 재구성 | **implemented + structurally tested** — 영상/360 → 프레임 집합 → SfM(`SFM_INTERNAL`, 임의 scale) → 측정된 Sim(3) 정합 → image-only dataset → 기존 학습·depth·surface·단면·체적 → TLS-assisted 대비 공통 구간 비교. 초기화는 재구성 자신의 점이고 holdout 구간은 실제로 빠진다. **실제 COLMAP·GPU·렌더러·실측 영상 미실행** — 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 남는다. **Phase 3 G2: PENDING**, 실측 과학적 검증: **NOT VALIDATED** |
-| 4 Advanced GS / heavy | 미착수 — `depth_loss`·`normalize_world_space` 를 여기서 설계 |
+| 3 Image/360 독립 재구성 | **implemented + structurally tested** — 영상/360 → 프레임 집합 → SfM(`SFM_INTERNAL`, 임의 scale) → 측정된 Sim(3) 정합 → image-only dataset → 기존 학습·depth·surface·단면·체적 → TLS-assisted 대비 공통 구간 비교. 초기화는 재구성 자신의 점이고 holdout 구간은 실제로 빠진다. **실제 COLMAP·GPU·렌더러·실측 영상 미실행** — 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 남는다. **Phase 3 manual acceptance: DEFERRED**, **Phase 3 G2: PENDING**, 실측 과학적 검증: **NOT VALIDATED** |
+| 4 Advanced GS / heavy | **implemented + structurally tested** — metric depth supervision artifact (init 과 분리, holdout leakage 재도출), upstream trainer 를 그대로 실행하는 MineGS adapter, 실행 가능한 heavy profile·ablation, 요청↔실제 config 대조, baseline↔advanced 비교. **real GPU heavy training: NOT PERFORMED**, **G3: PENDING**, 실측 과학적 검증: **NOT VALIDATED** ([계약](docs/PHASE4_CONTRACT.md)) |
 | 5 장거리 갱도 · 청킹 | 예약만 (manifest.chunks) |
 | 6 RunPod | **미구현, fail-closed** |
 | 7 Multi-epoch change | **미구현** — single manifest 는 change claim 불가 |

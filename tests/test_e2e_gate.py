@@ -657,10 +657,14 @@ def test_real_gpu_execution_is_decided_by_the_run_s_own_evidence():
     from types import SimpleNamespace
 
     from minegs.e2e.stages import _real_gpu_execution
+    from minegs.train.backends.gsplat import PINNED_GSPLAT, UPSTREAM_TRAINER_SHA256
 
-    real = SimpleNamespace(runtime={"gpu_model": "NVIDIA RTX 6000", "torch_cuda_available": True})
-    blank = SimpleNamespace(runtime={})
-    torch_only = SimpleNamespace(runtime={"torch_cuda_available": True})
+    pinned = {"gsplat": PINNED_GSPLAT, "trainer_sha256": UPSTREAM_TRAINER_SHA256}
+    real = SimpleNamespace(
+        runtime={"gpu_model": "NVIDIA RTX 6000", "torch_cuda_available": True, **pinned}
+    )
+    blank = SimpleNamespace(runtime=dict(pinned))
+    torch_only = SimpleNamespace(runtime={"torch_cuda_available": True, **pinned})
 
     assert _real_gpu_execution(real, substituted=False) is True
     assert _real_gpu_execution(torch_only, substituted=False) is True
@@ -668,6 +672,15 @@ def test_real_gpu_execution_is_decided_by_the_run_s_own_evidence():
     assert _real_gpu_execution(blank, substituted=False) is False
     # And a substituted one is False whatever the host happens to have.
     assert _real_gpu_execution(real, substituted=True) is False
+    # A GPU that ran something other than the pinned upstream trainer is not real gsplat
+    # training (Phase 4 C4): another file, another gsplat, or neither recorded.
+    for other in (
+        {"trainer_sha256": "0" * 64},
+        {"gsplat": "1.4.0"},
+        {"trainer_sha256": None, "gsplat": None},
+    ):
+        rt = {**real.runtime, **other}
+        assert _real_gpu_execution(SimpleNamespace(runtime=rt), substituted=False) is False
 
 
 # ---------------------------------------------------------------- review round: currentness

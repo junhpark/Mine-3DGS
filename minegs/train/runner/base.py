@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
 from pydantic import Field
 
 from minegs.core.config import MigrationRegistry, VersionedModel
@@ -91,6 +92,9 @@ class RunConfig(VersionedModel):
     resume_from: str | None = None
     chunk_id: str | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
+    #: A verified DepthSupervisionRecord directory (Phase 4). Required exactly when the profile
+    #: requests depth_loss; given to a profile that does not, it is refused, not ignored.
+    depth_supervision: str | None = None
 
 
 RUN_RECORD_MIGRATIONS = MigrationRegistry("run_record")
@@ -107,10 +111,17 @@ def _run_1_0_to_1_1(d: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
+@RUN_RECORD_MIGRATIONS.register("1.1", "1.2")
+def _run_1_1_to_1_2(d: dict[str, Any]) -> dict[str, Any]:
+    """1.2 adds Phase 4 trainer evidence; a 1.1 run recorded none of it, and says so by its
+    absence rather than by values invented now."""
+    return d
+
+
 class RunRecord(VersionedModel):
     """``runs/<run_id>/run.json`` (§9)."""
 
-    SCHEMA_VERSION: ClassVar[str] = "1.1"
+    SCHEMA_VERSION: ClassVar[str] = "1.2"
     MIGRATIONS: ClassVar[MigrationRegistry | None] = RUN_RECORD_MIGRATIONS
     run_id: str
     dataset_id: str
@@ -155,6 +166,23 @@ class RunRecord(VersionedModel):
     extents: dict[str, Any] = Field(default_factory=dict)
     #: Why a run is FAILED. A failed run that cannot say why is not much better than a silent one.
     failure_reason: str | None = None
+
+    # ---- Phase 4 trainer evidence (schema 1.2). All default, so 1.1 records migrate unchanged.
+    #: Which program trained: upstream directly, or the MineGS adapter around it (AD-5).
+    trainer: dict[str, Any] = Field(default_factory=dict)
+    #: Capability requests as the profile made them, and as the backend resolved them.
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    #: What the trainer's cfg.yml must say, fixed before the run, compared after it (AD-8).
+    expected_trainer_config: dict[str, Any] = Field(default_factory=dict)
+    #: What it did say: the compared keys, read back, and the file's digest.
+    trainer_config: dict[str, Any] = Field(default_factory=dict)
+    trainer_config_sha256: str | None = None
+    #: The verified depth supervision this run trained with (identity + semantics), or None.
+    depth_supervision: dict[str, Any] | None = None
+    #: The MCMC unit rescaling: host-side expectation and what the trainer applied (AD-6).
+    metric_compensation: dict[str, Any] | None = None
+    #: Images upstream actually optimised, which is not every staged one (test_every).
+    optimised_images: int | None = None
 
 
 class RunHandle(ABC):
@@ -226,9 +254,31 @@ class Runner(ABC):
         # as Path(".")), but the guard should not depend on that.
         if run.resume_from is not None:
             refuse_resume(backend)
+        enabled = backend.resolve_requests(profile)
+        verified = None
+        if enabled.get("depth_loss") and run.depth_supervision is None:
+            raise ContractError(
+                f"profile {profile.name} requests depth supervision (requests.depth_loss: "
+                "true) and no DepthSupervisionRecord was given. Build one with `minegs dataset "
+                "depth-supervision`, then pass --depth-supervision <dir>."
+            )
+        if run.depth_supervision is not None:
+            if not enabled.get("depth_loss"):
+                raise ContractError(
+                    f"--depth-supervision given, but profile {profile.name} does not request "
+                    "depth_loss; supervision a run would ignore is refused, not dropped"
+                )
+            from minegs.train.supervision.depth import verify_depth_supervision
+
+            # Before anything is created: an artifact that fails its contract stops the run
+            # while there is still nothing to clean up.
+            verified = verify_depth_supervision(
+                dataset_dir, run.depth_supervision, manifest=manifest
+            )
         refuse_used_run_dir(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         record = RunRecord(
+            schema_version=RunRecord.SCHEMA_VERSION,
             run_id=run.run_id,
             dataset_id=manifest.dataset_id,
             dataset_hash=sha256_tree(dataset_dir, DATASET_HASH_PATTERNS),
@@ -239,7 +289,15 @@ class Runner(ABC):
             docker_digest=self.config.image_digest(),
             T_tls_from_local=T_tls_from_local.to_list(),
             provenance=stamp(run.model_dump(mode="json"), parents=[manifest.dataset_id]),
+            capabilities={"requested": dict(profile.requests), "resolved": enabled},
+            depth_supervision=None
+            if verified is None
+            else {
+                **verified.summary(),
+                "path": str(Path(run.depth_supervision).resolve()),
+            },
         )
+        self._verified_supervision = verified
         return run, manifest, profile, record
 
     @staticmethod
@@ -387,7 +445,40 @@ def runtime_info() -> dict[str, Any]:
         info["torch_cuda_available"] = bool(torch.cuda.is_available())
     except Exception:
         info["torch"] = None
+    try:  # the library the native trainer imports; None where it is not installed
+        import gsplat
+
+        info["gsplat"] = getattr(gsplat, "__version__", None)
+    except ImportError:
+        info["gsplat"] = None
     return info
+
+
+def pinned_upstream(record: Any) -> bool:
+    """Whether the run's own runtime evidence names the pinned gsplat and its pinned trainer.
+
+    Both are recorded by the runner from the machine that trained (the host on ``--native``, the
+    image on the docker route), never from the request.
+    """
+    from minegs.train.backends.gsplat import PINNED_GSPLAT, UPSTREAM_TRAINER_SHA256
+
+    rt = dict(getattr(record, "runtime", None) or {})
+    return (
+        str(rt.get("gsplat")) == PINNED_GSPLAT
+        and rt.get("trainer_sha256") == UPSTREAM_TRAINER_SHA256
+    )
+
+
+def real_gpu_evidence(record: Any) -> bool:
+    """A GPU was there, and the pinned upstream trained on it, as the run itself recorded.
+
+    The one rule for "real GPU training" (e2e report and run comparison alike). A trainer that
+    is not v1.5.3's ``simple_trainer.py``, or an unrecorded gsplat, is not real gsplat training,
+    whatever the host has.
+    """
+    rt = dict(getattr(record, "runtime", None) or {})
+    gpu = bool(rt.get("gpu_model")) or rt.get("torch_cuda_available") is True
+    return gpu and pinned_upstream(record)
 
 
 #: Asked of the image itself, so the recorded versions are the ones that trained.
@@ -399,6 +490,8 @@ _PROBE = (
     "d['gpu_model']=torch.cuda.get_device_name(0) if torch.cuda.is_available() else None;"
     "\ntry:\n import gsplat; d['gsplat']=gsplat.__version__\nexcept Exception as e:"
     " d['gsplat']=None\n"
+    "import hashlib\ntry:\n d['trainer_sha256']=hashlib.sha256(open(sys.argv[1],'rb').read())"
+    ".hexdigest()\nexcept (IndexError, OSError):\n d['trainer_sha256']=None\n"
     "print('MINEGS_PROBE'+json.dumps(d))"
 )
 
@@ -425,6 +518,7 @@ def container_runtime_info(image: str, device: str, trainer_path: str) -> dict[s
         image,
         "-c",
         _PROBE,
+        trainer_path,
     ]
     try:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
@@ -553,7 +647,7 @@ def verify_postconditions(
         raise ContractError(
             f"the trainer ran with normalize_world_space={declared!r}. BACKEND_INTERNAL must be "
             "LOCAL_METRIC for this baseline, so the output is in arbitrary units and the run is "
-            "not a metric one (§0D.2 D2-7)"
+            "not a metric one (§0D.2 D2-7). Why it stays refused: docs/PHASE4_CONTRACT.md §8"
         )
 
     # The span ratio corroborates; it does not lead. It is blind to rotation and translation by
@@ -566,6 +660,218 @@ def verify_postconditions(
             "this baseline allows. BACKEND_INTERNAL is supposed to be LOCAL_METRIC, so a "
             "scale change of this size means something normalised the scene (§0D.2 D2-7)"
         )
+
+    check_trainer_evidence(record, evidence, staged_dir, n_final=len(final.xyz))
+
+
+def _cfg_value(cfg: dict, key: str) -> Any:
+    """A compared key's value in the trainer's cfg.yml; ``strategy`` is the class name."""
+    from minegs.train.backends.gsplat import strategy_name
+
+    if key == "strategy":
+        return strategy_name(cfg)
+    if key.startswith("strategy."):
+        st = cfg.get("strategy")
+        return st.get(key.split(".", 1)[1], _MISSING) if isinstance(st, dict) else _MISSING
+    return cfg.get(key, _MISSING)
+
+
+_MISSING = object()
+
+
+def _same(a: Any, b: Any) -> bool:
+    if isinstance(a, bool) or isinstance(b, bool) or a is None or b is None:
+        return a is b or (a == b and type(a) is type(b))
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b)))
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b, strict=True))
+    return a == b
+
+
+def _close(a: Any, b: float, rel: float = 1e-6) -> bool:
+    return isinstance(a, (int, float)) and not isinstance(a, bool) and abs(a - b) <= rel * abs(b)
+
+
+def staged_metric_scale(staged_dir: Path) -> float:
+    """``s`` that upstream normalisation would apply to the staged cameras (host-side port)."""
+    from minegs.ingest.common import colmap_io
+    from minegs.train.backends.gsplat import similarity_from_cameras
+    from minegs.train.trainers.advanced_gs import metric_scale_from_cameras
+
+    model = colmap_io.read_model(Path(staged_dir) / "sparse" / "0")
+    names = sorted(model.image_by_name())
+    by_name = model.image_by_name()
+    c2w = np.stack([by_name[n].world_from_cam.matrix() for n in names])
+    return metric_scale_from_cameras(c2w, similarity_from_cameras)
+
+
+def check_trainer_evidence(
+    record: RunRecord, evidence: Any, staged_dir: Path, n_final: int
+) -> None:
+    """What the trainer says it ran, against what the run asked for (Phase 4 AD-8).
+
+    Every mismatch is a refusal. A requested capability that the trainer's own config shows
+    switched off is a different experiment, and so is one switched on that was never asked for.
+    A run whose evidence cannot be read cannot show which experiment it was. ``real`` does not
+    enter here: whether hardware ran is decided by the runtime evidence alone.
+    """
+    from minegs.train.backends.gsplat import (
+        PINNED_GSPLAT,
+        UPSTREAM_MCMC_NOISE_LR,
+        UPSTREAM_MCMC_SCALE_REG,
+    )
+
+    expected = dict(record.expected_trainer_config or {})
+    if evidence.trainer_config_sha256 is None:
+        raise ContractError(
+            "the trainer left no cfg.yml, so the configuration it actually ran under cannot be "
+            "compared with the one requested (Phase 4 AD-8)"
+        )
+    cfg = dict(evidence.trainer_config_full or {})
+    if not cfg:
+        raise ContractError("the trainer's cfg.yml could not be read as a configuration")
+    seen: dict[str, Any] = {}
+    differ = []
+    for key, want in sorted(expected.items()):
+        got = _cfg_value(cfg, key)
+        seen[key] = None if got is _MISSING else got
+        if got is _MISSING:
+            differ.append(f"{key}: missing (expected {want!r})")
+        elif not _same(got, want):
+            differ.append(f"{key}: {got!r} (expected {want!r})")
+    record.trainer_config = seen
+    record.trainer_config_sha256 = evidence.trainer_config_sha256
+    if differ:
+        raise ContractError(
+            "the trainer did not run the configuration this run requested — "
+            + "; ".join(differ)
+            + ". A run is recorded as what it was, so it is not called succeeded."
+        )
+
+    # ---- the MineGS adapter, when it was the entrypoint
+    trainer = dict(record.trainer or {})
+    adapter = evidence.adapter_evidence
+    if trainer.get("entrypoint") == "minegs_adapter":
+        if adapter is None:
+            raise ContractError(
+                "the run was built to train through the MineGS adapter, but no adapter evidence "
+                "was written; nothing shows its extensions were attached"
+            )
+        if (adapter.get("adapter") or {}).get("sha256") != trainer.get("adapter_sha256"):
+            raise ContractError(
+                "the adapter that ran is not the adapter this MineGS ships "
+                f"({(adapter.get('adapter') or {}).get('sha256', '?')[:12]} vs "
+                f"{str(trainer.get('adapter_sha256'))[:12]}): the image and the host disagree"
+            )
+        record.optimised_images = len(adapter.get("optimised_images") or [])
+        ran = (adapter.get("upstream_trainer") or {}).get("sha256")
+        hashed = (record.runtime or {}).get("trainer_sha256")
+        if ran and hashed and ran != hashed:
+            raise ContractError(
+                f"the adapter ran upstream trainer {ran[:12]}, but the runner recorded "
+                f"{hashed[:12]} as the trainer of this run"
+            )
+        if record.depth_supervision is None and adapter.get("depth_supervision") is not None:
+            raise ContractError(
+                "the adapter reports depth supervision in a run that recorded none; the run "
+                "would be stated as something other than what trained"
+            )
+    elif adapter is not None:
+        raise ContractError("adapter evidence appeared in a run that did not use the adapter")
+    else:
+        n = int((record.staged or {}).get("n_images") or 0)
+        te = int(expected.get("test_every") or 8)
+        record.optimised_images = n - (-(-n // te)) if n else None
+
+    # ---- depth supervision actually acted, on the artifact this run recorded
+    sup = record.depth_supervision
+    if sup is not None:
+        got = (adapter or {}).get("depth_supervision")
+        if not got:
+            raise ContractError("depth supervision was requested and the trainer reports none")
+        if got.get("artifact_sha256") != sup.get("artifact_sha256"):
+            raise ContractError(
+                f"the trainer consumed depth supervision {str(got.get('artifact_sha256'))[:12]}, "
+                f"but this run recorded {str(sup.get('artifact_sha256'))[:12]}"
+            )
+        if not got.get("steps_with_depth_term"):
+            raise ContractError(
+                "depth supervision was loaded but no training step applied the depth term"
+            )
+        if not got.get("images_with_samples"):
+            raise ContractError("no optimised image carried a depth sample")
+        optimised = set((adapter or {}).get("optimised_images") or [])
+        if not set(got.get("images_with_samples") or []) <= optimised:
+            raise ContractError("the trainer reports depth samples on images it did not optimise")
+        if not int(got.get("n_samples_in_domain") or 0) > 0:
+            raise ContractError("the trainer reports no depth sample inside its images")
+        calls = got.get("training_calls")
+        if not isinstance(calls, int) or not 0 < int(got["steps_with_depth_term"]) <= calls:
+            raise ContractError(
+                f"the trainer reports the depth term on {got.get('steps_with_depth_term')} steps "
+                f"of {calls} training renders; that cannot have happened"
+            )
+        if not _close(got.get("depth_lambda"), float(expected.get("depth_lambda", 0.01))):
+            raise ContractError("the depth weight the trainer used is not the one requested")
+        sup = dict(sup)
+        sup["trainer"] = {
+            k: got.get(k)
+            for k in (
+                "n_samples_in_domain",
+                "n_samples_out_of_domain",
+                "steps_with_depth_term",
+                "depth_term_mean",
+                "depth_term_last",
+                "depth_lambda",
+                "formula",
+            )
+        }
+        sup["trainer"]["images_with_samples"] = len(got.get("images_with_samples") or [])
+        sup["trainer"]["images_without_samples"] = len(got.get("images_without_samples") or [])
+        record.depth_supervision = sup
+
+    # ---- MCMC in metres: the host's expectation, the trainer's numbers, the trainer's config
+    if expected.get("strategy") == "MCMCStrategy":
+        s_host = staged_metric_scale(staged_dir)
+        want_noise = UPSTREAM_MCMC_NOISE_LR * s_host * s_host
+        want_reg = UPSTREAM_MCMC_SCALE_REG * s_host
+        comp = (adapter or {}).get("mcmc_metric_compensation") or {}
+        checks = (
+            ("trainer scale", comp.get("s"), s_host),
+            ("cfg.yml strategy.noise_lr", _cfg_value(cfg, "strategy.noise_lr"), want_noise),
+            ("cfg.yml scale_reg", cfg.get("scale_reg"), want_reg),
+            ("upstream noise_lr", comp.get("noise_lr_base"), UPSTREAM_MCMC_NOISE_LR),
+            ("upstream scale_reg", comp.get("scale_reg_base"), UPSTREAM_MCMC_SCALE_REG),
+        )
+        bad = [
+            f"{what}: {got!r} vs {want!r}" for what, got, want in checks if not _close(got, want)
+        ]
+        record.metric_compensation = {
+            "s_host": s_host,
+            "noise_lr_expected": want_noise,
+            "scale_reg_expected": want_reg,
+            "trainer": comp or None,
+        }
+        if bad:
+            raise ContractError(f"MCMC metric compensation does not hold ({'; '.join(bad)})")
+
+    # ---- export dropped nothing; the trained-with gsplat is the pinned one
+    if evidence.stats_gaussian_count is None:
+        raise ContractError(
+            "the trainer's final gaussian count cannot be read from its last stats file; "
+            "upstream always writes an integer num_GS there, so whether the export dropped "
+            "diverged gaussians cannot be checked"
+        )
+    if evidence.stats_gaussian_count != n_final:
+        raise ContractError(
+            f"the trainer ended with {evidence.stats_gaussian_count} gaussians but its PLY holds "
+            f"{n_final}: export drops non-finite splats silently (gsplat/exporter.py:515-538), "
+            "so the difference is gaussians that diverged"
+        )
+    trained_with = (record.runtime or {}).get("gsplat")
+    if trained_with and str(trained_with) != PINNED_GSPLAT:
+        raise ContractError(f"trained with gsplat {trained_with}, pinned {PINNED_GSPLAT}")
 
 
 def _in_run(outputs: list[Path], evidence: Any) -> Path:

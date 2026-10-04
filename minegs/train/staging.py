@@ -4,6 +4,19 @@ Why a staged copy instead of pointing the trainer at ``dataset/``:
 
 1. **Read-only input.** The dataset mount is ``:ro`` in docker and gsplat's COLMAP parser
    writes downscaled image folders (``images_<factor>_png``) next to ``images/``.
+
+What the pinned upstream parser needs from the staged tree, found in the Phase 4 C0 audit
+(docs/PHASE4_CONTRACT.md §2.3) and provided here:
+
+* **a binary model.** The pycolmap fork gsplat v1.5.3 reads models with cannot parse COLMAP
+  text on Python 3, so ``sparse/0`` carries ``*.bin`` beside the ``*.txt`` MineGS reads.
+* **``images_<factor>/`` for ``data_factor > 1``.** ``Parser`` refuses to start without it
+  (``colmap.py:183-187``). For ``.png`` images MineGS writes the downscaled copies itself, with
+  upstream's own resize (PIL bicubic, ``round(w / f)``). For ``.jpg`` it links the originals,
+  because upstream then resizes from ``images/`` into ``images_<factor>_png`` itself.
+* **finite appearance colours.** With ``app_opt`` upstream initialises colour as
+  ``logit(rgb / 255)``, so a 0 or 255 channel becomes an infinite parameter. When appearance
+  is requested the staged init colours are clamped to ``[1, 254]``, and the clamp is recorded.
 2. **Profile image subset.** ``profile.max_images`` (light: 100) is applied *here*, evenly
    spaced over the manifest's train images, so the trainer never sees test-group images.
 3. **TLS initialisation.** ``init_points.ply`` (LOCAL_METRIC) becomes ``sparse/0/points3D.txt``
@@ -38,6 +51,25 @@ class StagedDataset:
     subset: bool
     init_points: int
     init_source: str  # "init_points.ply" | "points3D.txt"
+    #: How ``images_<factor>/`` was provided (None for factor 1).
+    downscale: dict | None = None
+    #: How many init colour channels were moved off 0/255 for ``app_opt`` (None: no clamp).
+    init_rgb_clamped: int | None = None
+
+
+#: Every staged file the trainer reads, for the staged-tree hash in run.json.
+STAGED_HASH_PATTERNS = (
+    "sparse/0/*.txt",
+    "sparse/0/*.bin",
+    "images/**/*",
+    "images_*/**/*",
+    "masks/**/*",
+    "supervision/**/*",
+)
+#: Upstream's own downscale (examples/datasets/colmap.py::_resize_image_folder).
+DOWNSCALE_RULE = "PIL BICUBIC to (round(w / f), round(h / f)), RGB, PNG"
+#: ``logit(rgb / 255)`` is finite only strictly inside (0, 255).
+APPEARANCE_RGB_RANGE = (1, 254)
 
 
 def select_images(train_images: list[str], max_images: int | None) -> list[str]:
@@ -60,6 +92,85 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _png_key(name: str) -> str:
+    return os.path.splitext(name)[0] + ".png"
+
+
+def stage_downscaled(staged_dir: Path, names: list[str], factor: int) -> dict | None:
+    """Provide ``images_<factor>/`` the way the pinned upstream parser expects it."""
+    if factor <= 1:
+        return None
+    exts = {os.path.splitext(n)[1] for n in names}
+    lower = {e.lower() for e in exts}
+    folder = staged_dir / f"images_{factor}"
+    if lower == {".jpg"}:
+        # Upstream sees a .jpg first entry and resizes images/ into images_<f>_png itself, then
+        # pairs the two folders by sorted order. That pairing must be the identity.
+        if sorted(_png_key(n) for n in names) != [_png_key(n) for n in sorted(names)]:
+            raise ContractError(
+                "upstream pairs images/ with its resized .png copies by sorted name, and for "
+                "these file names the two orders differ; training would pair images with the "
+                "wrong cameras. Rename the images, or train with data_factor 1."
+            )
+        for n in names:
+            _link_or_copy(staged_dir / "images" / n, folder / n)
+        return {
+            "factor": factor,
+            "folder": folder.name,
+            "mode": "upstream_resize_from_jpg",
+            "rule": DOWNSCALE_RULE,
+        }
+    if lower != {".png"} or len(exts) != 1:
+        raise ContractError(
+            f"data_factor {factor} with image suffixes {sorted(exts)}: upstream reads a "
+            "downscaled folder as given for .png and resizes it itself for .jpg; for anything "
+            "else (or a mix) which pixels it trains on is not defined. Use data_factor 1."
+        )
+    from PIL import Image as PILImage
+
+    for n in names:
+        with PILImage.open(staged_dir / "images" / n) as im:
+            arr = np.asarray(im)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            raise ContractError(
+                f"{n} is not an RGB image (shape {arr.shape}); upstream slices [..., :3]"
+            )
+        h, w = arr.shape[:2]
+        size = (round(w / factor), round(h / factor))
+        out = folder / n
+        out.parent.mkdir(parents=True, exist_ok=True)
+        PILImage.fromarray(np.ascontiguousarray(arr[..., :3])).resize(size, PILImage.BICUBIC).save(
+            out
+        )
+    import PIL
+
+    return {
+        "factor": factor,
+        "folder": folder.name,
+        "mode": "minegs_png",
+        "rule": DOWNSCALE_RULE,
+        "pillow": PIL.__version__,
+    }
+
+
+def stage_depth_supervision(verified, staged_dir: Path) -> Path:
+    """Copy a verified depth supervision artifact into the staged tree, byte for byte."""
+    from minegs.core.provenance import sha256_tree
+
+    dst = Path(staged_dir) / "supervision" / "depth" / verified.record.supervision_id
+    if dst.exists():
+        shutil.rmtree(dst)
+    for f in sorted(p for p in Path(verified.path).iterdir() if p.is_file()):
+        _link_or_copy(f, dst / f.name)
+    got = sha256_tree(dst)
+    if got != verified.artifact_sha256:
+        raise ContractError(
+            f"the staged copy of {verified.record.supervision_id} hashes to {got[:12]}, not the "
+            f"verified {verified.artifact_sha256[:12]}"
+        )
+    return dst
+
+
 def stage_dataset(
     dataset_dir: Path,
     staged_dir: Path,
@@ -67,6 +178,8 @@ def stage_dataset(
     max_images: int | None = None,
     use_init_points: bool = True,
     chunk_id: str | None = None,
+    data_factor: int = 1,
+    clamp_init_rgb: bool = False,
 ) -> StagedDataset:
     dataset_dir = Path(dataset_dir)
     staged_dir = Path(staged_dir)
@@ -108,6 +221,20 @@ def stage_dataset(
     images = {iid: im for iid, im in model.images.items() if iid in keep_ids}
     init_src = "points3D.txt"
     points = model.points3D
+    if not use_init_points:
+        # Tracks naming an image that was not staged make upstream's parser raise KeyError
+        # (colmap.py:210); keep only the observations of staged images.
+        points = {}
+        for pid, p in model.points3D.items():
+            keep = np.isin(np.asarray(p.image_ids), list(keep_ids))
+            points[pid] = colmap_io.Point3D(
+                pid,
+                p.xyz,
+                p.rgb,
+                p.error,
+                np.asarray(p.image_ids)[keep],
+                np.asarray(p.point2D_idxs)[keep],
+            )
     if use_init_points:
         pc = read_ply(dataset_dir / manifest.initialization.file)
         if pc.frame not in ("LOCAL_METRIC", "UNKNOWN"):
@@ -125,8 +252,40 @@ def stage_dataset(
         for cid, c in model.cameras.items()
         if any(im.camera_id == cid for im in images.values())
     }
+    # Upstream rescales every camera's K by the first image's actual/expected size ratio
+    # (colmap.py:262-273), so an image that is not its camera's size would silently train on
+    # distorted intrinsics. The Phase 1 render gate refuses the same thing after training.
+    from minegs.eval.surface.render import require_images_match_cameras
+
+    require_images_match_cameras(dataset_dir, model.cameras, images)
+    if data_factor > 1:
+        # Upstream divides K and the image size by data_factor, then rescales every camera by
+        # the first image's actual/expected ratio (colmap.py:107, 262-273). Only when each
+        # size divides exactly is that ratio 1 for every camera, so that the trainer's K is the
+        # image's K and its image size is the size it renders.
+        odd = sorted(
+            f"camera {cid} {c.width}x{c.height}"
+            for cid, c in cams.items()
+            if c.width % data_factor or c.height % data_factor
+        )
+        if odd:
+            raise ContractError(
+                f"data_factor {data_factor} does not divide {', '.join(odd)}. Upstream would "
+                "train those cameras with a K scaled by another camera's rounding; use a factor "
+                "that divides every camera size, or data_factor 1."
+            )
+    clamped = None
+    if clamp_init_rgb:
+        lo, hi = APPEARANCE_RGB_RANGE
+        clamped = 0
+        for p in points.values():
+            rgb = np.asarray(p.rgb, dtype=np.int64)
+            clamped += int(((rgb < lo) | (rgb > hi)).sum())
+            p.rgb = np.clip(rgb, lo, hi).astype(np.uint8)
     staged_model = colmap_io.ColmapModel(cams, images, points)
     colmap_io.write_model(staged_model, staged_dir / "sparse" / "0")
+    colmap_io.write_model_binary(staged_model, staged_dir / "sparse" / "0")
+    downscale = stage_downscaled(staged_dir, chosen, int(data_factor))
     (staged_dir / "STAGED_FROM.txt").write_text(
         f"dataset_id={manifest.dataset_id}\nsource={dataset_dir}\nimages={len(chosen)}/{len(train)}\ninit={init_src}\n"
     )
@@ -137,4 +296,6 @@ def stage_dataset(
         subset=len(chosen) < len(train),
         init_points=len(points),
         init_source=init_src,
+        downscale=downscale,
+        init_rgb_clamped=clamped,
     )
