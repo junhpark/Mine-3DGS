@@ -840,3 +840,85 @@ def compare_runs_cmd(
         dump_json(rep, (out / RUN_COMPARISON_FILE) if out is not None else None)
 
     run_guarded(go)
+
+
+@app.command("chunk-set")
+def chunk_set_cmd(
+    dataset_dir: Path = typer.Argument(..., help="the dataset the chunk plan was cut from"),
+    chunk_plan: Path = typer.Option(..., help="chunks/<plan_id>/chunk_plan.json"),
+    run: list[Path] = typer.Option(..., "--run", help="runs/<id> of one chunk; repeat per chunk"),
+    sections: list[Path] = typer.Option(
+        [], "--sections", help="sections cut from one chunk run's surface on the whole-axis grid"
+    ),
+    reference_sections: Path = typer.Option(..., help="sections of the scanned reference cloud"),
+    ranges: str | None = typer.Option(None, help="default: the dataset's declared holdout"),
+    allow_incomplete: bool = typer.Option(
+        False, help="report a missing or failed chunk as missing instead of refusing the set"
+    ),
+    chunk_set_id: str = typer.Option("chunk-set"),
+    out: Path | None = typer.Option(None, help="directory for chunk_run_set.json"),
+) -> None:
+    """The chunk runs of one plan, read station by station from the chunk that owns each (Phase 5).
+
+    Each sections file names the run it was cut from, which is how it is paired with --run.
+    Refuses another dataset, plan, profile or grid, a chunk given twice, and — unless
+    --allow-incomplete — a missing or failed chunk. Overlap is never counted twice; seams are
+    numbers about agreement, not accuracy. Says G3: PENDING.
+    """
+    from minegs.chunks.compose import CHUNK_RUN_SET_FILE, ChunkInputs, compose_chunk_set
+    from minegs.core.errors import ContractError
+    from minegs.eval.sections import load_section_input
+    from minegs.train.runner.base import load_record
+
+    def record(path: Path):
+        rec, _ = load_section_input(path)
+        if rec is None:
+            raise ContractError(f"{path} is a bare section series; it names no run")
+        return rec
+
+    def go() -> None:
+        by_run: dict[str, object] = {}
+        for path in sections:
+            rec = record(path)
+            if rec.source.run_id is None:
+                raise ContractError(f"{path} was cut from a {rec.source.kind}, not a run's surface")
+            if rec.source.run_id in by_run:
+                raise ContractError(f"two sections files name run {rec.source.run_id}")
+            by_run[rec.source.run_id] = rec
+        inputs, used = [], set()
+        for run_dir in run:
+            run_id = load_record(run_dir).run_id
+            inputs.append(ChunkInputs(run_dir, by_run.get(run_id)))
+            used.add(run_id)
+        stray = sorted(set(by_run) - used)
+        if stray:
+            raise ContractError(f"sections were given for runs {stray} that are not in --run")
+        cs = compose_chunk_set(
+            dataset_dir,
+            chunk_plan,
+            inputs,
+            record(reference_sections),
+            chunk_set_id=chunk_set_id,
+            ranges=_ranges(ranges) or None,
+            allow_incomplete=allow_incomplete,
+        )
+        console.print(
+            f"chunk set [bold]{cs.chunk_set_id}[/]: plan {cs.plan_id}, "
+            f"{len(cs.chunks) - len(cs.missing_chunks)}/{len(cs.chunks)} chunks, coverage "
+            f"{cs.coverage_fraction:.3f} of {cs.requested_core_length_m:.2f} m"
+        )
+        if cs.missing_chunks:
+            console.print(f"  [yellow]missing {cs.missing_chunks} over {cs.missing_intervals_m}[/]")
+        for seam in cs.seams:
+            console.print(
+                f"  seam {seam['left']}|{seam['right']} over {seam['overlap_m']}: "
+                f"n={seam['n_paired_sections']} "
+                f"median |dA|={seam['median_abs_area_difference_m2']}"
+            )
+        console.print(f"  real_execution={cs.real_execution}  G3: {cs.g3_status}")
+        for n in cs.notes:
+            console.print(f"  [yellow]{n}[/]")
+        console.print(f"[bold]{cs.maturity_statement}[/]")
+        dump_json(cs, (out / CHUNK_RUN_SET_FILE) if out is not None else None)
+
+    run_guarded(go)
