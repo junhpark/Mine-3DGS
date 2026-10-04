@@ -93,7 +93,8 @@ provenance (minegs version, git, created_at — digest 밖)
 ### 5.1 core 와 ownership
 
 * 경계 `b_k = s_start + k·L` (k = 0 … n−1), `b_n = s_end`, `n = ceil((s_end − s_start)/L)`. 마지막 core 는
-  나머지 길이다.
+  나머지 길이다. 나머지가 overlap 이하이면 직전 core 에 합친다 — 직전 chunk 의 support 가 이미 축 끝까지
+  닿으므로 따로 학습할 것이 없고, 이미지 없는 sliver chunk 가 생기지 않는다 (C1 에서 정함).
 * chunk i 의 core = `[b_i, b_{i+1})`, 마지막 chunk 만 `[b_{n-1}, s_end]`. chainage `s` 의 소유자는 정확히
   하나다: `owner(s) = searchsorted(b_1..b_{n-1}, s + ε, right)` (ε = 1e-9 m) — 모든 소유 판정은 이 함수 하나.
 * support = `[max(s_start, b_i − overlap), min(s_end, b_{i+1} + overlap)]`.

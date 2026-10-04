@@ -15,7 +15,7 @@ app.add_typer(ingest.app, name="ingest", help="raw (E57 / video / 360) -> interm
 app.add_typer(
     dataset.app,
     name="dataset",
-    help="dataset contract: synthetic / validate / info / migrate / chunks",
+    help="dataset contract: synthetic / validate / info / migrate / chunk-plan",
 )
 app.add_typer(train.app, name="train", help="submit and inspect training runs (local / RunPod)")
 app.add_typer(
