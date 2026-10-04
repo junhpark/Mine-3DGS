@@ -62,6 +62,7 @@ minegs/
     common/  geometry(PanoConvention) · equirect(링 크롭) · colmap_io(rigs.txt/frames.txt 포함)
     e57/     _nodes(단일 pye57 seam) · inventory+models+exceptions(0B.1) · images+mapping(0B.2 증거 기반 매핑) · extract(0B.3 추출·마스크·manifest) · scan_split(deprecated) · tiles(PDAL) · pose_to_colmap · pano/{E57Embedded,ExternalJpeg,VendorExport}
     video/   frames(ffmpeg) · dedup_blur · masks · rig(360 → COLMAP rig) · sfm/{COLMAPIncremental,COLMAPGlobal,GLUEMAP(exp)}
+  chunks/    plan(ChunkPlanRecord · owner_index · verifier) · run(train_chunks 순차) · compose(ChunkRunSet · core-only stitching · seam 수치)
   train/     staging(쓰기 가능 복사본 + max_images 서브셋 + init_points→points3D + *.bin · images_<f>)
     supervision/  depth(DepthSupervisionRecord · 재도출 검증) · build(sfm_tracks · tls_projection) · support(holdout 판정)
     trainers/  advanced_gs(upstream trainer 그대로 + MineGS depth 항) · depth_term
@@ -251,7 +252,22 @@ minegs dataset depth-supervision-verify data/<id>/dataset data/<id>/dataset/supe
 minegs train run data/<id>/dataset --profile heavy --depth-supervision data/<id>/dataset/supervision/depth/<dsup_id>
 minegs eval compare-runs data/<id>/dataset --baseline-run <runs/a> --advanced-run <runs/b> \
     --baseline-sections .. --advanced-sections .. --baseline-reference-sections .. --advanced-reference-sections ..
+
+# Phase 5 — 장거리 갱도 chunk 학습과 합성 (core/overlap 은 사용자가 정한다)
+minegs dataset chunk-plan data/<id>/dataset --core-length-m 100 --overlap-m 20   # chunks/<plan_id>/chunk_plan.json
+minegs dataset chunk-plan-verify data/<id>/dataset data/<id>/dataset/chunks/<plan_id>/chunk_plan.json
+minegs train chunks data/<id>/dataset --chunk-plan data/<id>/dataset/chunks/<plan_id>/chunk_plan.json --profile light
+minegs eval chunk-set data/<id>/dataset --chunk-plan .. --run runs/<plan_id>/K000 --sections .. \
+    --run runs/<plan_id>/K001 --sections .. --reference-sections <스캔 reference sections> --out ..
 ```
+
+**Phase 5 chunking** ([계약](docs/PHASE5_CONTRACT.md)) — 나누는 것은 학습 단위뿐이다. 모든 chunk 는 같은
+`dataset_id`·`dataset_hash`·`LOCAL_METRIC` (`T_local_from_internal = I`) 에서 학습하고, chunk 의 학습
+이미지는 전역 split 의 train 이미지 중 그 chunk support 에 걸친 capture group 전체다 (360 ring·video 를
+쪼개지 않고, test·holdout 제외 이미지는 되살아나지 않는다). init 은 기존 support locator 로, depth 는
+전역 artifact 그대로 쓴다. 합성은 각 station 을 소유 chunk 하나에서만 읽으므로 overlap 이 두 번 적분되지
+않고, 누락 chunk 는 0 이 아니라 누락으로 보고된다. seam 수치는 두 복원의 일치도이지 정확도가 아니다.
+Gaussian 병합·chunk ICP·자동 chunk 크기는 범위 밖이고, **실제 GPU chunk 학습은 아직 수행되지 않았다**.
 
 프로파일은 backend 플래그가 아니라 **capability** 를 요청한다 (`requests: {antialiasing: true, ...}`).
 백엔드가 그 capability 를 *제공할 수 없으면* 이유와 함께 거부한다 (`capability_notes`).
@@ -290,6 +306,9 @@ artifact 지만 같은 측량 (SfM 재구성 또는 TLS) 에서 나오므로 독
 | `--profile heavy` (또는 heavy-depth) 에 `--depth-supervision` 없음 | `ContractError` (exit 2) | 증거 없는 depth run 금지 | — |
 | 오염·변조된 depth artifact (holdout 점/ray, held-out 이미지, held-out view 를 포함한 SfM track, 위치 불명 support, hash 불일치) | `ContractError` (exit 2) | 재도출 검증 | — |
 | dataset 의 `init_points.ply` 를 `--cloud` 로 | `ContractError` (exit 2) | init 이 깊이 증거를 사칭한다 | — |
+| `--core-length-m ≤ 0`, `--overlap-m < 0` 또는 `≥ core` | `ContractError` (exit 2) | 정의되지 않는 chunk | — |
+| gap·중복 소유가 있거나 생성 뒤 dataset·centerline 이 바뀐 chunk plan, plan 없는 `--chunk` | `ContractError` (exit 2) | chunk 는 검증된 plan 에서만 학습한다 (Phase 5 계약 §5.2, AD-1) | — |
+| 다른 dataset·plan·profile·chunk 의 run, 중복·누락·FAILED chunk 를 `eval chunk-set` 에 | `ContractError` (exit 2) — 누락·FAILED 는 `--allow-incomplete` 일 때만 incomplete set | 한 실험만 합성한다 (Phase 5 계약 §7) | — |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현. 필요한 단계는 `runner/runpod.py` docstring | Phase 6 |
 
 light 프로파일의 커맨드는 Phase 0D 와 바이트 단위로 같다: `--no-normalize_world_space`, depth 없음,
@@ -754,7 +773,7 @@ renderer** — 이고 전부 기록된다. T1–T30 이 거부를 고정한다.
 | 2 E57 end-to-end MVP (v0.1) | **implemented + structurally tested** — `minegs e2e run` / `status` / `report` 가 E57 한 개를 ingest→dataset→train→depth→surface→geometry→단면/체적→report 로 관통한다. stage 마다 입력 identity 를 다시 읽어 대조하므로 움직인 입력 위에 조용히 쌓지 않는다. 복원과 held-out TLS 를 같은 grid 에서 pair 하고 공통 구간에서만 체적을 비교한다. structural gate 는 테스트 시점에 쓴 실제 E57 에서 돌지만 **trainer·renderer 는 대체**되고 그 사실이 report 에 남는다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** ([runbook](docs/PHASE2_E57_G2.md)) |
 | 3 Image/360 독립 재구성 | **implemented + structurally tested** — 영상/360 → 프레임 집합 → SfM(`SFM_INTERNAL`, 임의 scale) → 측정된 Sim(3) 정합 → image-only dataset → 기존 학습·depth·surface·단면·체적 → TLS-assisted 대비 공통 구간 비교. 초기화는 재구성 자신의 점이고 holdout 구간은 실제로 빠진다. **실제 COLMAP·GPU·렌더러·실측 영상 미실행** — 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 남는다. **Phase 3 manual acceptance: DEFERRED**, **Phase 3 G2: PENDING**, 실측 과학적 검증: **NOT VALIDATED** |
 | 4 Advanced GS / heavy | **implemented + structurally tested** — metric depth supervision artifact (init 과 분리, holdout leakage 재도출), upstream trainer 를 그대로 실행하는 MineGS adapter, 실행 가능한 heavy profile·ablation, 요청↔실제 config 대조, baseline↔advanced 비교. **real GPU heavy training: NOT PERFORMED**, **G3: PENDING**, 실측 과학적 검증: **NOT VALIDATED** ([계약](docs/PHASE4_CONTRACT.md)) |
-| 5 장거리 갱도 · 청킹 | 예약만 (manifest.chunks) |
+| 5 장거리 갱도 · 청킹 | **implemented + structurally tested** — 중심선 chainage 기준 versioned chunk plan (core/support, `[lo,hi)` 소유권, atomic capture group, 전역 split 보존), 기존 run 경로 그대로의 chunk 학습 (같은 dataset·같은 `LOCAL_METRIC`), station 마다 소유 chunk 하나만 읽는 `ChunkRunSet` 합성 (coverage·누락 구간·holdout 평가·seam 일치도 수치, Gaussian 병합 없음). **real GPU chunked training: NOT PERFORMED**, **real long-tunnel mine dataset: NOT VALIDATED**, **optimal chunk size: NOT DETERMINED**, **G3: PENDING** ([계약](docs/PHASE5_CONTRACT.md)) |
 | 6 RunPod | **미구현, fail-closed** |
 | 7 Multi-epoch change | **미구현** — single manifest 는 change claim 불가 |
 | 8 Viewer / Export / Web | 부분 — Viser·export 구현, FastAPI 미착수 |
