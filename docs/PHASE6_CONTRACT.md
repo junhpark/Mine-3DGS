@@ -307,8 +307,10 @@ verifier 가 재현·반박했다. **20 건 중 14 건 확인 (major 4 · minor 
 (final gate 결과는 PR 본문에 그대로 기록한다.)
 
 * `ruff check .` · `ruff format --check .`: 통과.
-* `pytest` 전체 (일반 venv): 통과, skip 은 torch·live 항목뿐. torch 항목은 numpy<2 venv 에서
-  `test_phase4_trainer_torch`·`test_phase5_train_torch`·`test_phase6_torch` 통과.
+* `pytest` 전체 (일반 venv): **988 passed, 4 skipped** (torch 모듈 3 + live 1), 실패 0 (base 905
+  collected). torch 항목은 numpy<2 venv 에서 `test_phase4_trainer_torch`·`test_phase5_train_torch`·
+  `test_phase6_torch` **17 passed**.
+* hadolint (`Dockerfile.gpu`·`Dockerfile.cpu`, CI 와 같은 ignore 목록): 통과.
 * CI 의 Phase 6 CLI smoke (`bash -e`): dry run, key 없음·tag image 거부, key 값 미출력, volume 무변경 — 통과.
 * live RunPod: 사용하지 않음. 실제 GPU: 사용하지 않음. billable 호출: 없음.
 
