@@ -7,6 +7,7 @@ directory. Live RunPod execution: NOT PERFORMED.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -112,7 +113,7 @@ def test_a_local_run_is_unchanged_by_phase_6(synthetic, tmp_path, monkeypatch):
     monkeypatch.setenv("MINEGS_GSPLAT_TRAINER", str(script))
     monkeypatch.setattr(runner_local, "cuda_available", lambda: True)
     run_dir = tmp_path / "runs" / "plain"
-    h = get_runner("local", RunnerConfig(runner="local", native=True)).submit(
+    h = get_runner("local", RunnerConfig(runner="local", native=True, image=IMAGE)).submit(
         RunConfig(
             dataset_dir=str(synthetic.dataset_dir),
             profile="light",
@@ -130,6 +131,8 @@ def test_a_local_run_is_unchanged_by_phase_6(synthetic, tmp_path, monkeypatch):
     assert rec.command == cmd.argv and rec.runner == "local"
     assert rec.remote_execution is None and rec.remote_sync is None
     assert not (run_dir / "remote.json").exists()
+    # a bare-environment run ran in no image, so it records none (the pod's worker does)
+    assert rec.image is None and rec.docker_digest is None
 
 
 # ================================================================ refused before any cost
@@ -139,6 +142,8 @@ def test_a_local_run_is_unchanged_by_phase_6(synthetic, tmp_path, monkeypatch):
     "why,over,match",
     [
         ("unpinned image", {"image": "ghcr.io/example/minegs:gpu"}, "pinned by digest"),
+        ("short digest", {"image": "ghcr.io/example/minegs@sha256:abc"}, "pinned by digest"),
+        ("not sha256", {"image": "ghcr.io/example/minegs@md5:" + "a" * 32}, "pinned by digest"),
         ("no volume", {"network_volume_id": None}, "network_volume_id"),
         ("two GPUs", {"gpu_count": 2}, "exactly one GPU"),
         ("relative mount", {"volume_mount": "data"}, "volume_mount"),
@@ -256,6 +261,40 @@ def test_a_cancelled_run_is_cancelled_and_a_failed_one_stays_failed(synthetic, p
     assert h2.status() is RunStatus.FAILED and load_record(h2.run_dir).status is RunStatus.FAILED
 
 
+def test_a_cancel_whose_terminate_failed_is_not_cancelled(synthetic, pod_env):
+    """The pod may still be running (and billing): the error is raised, the run is not marked
+    cancelled, and a second cancel terminates it."""
+    client = pod_env.mode("running")
+    h = submit(synthetic, pod_env)
+    real = client.terminate_pod
+
+    def failing(pod_id):
+        raise ProviderError("RunPod terminate_pod: 503")
+
+    client.terminate_pod = failing
+    with pytest.raises(ProviderError, match="503"):
+        h.cancel()
+    assert h.status() is RunStatus.PENDING and load_record(h.run_dir).status is RunStatus.PENDING
+    rem = RemoteExecutionRecord.load(h.run_dir / "remote.json")
+    assert rem.cancel_requested_at and rem.terminated_at is None
+    assert any("terminate failed" in n for n in rem.notes)
+    client.terminate_pod = real
+    h.cancel()
+    assert h.status() is RunStatus.CANCELLED and client.terminated == ["pod001"]
+
+
+def test_a_run_is_fetched_with_the_image_it_was_submitted_with(synthetic, pod_env):
+    pod_env.mode("running")
+    h = submit(synthetic, pod_env)
+    other = "ghcr.io/example/minegs:gpu@sha256:" + "cd" * 32
+    with pytest.raises(ContractError, match="submitted with image"):
+        RunPodRunner(runpod_config(pod_env.volume, image=other)).attach(h.run_dir)
+    assert pod_env.client.start_container(pod_env.client.created[-1]) == 0
+    assert RunPodRunner(runpod_config(pod_env.volume)).attach(h.run_dir).status() is (
+        RunStatus.SUCCEEDED
+    )
+
+
 def test_a_trainer_that_exits_non_zero_fails_with_its_evidence(synthetic, pod_env):
     pod_env.trainer(exit_code=3)
     h = submit(synthetic, pod_env)
@@ -369,7 +408,42 @@ def test_credentials_never_reach_records_logs_or_errors(synthetic, pod_env, monk
     for s in secrets:
         assert s not in text
     assert "RUNPOD_API_KEY" in text  # the name is recorded, the value is not
-    assert redact("Authorization: Bearer abc.def") == "***"
+    assert redact("Authorization: Bearer abc.def") == "Authorization: ***"
+
+
+@pytest.mark.parametrize(
+    "text, leaked",
+    [
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA"),
+        ("authorization: Token tok-0123456789", "tok-0123456789"),
+        (
+            "Authorization: AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us/s3/aws4_request, "
+            "SignedHeaders=host, Signature=feedfacecafe\nnext",
+            "feedfacecafe",
+        ),
+        ('{"Authorization": "Bearer sk-live-abc", "x": 1}', "sk-live-abc"),
+        ("{'authorization': 'Basic zzzzzz', 'a': 2}", "zzzzzz"),
+        ("retrying with bearer abc.def-123", "abc.def-123"),
+    ],
+)
+def test_any_authorization_header_is_redacted(text, leaked):
+    out = redact(text, {})
+    assert leaked not in out and "***" in out
+
+
+def test_rclone_errors_are_redacted_before_they_are_shortened(tmp_path, monkeypatch):
+    """A secret straddling the cut would survive a truncate-then-redact as an unmatched half."""
+    from minegs.train.remote.store import RcloneStore
+
+    secret = "s3-secret-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    exe = tmp_path / "rclone"
+    exe.write_text(f"#!/bin/sh\necho 'secret {secret}' >&2\nprintf '%0780d' 0 >&2\nexit 1\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    with pytest.raises(ContractError) as ei:
+        RcloneStore("vol:x").exists("a")
+    assert secret[-12:] not in str(ei.value) and "***" in str(ei.value)
 
 
 # ================================================================ CLI

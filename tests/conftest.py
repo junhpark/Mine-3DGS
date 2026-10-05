@@ -1,10 +1,30 @@
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 from minegs.core.synthetic import SyntheticResult, SyntheticSpec, generate
 
 from e57_fakes import FakeHeader, FakeNode, install_fake_pye57
+
+
+def pytest_collection_modifyitems(config, items):
+    """A billable live test runs only when the marker is asked for by name (Phase 6 §7).
+
+    ``MINEGS_RUNPOD_LIVE=1`` alone never starts one: without ``-m runpod_live`` (and not
+    ``not runpod_live``) every ``runpod_live`` item is skipped here, whatever its own guards say.
+    """
+    expr = config.getoption("markexpr") or ""
+    asked = re.search(r"\brunpod_live\b", expr) and not re.search(r"\bnot\s+runpod_live\b", expr)
+    if asked:
+        return
+    skip = pytest.mark.skip(
+        reason="billable: runs only with -m runpod_live and MINEGS_RUNPOD_LIVE=1"
+    )
+    for item in items:
+        if item.get_closest_marker("runpod_live") is not None:
+            item.add_marker(skip)
 
 
 @pytest.fixture(scope="session")

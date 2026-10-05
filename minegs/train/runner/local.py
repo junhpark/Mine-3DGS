@@ -255,7 +255,7 @@ class LocalRunner(Runner):
         record.T_local_from_internal = cmd.T_local_from_internal.to_list()
         record.trainer = dict(cmd.trainer)
         record.expected_trainer_config = dict(cmd.expected_config)
-        record.image = self.config.image or None
+        record.image = self.recorded_image()[0]
         record.max_steps = profile.max_steps
         record.runtime = (
             runtime_info()

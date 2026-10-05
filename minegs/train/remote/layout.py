@@ -28,6 +28,7 @@ CLAIM_FILE = "claim"
 WORKER_LOG = "worker.log"
 CANCEL_FILE = "cancel_requested.json"
 DATASET_CLAIM_FILE = "dataset.json"
+CHUNK_PLAN_FILE = "chunk_plan.json"
 OUTPUT_MANIFEST_FILE = "output_manifest.json"
 
 
@@ -102,6 +103,7 @@ class RemoteLayout:
 
 __all__ = [
     "CANCEL_FILE",
+    "CHUNK_PLAN_FILE",
     "CLAIM_FILE",
     "DATASET_CLAIM_FILE",
     "INPUTS_FILE",

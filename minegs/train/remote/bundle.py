@@ -19,6 +19,7 @@ from minegs.core.config import VersionedModel, canonical_json
 from minegs.core.errors import ContractError
 from minegs.core.provenance import sha256_file, sha256_tree_of, tree_files
 from minegs.train.remote.layout import (
+    CHUNK_PLAN_FILE,
     DATASET_CLAIM_FILE,
     INPUTS_FILE,
     RemoteLayout,
@@ -110,17 +111,44 @@ def require_dataset_dir(path: str | Path) -> Path:
     return p
 
 
+def _refuse_link(root: Path, f: Path, what: str) -> Path:
+    """``f`` as a plain file under ``root``: no symlinked component, nothing resolving outside.
+
+    A link is never followed into a pod (§5): it can point at survey sources or any other file
+    on this machine, and the bytes uploaded would then not be the dataset's own.
+    """
+    rel = f.relative_to(root)
+    cur = root
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise ContractError(
+                f"{what} {root}: {cur.relative_to(root).as_posix()} is a symlink; nothing is "
+                "uploaded through a link (it can point at raw data or any file on this machine). "
+                "Copy the file into place"
+            )
+    real = f.resolve()
+    if not real.is_relative_to(root.resolve()):
+        raise ContractError(f"{what} {root}: {rel.as_posix()} resolves outside it ({real})")
+    if f.suffix.lower() in RAW_SUFFIXES or real.suffix.lower() in RAW_SUFFIXES:
+        raise ContractError(
+            f"{what} {root} holds survey source files ({rel.as_posix()}); raw data never goes "
+            "to a pod. Remove it from the dataset (it belongs in raw/)"
+        )
+    return f
+
+
 def dataset_file_table(dataset_dir: Path) -> dict[str, str]:
-    """``{relative path: sha256}`` of exactly the files the dataset hash covers, raw refused."""
+    """``{relative path: sha256}`` of exactly the files the dataset hash covers.
+
+    Raw sources are refused, and so is any symlink on the way to a file (§5).
+    """
     from minegs.train.runner.base import DATASET_HASH_PATTERNS
 
-    files = tree_files(dataset_dir, DATASET_HASH_PATTERNS)
-    raw = [str(f.relative_to(dataset_dir)) for f in files if f.suffix.lower() in RAW_SUFFIXES]
-    if raw:
-        raise ContractError(
-            f"{dataset_dir} holds survey source files inside the dataset tree ({raw[:3]}); raw "
-            "data never goes to a pod. Remove them from the dataset (they belong in raw/)"
-        )
+    files = [
+        _refuse_link(dataset_dir, f, "dataset")
+        for f in tree_files(dataset_dir, DATASET_HASH_PATTERNS)
+    ]
     return {f.relative_to(dataset_dir).as_posix(): sha256_file(f) for f in files}
 
 
@@ -145,12 +173,13 @@ def publish_inputs(
     *,
     chunk_plan_file: Path | None = None,
     depth_dir: Path | None = None,
+    depth_files: list[str] | None = None,
 ) -> RunInputBundle:
     """Upload the dataset and sidecars, then publish ``inputs.json``. Returns the sealed bundle.
 
     Write-once and collision checks come first, before any byte moves: a run id that already has
     a job or a run on the volume is refused, and so is a content-addressed dataset path whose
-    claim names another hash.
+    claim names another hash. A claimed dataset path is reused as it is, never re-uploaded.
     """
     run_id = safe_id(bundle.run_id, "run_id")
     for rel in (layout.job(run_id), layout.run(run_id)):
@@ -175,25 +204,31 @@ def publish_inputs(
                 f"{store.describe()}/{claim_rel} claims {have}, not {claim}: the dataset path for "
                 "this hash holds something else. Nothing was overwritten"
             )
-    store.upload_files(dataset_dir, sorted(table), ds_rel)
     if raw_claim is None:
+        # Content-addressed and written once: the claim goes last, so a claimed path is a whole
+        # upload, and a claimed path is never written again (the pod re-hashes what it reads).
+        store.upload_files(dataset_dir, sorted(table), ds_rel)
         store.write_atomic(claim_rel, canonical_json(claim).encode())
 
     if bundle.chunk is not None:
         if chunk_plan_file is None:
             raise ContractError("a chunk run needs its plan file to upload")
-        store.upload_files(
-            chunk_plan_file.parent,
-            [chunk_plan_file.name],
-            layout.chunk_plan(bundle.chunk.plan_digest),
+        # Under the name the bundle gives the pod, whatever the local file was called.
+        store.write_atomic(
+            f"{layout.chunk_plan(bundle.chunk.plan_digest)}/{CHUNK_PLAN_FILE}",
+            Path(chunk_plan_file).read_bytes(),
         )
     if bundle.depth_supervision is not None:
-        if depth_dir is None:
-            raise ContractError("a depth-supervised run needs its artifact directory to upload")
-        files = sorted(
-            p.relative_to(depth_dir).as_posix() for p in depth_dir.rglob("*") if p.is_file()
+        if depth_dir is None or not depth_files:
+            raise ContractError(
+                "a depth-supervised run needs its verified artifact files to upload"
+            )
+        # Exactly the files the verified record names, nothing re-enumerated after the check.
+        for rel in depth_files:
+            _refuse_link(depth_dir, depth_dir / rel, "depth artifact")
+        store.upload_files(
+            depth_dir, sorted(depth_files), layout.depth(bundle.depth_supervision.artifact_sha256)
         )
-        store.upload_files(depth_dir, files, layout.depth(bundle.depth_supervision.artifact_sha256))
 
     sealed = bundle.sealed()
     store.write_atomic(f"{layout.job(run_id)}/{INPUTS_FILE}", _json(sealed))

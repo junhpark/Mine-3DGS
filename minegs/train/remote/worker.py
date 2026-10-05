@@ -28,6 +28,7 @@ from minegs.train.remote.bundle import (
     load_bundle,
 )
 from minegs.train.remote.layout import (
+    CHUNK_PLAN_FILE,
     CLAIM_FILE,
     OUTPUT_MANIFEST_FILE,
     STATUS_FILE,
@@ -108,6 +109,7 @@ class RemoteWorkerRunner(LocalRunner):
     """LocalRunner's native execution, recorded as what it is: a RunPod run."""
 
     name = "runpod"
+    native_runs_in_image = True
 
     def __init__(
         self, config: RunnerConfig, bundle: RunInputBundle, pod_dataset_hash: str, gpu: dict
@@ -158,9 +160,9 @@ class RemoteWorkerRunner(LocalRunner):
         return run, manifest, profile, record
 
 
-def verify_pod_inputs(bundle: RunInputBundle) -> tuple[str, dict[str, Any]]:
-    """Everything the bundle claims, re-derived from what the pod sees. Returns the dataset hash
-    and the GPU description. Nothing here trusts the submitter's checks."""
+def verify_pod_inputs(bundle: RunInputBundle) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """Everything the bundle claims, re-derived from what the pod sees. Returns the dataset hash,
+    the GPU description and the verified file table. Nothing here trusts the submitter's checks."""
     from minegs.chunks.plan import load_chunk_plan, verify_chunk_plan
     from minegs.train.supervision.depth import verify_depth_supervision
 
@@ -203,7 +205,7 @@ def verify_pod_inputs(bundle: RunInputBundle) -> tuple[str, dict[str, Any]]:
     if bundle.chunk is not None:
         plan_file = Path(bundle.chunk.path)
         if plan_file != Path(layout.pod(layout.chunk_plan(bundle.chunk.plan_digest))) / (
-            "chunk_plan.json"
+            CHUNK_PLAN_FILE
         ):
             raise ContractError(f"chunk plan path {plan_file} is not its digest-addressed path")
         plan = load_chunk_plan(plan_file)
@@ -223,7 +225,29 @@ def verify_pod_inputs(bundle: RunInputBundle) -> tuple[str, dict[str, Any]]:
                 f"the depth artifact on the volume is {verified.artifact_sha256[:12]}, not "
                 f"{bundle.depth_supervision.artifact_sha256[:12]}"
             )
-    return pod_hash, gpu
+    return pod_hash, gpu, table
+
+
+def verify_staged_inputs(run_dir: Path, table: dict[str, str]) -> None:
+    """The images and masks the trainer read are the verified dataset's bytes.
+
+    Staging links (or copies) them out of the dataset on the volume after the pod hashed it;
+    checking them again after the run closes the window in which the volume could have changed
+    under the trainer.
+    """
+    staged = Path(run_dir) / "staged"
+    for sub in ("images", "masks"):
+        root = staged / sub
+        if not root.is_dir():
+            continue
+        for f in sorted(p for p in root.rglob("*") if p.is_file()):
+            rel = f"{sub}/{f.relative_to(root).as_posix()}"
+            want = table.get(rel)
+            if want is None or sha256_file(f) != want:
+                raise ContractError(
+                    f"staged {rel} is not the verified dataset's file; the bytes the trainer "
+                    "read are not the dataset that was submitted"
+                )
 
 
 def write_output_manifest(
@@ -282,7 +306,7 @@ def run_worker(inputs: str | Path, poll_s: float = 5.0) -> int:
     run_dir = Path(bundle.paths["run"])
     try:
         try:
-            pod_hash, gpu = verify_pod_inputs(bundle)
+            pod_hash, gpu, table = verify_pod_inputs(bundle)
         except GpuUnsupportedError as e:
             return job.finish(False, EXIT_REFUSED, failure_stage="gpu_unsupported", message=str(e))
         except ContractError as e:
@@ -337,11 +361,18 @@ def run_worker(inputs: str | Path, poll_s: float = 5.0) -> int:
         rec.runtime = {**rec.runtime, "source": "runpod_pod"}
         runner.write_record(rec, run_dir)
         ok = final is RunStatus.SUCCEEDED and rec.status is RunStatus.SUCCEEDED and trainer_rc == 0
-        code = EXIT_OK if ok else EXIT_RUN_FAILED
-        manifest_sha = write_output_manifest(run_dir, bundle, rec.status.value, code)
         stage = None
         if not ok:
             stage = "trainer_exit" if trainer_rc != 0 else "output_verification"
+        else:
+            try:
+                verify_staged_inputs(run_dir, table)
+            except ContractError as e:
+                ok, stage = False, "input_verification"
+                rec.status, rec.failure_reason = RunStatus.FAILED, str(e)
+                runner.write_record(rec, run_dir)
+        code = EXIT_OK if ok else EXIT_RUN_FAILED
+        manifest_sha = write_output_manifest(run_dir, bundle, rec.status.value, code)
         return job.finish(
             ok,
             code,
@@ -369,6 +400,7 @@ __all__ = [
     "RemoteWorkerRunner",
     "run_worker",
     "verify_pod_inputs",
+    "verify_staged_inputs",
     "visible_gpus",
     "write_output_manifest",
 ]

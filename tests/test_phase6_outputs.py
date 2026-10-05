@@ -118,6 +118,21 @@ def _forge(run, job, edit) -> None:
         ),
         (lambda d: d.update(runner="local"), "runner local"),
         (lambda d: d["remote_sync"].update(input_bundle_digest="f" * 64), "input bundle"),
+        (lambda d: d["remote_sync"].update(pod_dataset_hash="0" * 64), "pod dataset hash"),
+        (lambda d: d.update(chunk_id="K001"), "chunk K001"),
+        (
+            lambda d: d.update(chunk={"plan_id": "p", "plan_digest": "e" * 64}),
+            "chunk None",
+        ),
+        (lambda d: d["remote_sync"].update(chunk_plan_digest="e" * 64), "chunk None"),
+        (
+            lambda d: d.update(depth_supervision={"artifact_sha256": "e" * 64}),
+            "depth supervision artifact",
+        ),
+        (
+            lambda d: d["remote_sync"].update(depth_artifact_sha256="e" * 64),
+            "depth supervision artifact",
+        ),
     ],
 )
 def test_a_run_record_that_is_not_the_submitted_run_is_refused(synthetic, pod_env, edit, match):
@@ -125,6 +140,29 @@ def test_a_run_record_that_is_not_the_submitted_run_is_refused(synthetic, pod_en
     _forge(run, job, edit)
     rem = _assert_not_published(h)
     assert match in rem.failure_message
+
+
+def test_a_partial_file_from_the_pod_is_never_published(synthetic, pod_env):
+    """The pod's manifest leaves ``.partial`` files out; pulled, one is a file nobody verified."""
+    h, run, _job = _finished(synthetic, pod_env)
+    (run / "point_cloud" / "point_cloud_9.ply.partial").write_bytes(b"half a cloud")
+    rem = _assert_not_published(h)
+    assert "not in the manifest" in rem.failure_message
+
+
+@pytest.mark.parametrize("garbage", [b"not json", b'{"run_id": 3}', b"[]"])
+def test_an_unparseable_manifest_fails_the_run_and_releases_the_pod(synthetic, pod_env, garbage):
+    """Even sealed into the status, a manifest that does not parse is a failed pull — the handle
+    does not crash, the run does not hang in RUNNING, and the pod is terminated."""
+    h, run, job = _finished(synthetic, pod_env)
+    (run / OUTPUT_MANIFEST_FILE).write_bytes(garbage)
+    js = JobStatus.load(job / "status.json")
+    js.model_copy(update={"output_manifest_sha256": hashlib.sha256(garbage).hexdigest()}).save(
+        job / "status.json"
+    )
+    rem = _assert_not_published(h)
+    assert "output manifest" in rem.failure_message
+    assert rem.terminated_at and pod_env.client.terminated == [rem.pod_id]
 
 
 def test_outputs_never_land_on_foreign_files(synthetic, pod_env):

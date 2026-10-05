@@ -116,30 +116,34 @@ def tree_digest(entries: list[OutputEntry]) -> str:
     return h.hexdigest()
 
 
-def _output_files(run_dir: Path, manifest_name: str) -> list[Path]:
+def _output_files(run_dir: Path, manifest_name: str, strict: bool = False) -> list[Path]:
+    """The files a run's outputs are. ``strict`` (the pulling side) leaves nothing out: a
+    ``.partial`` the pod skipped is, once pulled, a file the manifest does not name."""
     out = []
     for p in sorted(run_dir.rglob("*")):
         rel = p.relative_to(run_dir)
         if rel.parts and rel.parts[0] in OUTPUT_EXCLUDE:
             continue
-        if p.is_file() and rel.as_posix() != manifest_name and not p.name.endswith(".partial"):
+        if not p.is_file() or rel.as_posix() == manifest_name:
+            continue
+        if strict or not p.name.endswith(".partial"):
             out.append(p)
     return out
 
 
-def output_entries(run_dir: Path, manifest_name: str) -> list[OutputEntry]:
+def output_entries(run_dir: Path, manifest_name: str, strict: bool = False) -> list[OutputEntry]:
     return [
         OutputEntry(
             path=p.relative_to(run_dir).as_posix(), size=p.stat().st_size, sha256=sha256_file(p)
         )
-        for p in _output_files(run_dir, manifest_name)
+        for p in _output_files(run_dir, manifest_name, strict)
     ]
 
 
 def verify_output_tree(root: Path, manifest: RemoteOutputRecord, manifest_name: str) -> str:
     """Every manifest entry present with its size and digest, and nothing else. Returns the digest
     re-computed from the bytes on this side."""
-    have = {e.path: e for e in output_entries(root, manifest_name)}
+    have = {e.path: e for e in output_entries(root, manifest_name, strict=True)}
     want = {e.path: e for e in manifest.entries}
     missing = sorted(set(want) - set(have))
     extra = sorted(set(have) - set(want))

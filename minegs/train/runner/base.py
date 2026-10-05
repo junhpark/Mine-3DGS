@@ -271,6 +271,16 @@ class RunHandle(ABC):
 
 class Runner(ABC):
     name: str = "abstract"
+    #: Whether a ``native`` run executes inside ``config.image``. A developer's bare-environment
+    #: run does not, so it records no image (nothing ran in one); the RunPod worker does — the
+    #: pod is a container of that image — so it records the image it ran in.
+    native_runs_in_image: ClassVar[bool] = False
+
+    def recorded_image(self) -> tuple[str | None, str | None]:
+        """``(image, docker_digest)`` as the run record states them."""
+        if self.config.native and not self.native_runs_in_image:
+            return None, None
+        return self.config.image or None, self.config.image_digest()
 
     def __init__(self, config: RunnerConfig) -> None:
         self.config = config
@@ -376,7 +386,7 @@ class Runner(ABC):
             backend={"name": backend.name, "version": backend.version()},
             profile=profile.model_dump(mode="json"),
             runner=self.name,
-            docker_digest=self.config.image_digest(),
+            docker_digest=self.recorded_image()[1],
             T_tls_from_local=T_tls_from_local.to_list(),
             provenance=stamp(run.model_dump(mode="json"), parents=[manifest.dataset_id]),
             capabilities={"requested": dict(profile.requests), "resolved": enabled},

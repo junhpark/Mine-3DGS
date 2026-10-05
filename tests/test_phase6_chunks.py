@@ -110,7 +110,7 @@ def test_a_depth_supervised_chunk_reaches_the_pod_whole(tunnel, pod_env):
     assert bundle.profile == "heavy-depth" and bundle.dataset_hash == rec.dataset_hash
     assert bundle.chunk.plan_digest == tunnel.plan.plan_digest and bundle.chunk.chunk_id == "K001"
     assert bundle.depth_supervision.artifact_sha256 == sup.artifact_sha256
-    pod_hash, _gpu = verify_pod_inputs(bundle)
+    pod_hash, _gpu, _table = verify_pod_inputs(bundle)
     assert pod_hash == rec.dataset_hash
     remote_ds = bundle.paths["dataset"]
     plan = load_chunk_plan(bundle.chunk.path)
@@ -123,3 +123,43 @@ def test_a_depth_supervised_chunk_reaches_the_pod_whole(tunnel, pod_env):
     )
     assert sorted(st.images) == tunnel.plan.chunk("K001").images
     assert h.status() is RunStatus.PENDING
+
+
+def test_a_plan_file_under_any_local_name_reaches_the_pod_as_its_digest(tunnel, pod_env):
+    """The pod reads ``<digest>/chunk_plan.json``; the local file's own name does not travel."""
+    renamed = pod_env.tmp / "elsewhere" / "my_plan_v2.json"
+    renamed.parent.mkdir()
+    shutil.copyfile(tunnel.plan_path, renamed)
+    pod_env.trainer(span=50.0)
+    h = submit(
+        None,
+        pod_env,
+        dataset_dir=tunnel.dataset_dir,
+        overrides={"max_steps": 10},
+        chunk_id="K001",
+        chunk_plan=str(renamed),
+    )
+    assert h.wait(poll_s=0.01) is RunStatus.SUCCEEDED, load_record(h.run_dir).failure_reason
+    rec = load_record(h.run_dir)
+    plan_dir = pod_env.volume / layout_of(pod_env, rec).chunk_plan(tunnel.plan.plan_digest)
+    assert sorted(p.name for p in plan_dir.iterdir()) == ["chunk_plan.json"]
+
+
+def test_only_the_verified_depth_files_go_up(tunnel, pod_env):
+    """The artifact's two named files, not whatever its directory holds by upload time."""
+    from minegs.train.supervision.build import build_tls_projection
+    from minegs.train.supervision.depth import RECORD_FILE
+
+    sup = build_tls_projection(tunnel.dataset_dir, tunnel.cloud, pod_env.tmp / "dsup")
+    pod_env.mode("running")
+    h = submit(
+        None,
+        pod_env,
+        dataset_dir=tunnel.dataset_dir,
+        profile="heavy-depth",
+        overrides={"max_steps": 10},
+        depth_supervision=str(sup.path),
+    )
+    rec = load_record(h.run_dir)
+    art = pod_env.volume / layout_of(pod_env, rec).depth(sup.artifact_sha256)
+    assert sorted(p.name for p in art.iterdir()) == sorted([RECORD_FILE, sup.record.samples_file])

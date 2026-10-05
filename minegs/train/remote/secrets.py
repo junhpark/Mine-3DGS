@@ -20,7 +20,11 @@ _SECRET_NAMES = re.compile(
 )
 #: Shorter than this a "secret" is not one, and redacting it would mangle ordinary text.
 _MIN_SECRET_LEN = 6
-_BEARER = re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?\S+|bearer\s+[A-Za-z0-9._~+/=-]+")
+#: An Authorization header in any scheme (Bearer, Basic, Token, AWS4-HMAC-SHA256 ...): the value
+#: is the rest of the line, or the quoted string in a JSON/dict rendering of the headers.
+_AUTH_QUOTED = re.compile(r"""(?i)(authorization["']?\s*[:=]\s*)(["'])(?:\\.|(?!\2).)*\2""")
+_AUTH_LINE = re.compile(r"(?i)(authorization\s*[:=]\s*)[^\r\n]*")
+_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 
 
 def secret_env_names(environ: dict[str, str] | None = None) -> list[str]:
@@ -39,7 +43,9 @@ def redact(text: object, environ: dict[str, str] | None = None) -> str:
     s = str(text)
     for v in secret_values(environ):
         s = s.replace(v, "***")
-    return _BEARER.sub("***", s)
+    s = _AUTH_QUOTED.sub(r"\1\2***\2", s)
+    s = _AUTH_LINE.sub(r"\1***", s)
+    return _BEARER.sub("Bearer ***", s)
 
 
 __all__ = ["API_KEY_ENV", "redact", "secret_env_names", "secret_values"]

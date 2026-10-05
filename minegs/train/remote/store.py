@@ -88,6 +88,8 @@ class LocalDirStore(RemoteStore):
         dest = self.path(dest_rel)
         for rel in files:
             src = Path(src_root) / _rel(rel)
+            if src.is_symlink():
+                raise ContractError(f"{src} is a symlink; nothing is uploaded through a link")
             out = dest / rel
             out.parent.mkdir(parents=True, exist_ok=True)
             tmp = out.with_name(out.name + ".partial")
@@ -132,8 +134,10 @@ class RcloneStore(RemoteStore):
     def _run(self, *args: str, ok: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
         out = subprocess.run([self.exe, *args], capture_output=True, check=False)
         if out.returncode not in ok:
-            err = out.stderr.decode(errors="replace").strip()[-800:]
-            raise ContractError(f"rclone {args[0]} failed ({out.returncode}): {redact(err)}")
+            # Redacted whole, then shortened: a cut could split a secret so that it no longer
+            # matches, and the surviving half would be printed.
+            err = redact(out.stderr.decode(errors="replace").strip())[-800:]
+            raise ContractError(f"rclone {args[0]} failed ({out.returncode}): {err}")
         return out
 
     def exists(self, rel: str) -> bool:

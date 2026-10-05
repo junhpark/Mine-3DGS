@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ from minegs.train.remote.bundle import (
 )
 from minegs.train.remote.layout import (
     CANCEL_FILE,
+    CHUNK_PLAN_FILE,
     OUTPUT_MANIFEST_FILE,
     STATUS_FILE,
     WORKER_LOG,
@@ -72,6 +74,7 @@ from minegs.train.runner.base import (
     RunStatus,
     load_record,
 )
+from minegs.train.supervision.depth import RECORD_FILE
 
 REMOTE_FILE = "remote.json"
 
@@ -91,7 +94,6 @@ class RemoteExecutionRecord(VersionedModel):
 
     run_id: str
     dataset_id: str
-    provider: str = "runpod"
     credential_source: str
     storage: str
     network_volume_id: str
@@ -102,6 +104,10 @@ class RemoteExecutionRecord(VersionedModel):
     job_path: str
     run_path: str
     local_dataset_hash: str
+    #: The sidecar identities submitted (``{plan_id, plan_digest, chunk_id}``; the depth
+    #: artifact sha256). The pulled run.json must carry the same.
+    chunk: dict[str, str] | None = None
+    depth_artifact_sha256: str | None = None
     input_bundle_digest: str | None = None
     state: str = "submitting"
     #: True once a pod was created: the computation was handed to the provider.
@@ -136,6 +142,14 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+#: ``repo@sha256:<64 hex>`` — the only image reference a RunPod run accepts.
+_PINNED_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+
+
+def _image_digest(image: str) -> str | None:
+    return image.split("@", 1)[1] if _PINNED_IMAGE.match(image or "") else None
+
+
 class RunPodRunner(Runner):
     name = "runpod"
     #: Builds the provider client. Tests substitute a fake here; nothing else is substituted.
@@ -144,7 +158,7 @@ class RunPodRunner(Runner):
     # ---------------------------------------------------------------- checks before cost
     def _check_config(self) -> None:
         cfg = self.config
-        if not cfg.image_digest():
+        if not cfg.image_digest() or not _PINNED_IMAGE.match(cfg.image):
             raise ContractError(
                 f"runner image {cfg.image!r} is not pinned by digest (repo@sha256:...). A RunPod "
                 "run and a local run are the same computation only on the same image digest"
@@ -191,16 +205,18 @@ class RunPodRunner(Runner):
         if run.chunk_plan is not None:
             plan, planned = self._chunk
             plan_file = Path(run.chunk_plan)
-            plan_file = plan_file / "chunk_plan.json" if plan_file.is_dir() else plan_file
+            plan_file = plan_file / CHUNK_PLAN_FILE if plan_file.is_dir() else plan_file
             chunk = ChunkInput(
                 chunk_id=planned.chunk_id,
                 plan_id=plan.plan_id,
                 plan_digest=plan.plan_digest,
-                path=f"{layout.pod(layout.chunk_plan(plan.plan_digest))}/chunk_plan.json",
+                path=f"{layout.pod(layout.chunk_plan(plan.plan_digest))}/{CHUNK_PLAN_FILE}",
             )
         verified = getattr(self, "_verified_supervision", None)
+        depth_files = None
         if verified is not None:
             depth_dir = Path(run.depth_supervision)
+            depth_files = [RECORD_FILE, verified.record.samples_file]
             depth = DepthInput(
                 supervision_id=verified.record.supervision_id,
                 artifact_sha256=verified.artifact_sha256,
@@ -230,7 +246,7 @@ class RunPodRunner(Runner):
             submitter={"git_commit": git_commit()},
             created_at=_now(),
         )
-        return layout, bundle, plan_file, depth_dir
+        return layout, bundle, plan_file, depth_dir, depth_files
 
     def _pod_spec(self, layout: RemoteLayout, run_id: str, gpu_type: str) -> PodSpec:
         cfg = self.config
@@ -274,7 +290,7 @@ class RunPodRunner(Runner):
             run.run_dir = str(Path(td) / "run")
             run, _manifest, profile, record = self.prepare(run)
             table = dataset_file_table(ds)
-            layout, bundle, _plan, _depth = self._bundle(run, record, profile, table)
+            layout, bundle, *_files = self._bundle(run, record, profile, table)
         return {
             "storage": store.describe(),
             "credential_source": credential,
@@ -299,7 +315,9 @@ class RunPodRunner(Runner):
             raise ContractError(
                 f"{ds} changed while the run was being prepared (dataset hash moved); submit again"
             )
-        layout, bundle, plan_file, depth_dir = self._bundle(run, record, profile, table)
+        layout, bundle, plan_file, depth_dir, depth_files = self._bundle(
+            run, record, profile, table
+        )
 
         record.status = RunStatus.PENDING
         record.image = self.config.image
@@ -317,6 +335,16 @@ class RunPodRunner(Runner):
             job_path=layout.job(run.run_id),
             run_path=layout.run(run.run_id),
             local_dataset_hash=record.dataset_hash,
+            chunk=None
+            if bundle.chunk is None
+            else {
+                "plan_id": bundle.chunk.plan_id,
+                "plan_digest": bundle.chunk.plan_digest,
+                "chunk_id": bundle.chunk.chunk_id,
+            },
+            depth_artifact_sha256=None
+            if bundle.depth_supervision is None
+            else bundle.depth_supervision.artifact_sha256,
         )
         _write_remote(rem, run_dir)
 
@@ -329,7 +357,14 @@ class RunPodRunner(Runner):
 
         try:
             sealed = publish_inputs(
-                store, layout, bundle, ds, table, chunk_plan_file=plan_file, depth_dir=depth_dir
+                store,
+                layout,
+                bundle,
+                ds,
+                table,
+                chunk_plan_file=plan_file,
+                depth_dir=depth_dir,
+                depth_files=depth_files,
             )
         except ContractError as e:
             fail("input_sync", e)
@@ -373,6 +408,11 @@ class RunPodRunner(Runner):
         if not p.is_file():
             raise ContractError(f"{run_dir}: no {REMOTE_FILE}; not a RunPod run submitted here")
         rem = RemoteExecutionRecord.load(p)
+        if rem.image != self.config.image:
+            raise ContractError(
+                f"{run_dir} was submitted with image {rem.image}; the config names "
+                f"{self.config.image}. A run is fetched with the config it was submitted with"
+            )
         if rem.volume_mount != safe_mount(self.config.volume_mount):
             raise ContractError(
                 f"{run_dir} ran with volume_mount {rem.volume_mount}, the config says "
@@ -466,7 +506,7 @@ class RunPodHandle(RunHandle):
             return RunStatus.UNKNOWN
         if js is not None and js.final:
             return self._finish(js)
-        if self._rem.cancel_requested_at:
+        if self._rem.cancel_requested_at and self._rem.terminated_at:
             return self._settle(RunStatus.CANCELLED, "cancelled", "terminated by the user")
         try:
             pod = self._client.get_pod(self._rem.pod_id or "")
@@ -480,6 +520,8 @@ class RunPodHandle(RunHandle):
             js = self.job_status()  # the worker may have finished just before the pod did
             if js is not None and js.final:
                 return self._finish(js)
+            if self._rem.cancel_requested_at:
+                return self._settle(RunStatus.CANCELLED, "cancelled", "the pod ended after cancel")
             return self._settle(
                 RunStatus.FAILED,
                 "pod_ended_without_final_status",
@@ -500,9 +542,11 @@ class RunPodHandle(RunHandle):
         self._save()
         try:
             published = self._pull_and_publish(js) if js.output_manifest_sha256 else None
-        except ContractError as e:
+        except (ContractError, ValueError, TypeError, OSError) as e:
+            # Whatever made the pull fail, the run is over: the pod is released and the run is
+            # failed, never left to be re-read forever (and never succeeded).
             self._terminate_if_done()
-            return self._settle(RunStatus.FAILED, "pull_verification", str(e))
+            return self._settle(RunStatus.FAILED, "pull_verification", f"{type(e).__name__}: {e}")
         self._terminate_if_done()
         if js.succeeded and published is not None and published.status is RunStatus.SUCCEEDED:
             return self._settle(RunStatus.SUCCEEDED)
@@ -533,7 +577,10 @@ class RunPodHandle(RunHandle):
             raise ContractError(
                 "the output manifest on the volume is not the one the job status recorded"
             )
-        manifest = RemoteOutputRecord.model_validate_json(data)
+        try:
+            manifest = RemoteOutputRecord.model_validate_json(data)
+        except ValueError as e:
+            raise ContractError(f"{OUTPUT_MANIFEST_FILE} is not an output manifest ({e})") from e
         if manifest.run_id != self.run_id:
             raise ContractError(f"the output manifest is for run {manifest.run_id}")
         tmp = self.run_dir.parent / f".{self.run_dir.name}.pull"
@@ -548,8 +595,13 @@ class RunPodHandle(RunHandle):
             rj = tmp / "run.json"
             if not rj.is_file() or _sha(rj.read_bytes()) != manifest.run_json_sha256:
                 raise ContractError("the pulled run.json is not the one the manifest names")
-            rec = RunRecord.load(rj)
-            want_digest = self._runner.config.image_digest()
+            try:
+                rec = RunRecord.load(rj)
+            except (ValueError, TypeError) as e:
+                raise ContractError(f"the pulled run.json is not a run record ({e})") from e
+            # The image the run was submitted with, not whatever the config says at fetch time.
+            want_digest = _image_digest(rem.image)
+            sync = rec.remote_sync or {}
             problems = []
             if rec.run_id != self.run_id:
                 problems.append(f"run_id {rec.run_id}")
@@ -559,8 +611,25 @@ class RunPodHandle(RunHandle):
                 problems.append(f"image {rec.image}")
             if rec.runner != "runpod":
                 problems.append(f"runner {rec.runner}")
-            if (rec.remote_sync or {}).get("input_bundle_digest") != rem.input_bundle_digest:
+            if sync.get("input_bundle_digest") != rem.input_bundle_digest:
                 problems.append("input bundle")
+            if sync.get("pod_dataset_hash") != rem.local_dataset_hash:
+                problems.append("pod dataset hash")
+            want_chunk = rem.chunk or {}
+            got_chunk = rec.chunk or {}
+            if (
+                rec.chunk_id != want_chunk.get("chunk_id")
+                or got_chunk.get("plan_digest") != want_chunk.get("plan_digest")
+                or got_chunk.get("plan_id") != want_chunk.get("plan_id")
+                or sync.get("chunk_plan_digest") != want_chunk.get("plan_digest")
+            ):
+                problems.append(f"chunk {rec.chunk_id}")
+            if (rec.depth_supervision or {}).get(
+                "artifact_sha256"
+            ) != rem.depth_artifact_sha256 or sync.get(
+                "depth_artifact_sha256"
+            ) != rem.depth_artifact_sha256:
+                problems.append("depth supervision artifact")
             if (rec.status is RunStatus.SUCCEEDED) != js.succeeded:
                 problems.append(
                     f"run.json says {rec.status.value} but the job says {js.state.value} "
@@ -577,13 +646,14 @@ class RunPodHandle(RunHandle):
                     f"{self.run_dir} holds {foreign[:5]} that this submission did not write; "
                     "refusing to publish pulled outputs over them"
                 )
-            for f in sorted(p for p in tmp.rglob("*") if p.is_file()):
-                rel = f.relative_to(tmp)
-                if rel.as_posix() == "run.json":
+            # Only what was verified is published: the manifest's entries and the manifest
+            # itself, run.json last (its presence as a pod-written record means "complete").
+            for rel in sorted({e.path for e in manifest.entries} | {OUTPUT_MANIFEST_FILE}):
+                if rel == "run.json":
                     continue
                 dest = self.run_dir / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(f, dest)
+                os.replace(tmp / rel, dest)
             os.replace(rj, self.run_dir / "run.json")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -615,7 +685,7 @@ class RunPodHandle(RunHandle):
         rem = self._rem
         if self._terminal is not None:
             return
-        rem.cancel_requested_at = _now()
+        rem.cancel_requested_at = rem.cancel_requested_at or _now()
         self._save()
         self._store.write_atomic(
             self._job(CANCEL_FILE),
@@ -623,9 +693,13 @@ class RunPodHandle(RunHandle):
         )
         try:
             self._client.terminate_pod(rem.pod_id or "")
-            rem.terminated_at = _now()
         except ProviderError as e:
+            # Not terminated is not cancelled: the pod may still be running (and billing). The
+            # note is kept, the error is raised, and a later cancel tries again.
             rem.notes.append(redact(f"{_now()} terminate failed: {e}"))
+            self._save()
+            raise
+        rem.terminated_at = _now()
         self._save()
 
 

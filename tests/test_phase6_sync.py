@@ -61,6 +61,74 @@ def test_survey_sources_never_go_up(synthetic, dataset_copy, pod_env):
     assert pod_env.client.created == [] and volume_files(pod_env) == []
 
 
+@pytest.mark.parametrize("link", ["provenance_dir", "image_outside", "raw_behind_png"])
+def test_nothing_goes_up_through_a_symlink(synthetic, dataset_copy, pod_env, tmp_path, link):
+    """A link can point anywhere on this machine; its target never reaches the volume."""
+    outside = tmp_path / "private"
+    outside.mkdir()
+    (outside / "secret_notes.txt").write_text("not a dataset file")
+    (outside / "scan.e57").write_bytes(b"E57 raw")
+    if link == "provenance_dir":
+        shutil.rmtree(dataset_copy / "provenance")
+        (dataset_copy / "provenance").symlink_to(outside, target_is_directory=True)
+    else:
+        img = sorted((dataset_copy / "images").rglob("*.*"))[0]
+        img.unlink()
+        target = outside / ("secret_notes.txt" if link == "image_outside" else "scan.e57")
+        img.symlink_to(target)
+    with pytest.raises(ContractError, match="symlink"):
+        dataset_file_table(dataset_copy)
+    with pytest.raises(ContractError, match="symlink"):
+        submit(synthetic, pod_env, dataset_dir=dataset_copy)
+    assert pod_env.client.created == [] and volume_files(pod_env) == []
+
+
+def test_a_claimed_dataset_path_is_never_written_again(synthetic, dataset_copy, pod_env):
+    """Content-addressed and write-once: a second submission of the same bytes uploads nothing,
+    and a volume copy that went bad is refused by the pod, not silently repaired or reused."""
+    h1 = submit(synthetic, pod_env, name="v1", dataset_dir=dataset_copy)
+    assert h1.wait(poll_s=0.01) is RunStatus.SUCCEEDED
+    rec1 = load_record(h1.run_dir)
+    remote_ds = pod_env.volume / layout_of(pod_env, rec1).dataset(rec1.dataset_hash)
+    before = {p: p.stat().st_mtime_ns for p in remote_ds.rglob("*") if p.is_file()}
+    img = sorted((remote_ds / "images").rglob("*.*"))[0]
+    img.write_bytes(img.read_bytes() + b"\0")
+    bad = img.read_bytes()
+    h2 = submit(synthetic, pod_env, name="v2", dataset_dir=dataset_copy)
+    assert h2.wait(poll_s=0.01) is RunStatus.FAILED
+    assert RemoteExecutionRecord.load(h2.run_dir / "remote.json").failure_stage == (
+        "input_verification"
+    )
+    assert img.read_bytes() == bad  # not overwritten
+    after = {p: p.stat().st_mtime_ns for p in remote_ds.rglob("*") if p.is_file()}
+    assert {p: t for p, t in after.items() if p != img} == {
+        p: t for p, t in before.items() if p != img
+    }
+
+
+def test_the_trainer_reads_only_verified_bytes(synthetic, dataset_copy, pod_env, monkeypatch):
+    """A staged image that is not the verified dataset's file fails the job after the run."""
+    from minegs.train.runner import local as runner_local
+
+    real = runner_local.stage_dataset
+
+    def swapping(dataset_dir, staged_dir, *a, **kw):
+        st = real(dataset_dir, staged_dir, *a, **kw)
+        f = sorted((Path(staged_dir) / "images").rglob("*.*"))[0]
+        data = f.read_bytes()
+        f.unlink()  # staging hard-links: replace the link, never write through it
+        f.write_bytes(data + b"\0")
+        return st
+
+    monkeypatch.setattr(runner_local, "stage_dataset", swapping)
+    h = submit(synthetic, pod_env, dataset_dir=dataset_copy)
+    assert h.wait(poll_s=0.01) is RunStatus.FAILED
+    rec = load_record(h.run_dir)
+    js = JobStatus.model_validate(RemoteExecutionRecord.load(h.run_dir / "remote.json").job_status)
+    assert js.failure_stage == "input_verification" and js.exit_code == 1
+    assert rec.status is RunStatus.FAILED and "not the verified dataset" in rec.failure_reason
+
+
 def _staged_job(synthetic, env, ds, name="r1", **over):
     """Submit with the container not started yet; return the handle and the pod-side paths."""
     env.mode("running")
@@ -192,7 +260,7 @@ def test_the_depth_artifact_is_reverified_on_the_pod(
 
     bundle = RunInputBundle.model_validate(inputs)
     assert bundle.depth_supervision.artifact_sha256 == depth_artifact.artifact_sha256
-    pod_hash, _gpu = verify_pod_inputs(bundle)  # the uploaded artifact verifies as it is
+    pod_hash, _gpu, _table = verify_pod_inputs(bundle)  # the uploaded artifact verifies as it is
     assert pod_hash == rec.dataset_hash
     samples = Path(bundle.depth_supervision.path) / "samples.npy"
     samples.write_bytes(samples.read_bytes()[:-8] + b"\x00" * 8)
