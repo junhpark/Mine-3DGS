@@ -97,8 +97,8 @@ plan_digest, path} | null, depth_supervision {supervision_id, artifact_sha256, p
   는 `inputs.json` 없이는 시작하지 않는다.
 * raw 거부: 대상은 `manifest.json` 이 있는 dataset 디렉터리여야 하고 (`raw/`, project root 거부), upload
   목록에 raw 확장자 (`.e57 .mp4 .mov .avi .mkv .insv .insp .360 .las .laz`) 파일이 있으면 거부.
-* symlink 거부: dataset 디렉터리에서 파일까지의 경로에 symlink 가 하나라도 있거나 (`provenance/` 같은 디렉터리
-  포함), 실제 경로가 dataset 밖이면 거부. raw 확장자는 link 이름과 target 둘 다 본다. depth 파일과
+* symlink 거부: dataset 디렉터리 자체가 symlink 이거나, 그 디렉터리에서 파일까지의 경로에 symlink 가 하나라도
+  있거나 (`provenance/` 같은 디렉터리 포함), 실제 경로가 dataset 밖이면 거부. raw 확장자는 link 이름과 target 둘 다 본다. depth 파일과
   `LocalDirStore` 의 upload 원본도 같다. link 는 이 기계의 어떤 파일이든 가리킬 수 있다.
 
 ## 6. Job status 와 성공
@@ -165,6 +165,12 @@ dataset hash 재계산 = bundle 의 hash · bundle digest · chunk plan (`verify
 (`verify_depth_supervision` + sha) · 보이는 GPU 1 개, 지원 arch · run 디렉터리 없음. 실패하면 trainer 를
 실행하지 않고 FAILED + 0 아닌 exit code.
 
+그 다음 `prepare` 가 dataset 을 다시 hash 하고, staging 이 volume 에서 `sparse/0`·`init_points.ply`·images·
+masks 를 읽는다. **staging 이 끝난 직후, trainer 를 띄우기 전에** worker 는 volume 의 dataset 전체를 한 번 더
+hash 한다 (`LocalRunner._after_staging` hook — local 은 no-op, `RemoteWorkerRunner` 만 재-hash). 다르면
+trainer 프로세스는 만들어지지 않고 job 은 FAILED `input_verification` (exit 2, output manifest 없음). 그래서
+trainer 가 받은 staged 입력은 run 이 기록한 dataset hash 의 바이트에서 나온 것이다.
+
 ## 9. 산출물과 pull
 
 * worker 는 끝날 때 (성공·실패 모두, run 디렉터리가 있으면) `runs/<run_id>/output_manifest.json`
@@ -180,8 +186,8 @@ dataset hash 재계산 = bundle 의 hash · bundle digest · chunk plan (`verify
   때만 publish. publish 하는 것은 manifest 항목과 manifest 자체뿐이고 `run.json` 이 마지막이다. 하나라도
   어긋나면 publish 하지 않는다.
 * `attach` (`train fetch`/`cancel`) 는 config 의 image 가 submit 때의 image 와 다르면 거부한다.
-* worker 는 학습이 끝난 뒤 `staged/images`·`staged/masks` 가 검증한 dataset table 의 sha 와 같은지 다시
-  본다 (staging 은 volume 의 dataset 을 hard-link 한다). 다르면 run.json 을 FAILED 로 고치고 job 은 FAILED
+* worker 는 학습이 끝난 뒤에도 `staged/images`·`staged/masks` 가 검증한 dataset table 의 sha 와 같은지 다시
+  본다 (staging 은 volume 의 dataset 을 hard-link 하므로 학습 중의 변경도 잡는다). 다르면 run.json 을 FAILED 로 고치고 job 은 FAILED
   `input_verification`.
 
 ## 10. Evidence
@@ -314,6 +320,14 @@ verifier 가 재현·반박했다. **20 건 중 14 건 확인 (major 4 · minor 
 * CI 의 Phase 6 CLI smoke (`bash -e`): dry run, key 없음·tag image 거부, key 값 미출력, volume 무변경 — 통과.
 * live RunPod: 사용하지 않음. 실제 GPU: 사용하지 않음. billable 호출: 없음.
 
+### 13.5.1 독립 review (PR #18) 대응
+
+| review | 판정 | 대응 | 테스트 |
+|---|---|---|---|
+| B1 `sparse/0`·`init_points.ply` staging TOCTOU | BLOCKING | staging 직후·trainer 전 dataset 전체 재-hash (`_after_staging` hook), 다르면 FAILED `input_verification`, trainer 미실행 | `test_a_dataset_changed_during_staging_never_reaches_the_trainer` (cameras.txt · 유효한 다른 init PLY; 수정 전 코드에서는 SUCCEEDED 로 재현됨; trainer Popen 0 회 확인) |
+| SF1 dataset root symlink | SHOULD_FIX | `require_dataset_dir` 가 resolve 전에 root symlink 거부 | `test_a_symlinked_dataset_root_is_refused` |
+| SF2 상한 cached dataset 이 pod 생성 뒤에야 발견 | SHOULD_FIX (비 blocker) | 문서화만 (§13.6). 거짓 성공 없음 | 기존 `test_a_claimed_dataset_path_is_never_written_again` |
+
 ### 13.6 한계와 미룬 것
 
 * 실제 RunPod·실제 GPU 실행 없음. provider 는 fake, volume 은 temp directory, rclone 은 stand-in.
@@ -322,9 +336,12 @@ verifier 가 재현·반박했다. **20 건 중 14 건 확인 (major 4 · minor 
 * 할당 오류 판별은 SDK 메시지 문자열 ("instances ... available") 에 기대고, 아니면 일반 provider 오류로
   submit 을 멈춘다 (다음 GPU type 으로 넘어가지 않는다 — 보수적).
 * pull 은 staged 를 포함한 run 디렉터리 전체 (`backend_out/` 제외) 라 큰 dataset 에서 전송량이 크다.
-* staged 재검사는 images·masks 만이다. `sparse/0`·`init_points.ply` 는 staging 이 읽어 새로 쓰므로, prepare 의
-  재-hash 와 staging 사이 (초 단위) 에 volume 이 바뀌는 창이 남는다. volume 은 이 run 만 쓰는 write-once
-  경로라 위협은 volume 에 쓸 권한이 있는 쪽뿐이다.
+* staging 전후의 재-hash 는 "그 사이에 바뀌었다가 같은 바이트로 되돌아온" 변경 (ABA) 은 잡지 못한다. 그것을
+  닫으려면 staging 이 읽은 바이트 자체를 hash 해야 한다. volume 은 write-once 경로라 그런 변경은 volume 에
+  쓸 권한이 있는 쪽의 의도적 조작뿐이다.
+* volume 의 claim 된 dataset 사본이 상했으면 submitter 는 그것을 모른 채 pod 를 만들고, pod 의 재-hash 가
+  거부한다 — 거짓 성공은 없지만 pod 할당 비용이 든다. submitter 쪽 preflight (원격 hash 확인) 는 live
+  acceptance 에서 필요가 확인되면 추가한다.
 * docker local run 의 `backend.version` 은 host 의 패키지에서 읽는다 (image 안이 아니다). 재현성 비교는
   image digest 를 따로 보므로 쌍 판정은 영향받지 않지만, 그 필드 자체는 host 사실이다.
 * worker 가 쓰는 status 는 volume 위 파일이다. volume 자체가 없어지면 증거도 없다 (그때 run 은 FAILED/UNKNOWN).

@@ -112,6 +112,13 @@ class LocalHandle(RunHandle):
 class LocalRunner(Runner):
     name = "local"
 
+    def _after_staging(self, dataset_dir: Path) -> None:
+        """Called once staging has read everything it reads, before any trainer starts.
+
+        A local run's dataset is this machine's own directory; nothing to re-check. The RunPod
+        worker re-hashes the dataset on the shared volume here (Phase 6 §8).
+        """
+
     def submit(self, run: RunConfig) -> RunHandle:
         run, manifest, profile, record = self.prepare(run)
         run_dir = Path(run.run_dir)
@@ -149,6 +156,7 @@ class LocalRunner(Runner):
         staged_supervision = None
         if verified is not None:
             staged_supervision = stage_depth_supervision(verified, staged.path)
+        self._after_staging(dataset_dir)
         if planned is not None:
             chunk = dict(record.chunk or {})
             ev = dict(staged.chunk or {})

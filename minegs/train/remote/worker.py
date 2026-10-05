@@ -59,6 +59,10 @@ class GpuUnsupportedError(ContractError):
     pass
 
 
+class InputChangedError(ContractError):
+    """The dataset on the volume changed after the pod verified it."""
+
+
 def visible_gpus() -> dict[str, Any]:
     """What CUDA shows this process: count, names, compute capabilities."""
     try:
@@ -112,10 +116,32 @@ class RemoteWorkerRunner(LocalRunner):
     native_runs_in_image = True
 
     def __init__(
-        self, config: RunnerConfig, bundle: RunInputBundle, pod_dataset_hash: str, gpu: dict
+        self,
+        config: RunnerConfig,
+        bundle: RunInputBundle,
+        pod_dataset_hash: str,
+        gpu: dict,
+        table: dict[str, str] | None = None,
     ) -> None:
         super().__init__(config)
         self._bundle, self._pod_hash, self._gpu = bundle, pod_dataset_hash, gpu
+        self._table = table
+
+    def _after_staging(self, dataset_dir: Path) -> None:
+        """Staging has read ``sparse/0``, ``init_points.ply``, images and masks from the volume
+        after ``prepare`` hashed it. Hash the whole dataset again before the trainer starts, so
+        what the trainer is given is the dataset the record names (images and masks are checked
+        once more after the run: staging hard-links them)."""
+        table = dataset_file_table(Path(dataset_dir))
+        got = dataset_hash_of(table)
+        if got != self._pod_hash:
+            want = self._table or {}
+            changed = sorted(k for k in set(table) | set(want) if table.get(k) != want.get(k))
+            raise InputChangedError(
+                f"the dataset on the volume changed while it was being staged ({self._pod_hash[:12]}"
+                f" -> {got[:12]}; {changed[:5]}); the staged inputs are not the dataset the run "
+                "records. The trainer was not started"
+            )
 
     def prepare(self, run: RunConfig):
         run, manifest, profile, record = super().prepare(run)
@@ -323,7 +349,7 @@ def run_worker(inputs: str | Path, poll_s: float = 5.0) -> int:
             gpus="device=0",
             cuda_archs=list(bundle.cuda_archs),
         )
-        runner = RemoteWorkerRunner(config, bundle, pod_hash, gpu)
+        runner = RemoteWorkerRunner(config, bundle, pod_hash, gpu, table)
         try:
             handle = runner.submit(
                 RunConfig(
@@ -340,6 +366,11 @@ def run_worker(inputs: str | Path, poll_s: float = 5.0) -> int:
                     else bundle.depth_supervision.path,
                     overrides=dict(bundle.overrides),
                 )
+            )
+        except InputChangedError as e:
+            # No output manifest: there is no run to return, only the refusal.
+            return job.finish(
+                False, EXIT_REFUSED, failure_stage="input_verification", message=str(e)
             )
         except ContractError as e:
             manifest_sha = (
@@ -397,6 +428,7 @@ __all__ = [
     "EXIT_RESTARTED",
     "EXIT_RUN_FAILED",
     "GpuUnsupportedError",
+    "InputChangedError",
     "RemoteWorkerRunner",
     "run_worker",
     "verify_pod_inputs",

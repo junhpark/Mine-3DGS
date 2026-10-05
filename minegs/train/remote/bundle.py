@@ -101,7 +101,16 @@ class RunInputBundle(VersionedModel):
 
 
 def require_dataset_dir(path: str | Path) -> Path:
-    """A materialised dataset directory, and nothing that holds survey sources (§5)."""
+    """A materialised dataset directory, and nothing that holds survey sources (§5).
+
+    The directory itself must not be a symlink either: resolving it first would hide the link,
+    and every check below would then describe a directory nobody named.
+    """
+    if Path(path).is_symlink():
+        raise ContractError(
+            f"{path} is a symlink; give the dataset directory itself (nothing is uploaded "
+            "through a link)"
+        )
     p = Path(path).resolve()
     if p.name == "raw" or "raw" in p.parts[-2:-1]:
         raise ContractError(f"{path}: raw/ never leaves this machine; give the dataset/ directory")

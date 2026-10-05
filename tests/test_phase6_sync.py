@@ -10,6 +10,7 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pytest
 from minegs.core.errors import ContractError
 from minegs.core.provenance import sha256_tree
@@ -127,6 +128,63 @@ def test_the_trainer_reads_only_verified_bytes(synthetic, dataset_copy, pod_env,
     js = JobStatus.model_validate(RemoteExecutionRecord.load(h.run_dir / "remote.json").job_status)
     assert js.failure_stage == "input_verification" and js.exit_code == 1
     assert rec.status is RunStatus.FAILED and "not the verified dataset" in rec.failure_reason
+
+
+@pytest.mark.parametrize("swap", ["sparse_cameras", "init_points"])
+def test_a_dataset_changed_during_staging_never_reaches_the_trainer(
+    synthetic, dataset_copy, pod_env, monkeypatch, swap
+):
+    """Staging reads sparse/0 and init_points.ply after prepare hashed the volume. A change in that
+    window is caught by the re-hash after staging, before any trainer process exists."""
+    import subprocess
+
+    from minegs.core.pointcloud import read_ply, write_ply
+    from minegs.train.runner import local as runner_local
+
+    real = runner_local.stage_dataset
+    started = []
+
+    def changing(dataset_dir, staged_dir, *a, **kw):
+        ds = Path(dataset_dir)
+        if swap == "sparse_cameras":
+            f = ds / "sparse" / "0" / "cameras.txt"
+            f.write_text(f.read_text() + "# edited on the volume\n")
+        else:
+            pc = read_ply(ds / "init_points.ply")
+            write_ply(pc.select(np.arange(len(pc) - 1)), ds / "init_points.ply")
+        return real(dataset_dir, staged_dir, *a, **kw)  # reads the changed bytes
+
+    real_popen = subprocess.Popen
+
+    def popen(*a, **kw):
+        if "simple_trainer" in " ".join(map(str, a[0] if a else kw.get("args", []))):
+            started.append(a)
+        return real_popen(*a, **kw)
+
+    monkeypatch.setattr(runner_local, "stage_dataset", changing)
+    monkeypatch.setattr(runner_local.subprocess, "Popen", popen)
+    h = submit(synthetic, pod_env, dataset_dir=dataset_copy)
+    assert h.wait(poll_s=0.01) is RunStatus.FAILED
+    assert started == []  # no trainer process was ever launched
+    rem = RemoteExecutionRecord.load(h.run_dir / "remote.json")
+    js = JobStatus.model_validate(rem.job_status)
+    assert js.failure_stage == "input_verification" and js.exit_code == 2
+    assert js.trainer_exit_code is None and "changed while it was being staged" in js.message
+    assert rem.failure_stage == "input_verification" and not rem.artifact_sync_verified
+    rec = load_record(h.run_dir)
+    assert rec.status is RunStatus.FAILED and "changed while it was being staged" in (
+        rec.failure_reason
+    )
+    pod_run = pod_env.volume / layout_of(pod_env, rec).run(rec.run_id)
+    assert not (pod_run / "run.json").exists() and not (pod_run / "point_cloud").exists()
+
+
+def test_a_symlinked_dataset_root_is_refused(synthetic, dataset_copy, pod_env, tmp_path):
+    link = tmp_path / "dataset_link"
+    link.symlink_to(dataset_copy, target_is_directory=True)
+    with pytest.raises(ContractError, match="symlink"):
+        submit(synthetic, pod_env, dataset_dir=link)
+    assert pod_env.client.created == [] and volume_files(pod_env) == []
 
 
 def _staged_job(synthetic, env, ds, name="r1", **over):
