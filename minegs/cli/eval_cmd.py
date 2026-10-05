@@ -922,3 +922,27 @@ def chunk_set_cmd(
         dump_json(cs, (out / CHUNK_RUN_SET_FILE) if out is not None else None)
 
     run_guarded(go)
+
+
+@app.command("compare-execution")
+def compare_execution_cmd(
+    run_a: Path = typer.Argument(..., help="runs/<id> (e.g. the local run)"),
+    run_b: Path = typer.Argument(..., help="runs/<id> (e.g. the RunPod run)"),
+    comparison_id: str = typer.Option("execution-comparison"),
+    out: Path | None = typer.Option(None, help="directory for execution_comparison.json"),
+) -> None:
+    """Are two runs the same experiment, and if so, what did each record? (Phase 6 §11)
+
+    Not a reproducibility verdict: no tolerance is applied, and G3 stays PENDING.
+    """
+    from minegs.eval.compare.execution import EXECUTION_COMPARISON_FILE, compare_execution
+
+    def go() -> None:
+        rep = compare_execution(run_a, run_b, comparison_id=comparison_id)
+        console.print(f"reproducibility pair: [bold]{rep.reproducibility_pair}[/]")
+        for d in rep.differences:
+            console.print(f"  [yellow]differs: {d}[/]")
+        console.print(f"[bold]{rep.maturity_statement}[/]")
+        dump_json(rep, (out / EXECUTION_COMPARISON_FILE) if out is not None else None)
+
+    run_guarded(go)

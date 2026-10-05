@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from minegs.core.errors import ContractError, NotYetImplementedError
+from minegs.core.errors import ContractError
 from minegs.core.provenance import sha256_tree
 from minegs.ingest.common import colmap_io
 from minegs.train.backends import get_backend
@@ -297,8 +297,10 @@ def test_normalize_refusal_states_the_phase4_reality():
 
 
 def test_runpod_still_fails_closed_for_heavy(scene):
+    # Phase 6: RunPod runs exist, but never on an image without a digest — refused before any
+    # upload or pod (the default config carries no image)
     r = get_runner("runpod", RunnerConfig(runner="runpod"))
-    with pytest.raises(NotYetImplementedError, match="RunPod"):
+    with pytest.raises(ContractError, match="not pinned by digest"):
         r.submit(
             RunConfig(
                 dataset_dir=str(scene.dataset_dir),

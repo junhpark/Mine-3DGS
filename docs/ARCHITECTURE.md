@@ -294,8 +294,12 @@ RunHandle.status() / .logs() / .fetch_artifacts()
 ```
 * `LocalRunner` — `docker run --gpus device=<n> minegs:gpu@sha256:...`. CUDA 없으면 거부하고
   RunPod 저가 GPU 라우팅 제안.
-* `RunPodRunner` — 파드 생성(네트워크 볼륨) → `sync.push`(dataset 만) → 엔트리 →
-  폴링 → `sync.pull`(ply·로그) → 종료.
+* `RunPodRunner` (Phase 6, [계약](PHASE6_CONTRACT.md)) — network volume 이 persistent truth.
+  비용 전 검증 → dataset hash 가 덮는 파일만 content-addressed 경로로 upload, sidecar 는 digest 로
+  → `inputs.json` 마지막 → pod 생성 (`minegs train remote-worker`). pod 는 같은 이미지에서
+  LocalRunner 의 native 경로를 그대로 실행하고 (`runner: runpod`), 학습 전에 모든 identity 를 다시
+  도출한다. 성공은 worker 의 `status.json` (exit code) + output manifest 이고 lifecycle 이 아니다.
+  pull 은 manifest 로 모든 파일을 검증한 뒤에만 publish.
 * 두 러너의 GPU 이미지 digest 는 동일. run.json 에 기록.
 * **Training resume 은 구현되어 있지 않다.** `--resume-from` 은 명시적 옵션으로 존재하지만
   `Runner.prepare` 에서 항상 거부되며, 이는 trainer 실행 이전이자 run directory 생성 이전이다.
@@ -311,7 +315,7 @@ RunHandle.status() / .logs() / .fetch_artifacts()
 | iter | 7k | 30k |
 | 전략 | default | mcmc (metric 보정) |
 | appearance / depth supervision | 끔 / 끔 | 켬 / 켬 (`--depth-supervision`) |
-| 기본 러너 | local | local (RunPod 는 Phase 6) |
+| 기본 러너 | local | local (`--runner runpod` 가능, Phase 6) |
 
 heavy 의 ablation 은 `heavy-base` · `heavy-appearance` · `heavy-depth` (두 request 만 다르다).
 
@@ -443,4 +447,10 @@ end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced G
   atomic 하게 선택되고, init 은 기존 support locator, depth 는 전역 artifact 그대로다. 평가는
   station 소유권으로 이어 붙인 section 하나를 기존 `compare_to_reference` 로 잰다; seam 은 일치도
   수치일 뿐 pass 가 없다. 근거: [docs/PHASE5_CONTRACT.md](PHASE5_CONTRACT.md).
+* 2026-10 — Phase 6: RunPod 는 compute provider 이지 과학 backend 가 아니다. pod 는 LocalRunner 의
+  실행 경로를 그대로 돌리고 runner 이름만 다르다. network volume 이 진실이고 (pod 수명 ≠ 데이터 수명),
+  dataset 은 hash 로 주소가 정해져 다른 run 이 쓰는 바이트를 덮을 수 없다. provider 가 exit code 를 주지
+  않으므로 성공은 worker 가 volume 에 쓰는 status 와 output manifest 로만 판정하고 로컬에서 다시
+  검증한다. 같은 실험인지는 fingerprint (dataset hash · code SHA · image digest · profile · trainer 요청 ·
+  sidecar) 로 먼저 정하고, 허용범위는 live G3 에서 정한다. 근거: [docs/PHASE6_CONTRACT.md](PHASE6_CONTRACT.md).
 * 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.

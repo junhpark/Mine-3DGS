@@ -67,7 +67,8 @@ minegs/
     supervision/  depth(DepthSupervisionRecord · 재도출 검증) · build(sfm_tracks · tls_projection) · support(holdout 판정)
     trainers/  advanced_gs(upstream trainer 그대로 + MineGS depth 항) · depth_term
     backends/  base(BackendCapabilities + capability_notes) · gsplat(executable contract)
-    runner/    base · local(docker) · runpod(Phase 6, fail-closed) · sync(rclone)
+    runner/    base · local(docker) · runpod(Phase 6: volume sync · pod · status · verified pull) · sync(rclone)
+  train/remote/  bundle(RunInputBundle) · layout(volume 경로) · store(rclone / mount) · provider(RunPod seam) · worker(pod 쪽) · status(status.json · output manifest)
     profiles/  light.yaml · heavy.yaml (+ heavy-base · heavy-appearance · heavy-depth)
   eval/      protocol · compare(paths · runs) · register(Sim3 → ICP → diagnostics) · surface(render=gsplat depth · depth 역투영 → surface artifact) · geometry(양방향) · sections(A(s) + section artifact) · volume(∫A ds gap-safe, 설계대비, coverage) · change · render(PSNR/SSIM/LPIPS)
   viz/       viewer(Viser) · overlay(규약 캘리브레이션 = 골든 게이트) · compare · export(.spz/.splat)
@@ -259,7 +260,22 @@ minegs dataset chunk-plan-verify data/<id>/dataset data/<id>/dataset/chunks/<pla
 minegs train chunks data/<id>/dataset --chunk-plan data/<id>/dataset/chunks/<plan_id>/chunk_plan.json --profile light
 minegs eval chunk-set data/<id>/dataset --chunk-plan .. --run runs/<plan_id>/K000 --sections .. \
     --run runs/<plan_id>/K001 --sections .. --reference-sections <스캔 reference sections> --out ..
+
+# Phase 6 — 같은 run 을 RunPod GPU 에서 (RUNPOD_API_KEY 는 환경변수, configs/runner/runpod.yaml 에
+# digest 고정 image · network volume · 그 volume 에 닿는 sync.remote)
+minegs train run data/<id>/dataset --profile light --runner runpod --config configs/runner/runpod.yaml --dry-run
+minegs train run data/<id>/dataset --profile light --runner runpod --config configs/runner/runpod.yaml
+minegs train fetch  runs/<run_id> --config configs/runner/runpod.yaml   # volume 의 status 로 판정, 검증된 pull
+minegs train cancel runs/<run_id> --config configs/runner/runpod.yaml
+minegs eval compare-execution runs/<local_id> runs/<remote_id>          # 같은 실험인가 (허용범위 없음)
 ```
+
+**Phase 6 RunPod** ([계약](docs/PHASE6_CONTRACT.md), [live runbook](docs/PHASE6_ACCEPTANCE.md)) — pod 는
+LocalRunner 와 같은 이미지·같은 학습 경로를 실행하고 `run.json` 에 `runner: runpod` 로 남는다. 올라가는
+것은 dataset hash 가 덮는 파일과 run 에 묶인 sidecar 뿐이고 (raw 는 거부), pod 가 학습 전에 그 hash 를 다시
+계산한다. 성공은 pod 상태가 아니라 worker 가 network volume 에 쓰는 `status.json` (exit code) 과 output
+manifest 이고, 산출물은 모든 파일이 manifest 와 일치할 때만 로컬에 publish 된다. 테스트·CI 는 fake provider
+와 temp volume 만 쓴다 — **실제 RunPod 실행은 아직 하지 않았다**.
 
 **Phase 5 chunking** ([계약](docs/PHASE5_CONTRACT.md)) — 나누는 것은 학습 단위뿐이다. 모든 chunk 는 같은
 `dataset_id`·`dataset_hash`·`LOCAL_METRIC` (`T_local_from_internal = I`) 에서 학습하고, chunk 의 학습
@@ -309,7 +325,8 @@ artifact 지만 같은 측량 (SfM 재구성 또는 TLS) 에서 나오므로 독
 | `--core-length-m ≤ 0`, `--overlap-m < 0` 또는 `≥ core` | `ContractError` (exit 2) | 정의되지 않는 chunk | — |
 | gap·중복 소유가 있거나 생성 뒤 dataset·centerline 이 바뀐 chunk plan, plan 없는 `--chunk` | `ContractError` (exit 2) | chunk 는 검증된 plan 에서만 학습한다 (Phase 5 계약 §5.2, AD-1) | — |
 | 다른 dataset·plan·profile·chunk 의 run, 중복·누락·FAILED chunk 를 `eval chunk-set` 에 | `ContractError` (exit 2) — 누락·FAILED 는 `--allow-incomplete` 일 때만 incomplete set | 한 실험만 합성한다 (Phase 5 계약 §7) | — |
-| `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현. 필요한 단계는 `runner/runpod.py` docstring | Phase 6 |
+| RunPod: digest 없는 image, volume·storage·`RUNPOD_API_KEY` 없음, `gpu_count ≠ 1`, raw 파일, 이미 있는 remote run id | `ContractError` (exit 2), upload·pod 생성 전 | 비용 전에 거부 ([Phase 6 계약](docs/PHASE6_CONTRACT.md)) | — |
+| final status 없이 끝난 pod, exit ≠ 0, manifest 와 다른 산출물 | run FAILED, publish 안 함 | pod lifecycle 은 성공이 아니다 | — |
 
 light 프로파일의 커맨드는 Phase 0D 와 바이트 단위로 같다: `--no-normalize_world_space`, depth 없음,
 upstream trainer 직접 실행, `T_local_from_internal` 은 항등이다.
@@ -774,7 +791,7 @@ renderer** — 이고 전부 기록된다. T1–T30 이 거부를 고정한다.
 | 3 Image/360 독립 재구성 | **implemented + structurally tested** — 영상/360 → 프레임 집합 → SfM(`SFM_INTERNAL`, 임의 scale) → 측정된 Sim(3) 정합 → image-only dataset → 기존 학습·depth·surface·단면·체적 → TLS-assisted 대비 공통 구간 비교. 초기화는 재구성 자신의 점이고 holdout 구간은 실제로 빠진다. **실제 COLMAP·GPU·렌더러·실측 영상 미실행** — 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 남는다. **Phase 3 manual acceptance: DEFERRED**, **Phase 3 G2: PENDING**, 실측 과학적 검증: **NOT VALIDATED** |
 | 4 Advanced GS / heavy | **implemented + structurally tested** — metric depth supervision artifact (init 과 분리, holdout leakage 재도출), upstream trainer 를 그대로 실행하는 MineGS adapter, 실행 가능한 heavy profile·ablation, 요청↔실제 config 대조, baseline↔advanced 비교. **real GPU heavy training: NOT PERFORMED**, **G3: PENDING**, 실측 과학적 검증: **NOT VALIDATED** ([계약](docs/PHASE4_CONTRACT.md)) |
 | 5 장거리 갱도 · 청킹 | **implemented + structurally tested** — 중심선 chainage 기준 versioned chunk plan (core/support, `[lo,hi)` 소유권, atomic capture group, 전역 split 보존), 기존 run 경로 그대로의 chunk 학습 (같은 dataset·같은 `LOCAL_METRIC`), station 마다 소유 chunk 하나만 읽는 `ChunkRunSet` 합성 (coverage·누락 구간·holdout 평가·seam 일치도 수치, Gaussian 병합 없음). **real GPU chunked training: NOT PERFORMED**, **real long-tunnel mine dataset: NOT VALIDATED**, **optimal chunk size: NOT DETERMINED**, **G3: PENDING** ([계약](docs/PHASE5_CONTRACT.md)) |
-| 6 RunPod | **미구현, fail-closed** |
+| 6 RunPod / reproducible compute | **implemented + structurally tested** — 같은 digest 이미지, dataset hash 의 파일만 network volume 에 (raw 거부), sidecar 는 digest 로, pod 안 재검증, LocalRunner 와 같은 학습 경로, exit-code 기반 `status.json`, manifest 로 검증한 pull, chunk·depth 호환, secret 미기록. **Live RunPod GPU execution: NOT PERFORMED**, **Local↔RunPod reproducibility: NOT VALIDATED**, **G3: PENDING** ([계약](docs/PHASE6_CONTRACT.md), [runbook](docs/PHASE6_ACCEPTANCE.md)) |
 | 7 Multi-epoch change | **미구현** — single manifest 는 change claim 불가 |
 | 8 Viewer / Export / Web | 부분 — Viser·export 구현, FastAPI 미착수 |
 

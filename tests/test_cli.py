@@ -255,7 +255,7 @@ def test_cli_heavy_profile_fails_closed(tmp_path):
     assert r.exit_code == 0 and "--no-normalize_world_space" in r.output
 
 
-def test_cli_runpod_is_not_runnable(tmp_path):
+def test_cli_runpod_without_a_runner_config_is_refused(tmp_path):
     root = tmp_path / "syn"
     assert (
         runner.invoke(
@@ -274,13 +274,14 @@ def test_cli_runpod_is_not_runnable(tmp_path):
         ).exit_code
         == 0
     )
-    # light is runnable in principle, so the RunPod path is what refuses it
+    # light is runnable in principle; a RunPod run with no runner config has no digest-pinned
+    # image, and is refused for that before anything is uploaded or created (Phase 6)
     r = runner.invoke(
         app, ["train", "run", str(root / "dataset"), "--profile", "light", "--runner", "runpod"]
     )
-    assert r.exit_code == 4 and "Phase 6" in r.output
+    assert r.exit_code == 2 and "pinned by digest" in " ".join(r.output.split())
     # heavy must report ITS OWN reason (no depth supervision given), not whatever its runner
-    # says first; its default runner is local now (RunPod is Phase 6)
+    # says first; its default runner is local
     r = runner.invoke(app, ["train", "run", str(root / "dataset"), "--profile", "heavy"])
     assert r.exit_code == 2 and "depth_loss" in r.output
     assert "DepthSupervisionRecord" in " ".join(r.output.split())

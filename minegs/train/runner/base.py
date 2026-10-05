@@ -53,8 +53,24 @@ class RunStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+RUNNER_CONFIG_MIGRATIONS = MigrationRegistry("runner_config")
+
+
+@RUNNER_CONFIG_MIGRATIONS.register("1.0", "1.1")
+def _runner_1_0_to_1_1(d: dict[str, Any]) -> dict[str, Any]:
+    """1.1 adds the Phase 6 RunPod fields; each has a default that a 1.0 config already meant
+    (one GPU, the image's CUDA architectures, terminate a pod once its evidence is durable)."""
+    return d
+
+
+#: The CUDA architectures ``docker/Dockerfile.gpu`` compiles for (``TORCH_CUDA_ARCH_LIST``); a
+#: test keeps the two equal. A GPU outside this list cannot run the image's kernels.
+IMAGE_CUDA_ARCHS = ("7.5", "8.0", "8.6", "8.9", "9.0")
+
+
 class RunnerConfig(VersionedModel):
-    SCHEMA_VERSION: ClassVar[str] = "1.0"
+    SCHEMA_VERSION: ClassVar[str] = "1.1"
+    MIGRATIONS: ClassVar[MigrationRegistry | None] = RUNNER_CONFIG_MIGRATIONS
     runner: str = "local"
     image: str = ""
     data_root: str = "./data"
@@ -72,6 +88,16 @@ class RunnerConfig(VersionedModel):
     container_disk_gb: int = 40
     sync: dict[str, Any] = Field(default_factory=dict)
     poll_interval_s: int = 30
+    # ---- Phase 6 (schema 1.1)
+    #: GPUs per pod. Only 1: a second visible device makes gsplat distributed (see ``gpus``).
+    gpu_count: int = 1
+    #: Compute capabilities the image supports; the pod refuses any other GPU before training.
+    cuda_archs: list[str] = Field(default_factory=lambda: list(IMAGE_CUDA_ARCHS))
+    #: Host CUDA versions RunPod may place the pod on (provider filter); None = no filter.
+    allowed_cuda_versions: list[str] | None = None
+    cloud_type: str = "ALL"
+    #: Terminate the pod once its final status and output manifest are on the volume.
+    terminate_on_completion: bool = True
 
     def image_digest(self) -> str | None:
         return self.image.split("@", 1)[1] if "@" in self.image else None
@@ -121,6 +147,13 @@ def _run_1_1_to_1_2(d: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
+@RUN_RECORD_MIGRATIONS.register("1.3", "1.4")
+def _run_1_3_to_1_4(d: dict[str, Any]) -> dict[str, Any]:
+    """1.4 adds Phase 6 remote evidence. A 1.3 run did not run remotely, or recorded nothing
+    about it: both fields stay null rather than being reconstructed."""
+    return d
+
+
 @RUN_RECORD_MIGRATIONS.register("1.2", "1.3")
 def _run_1_2_to_1_3(d: dict[str, Any]) -> dict[str, Any]:
     """1.3 adds the Phase 5 chunk binding. A 1.2 run trained no plan's chunk: ``chunk`` stays
@@ -131,7 +164,7 @@ def _run_1_2_to_1_3(d: dict[str, Any]) -> dict[str, Any]:
 class RunRecord(VersionedModel):
     """``runs/<run_id>/run.json`` (§9)."""
 
-    SCHEMA_VERSION: ClassVar[str] = "1.3"
+    SCHEMA_VERSION: ClassVar[str] = "1.4"
     MIGRATIONS: ClassVar[MigrationRegistry | None] = RUN_RECORD_MIGRATIONS
     run_id: str
     dataset_id: str
@@ -198,6 +231,14 @@ class RunRecord(VersionedModel):
     #: Plan identity, the chunk's core/support, what was selected for it, and what it used
     #: (docs/PHASE5_CONTRACT.md §6). Outputs stay in the dataset's LOCAL_METRIC frame.
     chunk: dict[str, Any] | None = None
+
+    # ---- Phase 6 remote evidence (schema 1.4). Null for a run that did not execute remotely.
+    #: Compute provenance, as the pod knew it: provider, pod id, requested GPU types, volume and
+    #: remote paths (docs/PHASE6_CONTRACT.md §10). Not scientific evidence.
+    remote_execution: dict[str, Any] | None = None
+    #: What reached the pod, by identity: the input bundle digest, the dataset hash the submitter
+    #: claimed and the one the pod re-derived, the sidecar digests.
+    remote_sync: dict[str, Any] | None = None
 
 
 class RunHandle(ABC):

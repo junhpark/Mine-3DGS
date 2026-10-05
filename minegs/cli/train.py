@@ -111,6 +111,12 @@ def run(
         help="a DepthSupervisionRecord directory (`minegs dataset depth-supervision`); required "
         "by profiles that request depth_loss (heavy, heavy-depth), refused by the others",
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="runpod: print what would be uploaded and the pod request, with no upload, no pod "
+        "and no cost (`train command` is the local equivalent)",
+    ),
 ) -> None:
     """Run training to completion. Output: <dataset>/../runs/<run_id>/ with LOCAL_METRIC .ply (§8).
 
@@ -147,20 +153,27 @@ def run(
         if native:
             rcfg.native = True
         r = get_runner(rname, rcfg)
-        h = r.submit(
-            RunConfig(
-                dataset_dir=str(dataset_dir),
-                profile=profile,
-                backend=backend,
-                runner=rname,
-                resume_from=str(resume_from) if resume_from else None,
-                chunk_id=chunk,
-                chunk_plan=str(chunk_plan) if chunk_plan else None,
-                depth_supervision=str(depth_supervision) if depth_supervision else None,
-            )
+        cfg = RunConfig(
+            dataset_dir=str(dataset_dir),
+            profile=profile,
+            backend=backend,
+            runner=rname,
+            resume_from=str(resume_from) if resume_from else None,
+            chunk_id=chunk,
+            chunk_plan=str(chunk_plan) if chunk_plan else None,
+            depth_supervision=str(depth_supervision) if depth_supervision else None,
         )
+        if dry_run:
+            if rname != "runpod":
+                raise ContractError(
+                    "--dry-run plans a RunPod run; for a local run see `train command`"
+                )
+            dump_json(r.plan(cfg), None)
+            return
+        h = r.submit(cfg)
         console.print(f"submitted [bold]{h.run_id}[/] -> {h.run_dir}")
-        st = h.wait(poll_s=2.0)
+        # a remote run is asked about at the config's pace, not every two seconds
+        st = h.wait(poll_s=float(rcfg.poll_interval_s) if rname == "runpod" else 2.0)
         console.print(f"status: {st.value}  artifacts: {[str(p) for p in h.fetch_artifacts()]}")
         if st is not RunStatus.SUCCEEDED:
             rec = load_record(h.run_dir)
@@ -174,7 +187,9 @@ def chunks(
     dataset_dir: Path = typer.Argument(...),
     chunk_plan: Path = typer.Option(..., "--chunk-plan", help="a chunks/<plan_id> directory"),
     profile: str = typer.Option("light"),
-    runner: str | None = typer.Option(None, help="local (default: profile.default_runner)"),
+    runner: str | None = typer.Option(
+        None, help="local | runpod (default: profile.default_runner)"
+    ),
     backend: str = typer.Option("gsplat"),
     config: Path | None = typer.Option(None, help="configs/runner/*.yaml"),
     native: bool = typer.Option(False, help="local: run in this python env instead of docker"),
@@ -212,6 +227,7 @@ def chunks(
             runs_dir=runs_dir,
             backend=backend,
             depth_supervision=depth_supervision,
+            poll_s=float(rcfg.poll_interval_s) if rname == "runpod" else 2.0,
         )
         for d in done:
             console.print(f"  {d['chunk_id']}: {d['status']}  {d['run_dir']}")
@@ -243,17 +259,56 @@ def logs(run_dir: Path = typer.Argument(...), tail: int = typer.Option(50)) -> N
 
 
 @app.command()
-def fetch(run_dir: Path = typer.Argument(...), config: Path | None = typer.Option(None)) -> None:
-    """Pull artifacts of a RunPod run into run_dir (local runs are already in place)."""
-    from minegs.train.runner.base import load_record
+def fetch(
+    run_dir: Path = typer.Argument(...),
+    config: Path | None = typer.Option(None, help="the configs/runner/runpod.yaml it ran with"),
+) -> None:
+    """Check a RunPod run and, once it has finished, pull and verify its outputs into run_dir.
+
+    Success is the worker's durable status on the volume plus every output file matching the
+    run's output manifest — never the pod's lifecycle (docs/PHASE6_CONTRACT.md §6, §9).
+    """
+    from minegs.core.errors import ContractError
+    from minegs.train.runner.base import RunnerConfig, load_record
 
     def go() -> None:
         rec = load_record(run_dir)
         if rec.runner == "local":
             console.print(f"local run; outputs: {rec.outputs}")
             return
-        from minegs.core.errors import NotYetImplementedError
+        if config is None:
+            raise ContractError(
+                "a RunPod run is fetched with the runner config it ran with (--config)"
+            )
+        from minegs.train.runner.runpod import RunPodRunner
 
-        raise NotYetImplementedError("fetching RunPod run artifacts", "6")
+        h = RunPodRunner(RunnerConfig.load(config)).attach(run_dir)
+        st = h.status()
+        console.print(f"{h.run_id}: {st.value}  artifacts: {[str(p) for p in h.fetch_artifacts()]}")
 
     run_guarded(go)
+
+
+@app.command()
+def cancel(
+    run_dir: Path = typer.Argument(...),
+    config: Path = typer.Option(..., help="the configs/runner/runpod.yaml it ran with"),
+) -> None:
+    """Terminate a RunPod run's pod. A run that already finished keeps its result."""
+    from minegs.train.runner.base import RunnerConfig
+    from minegs.train.runner.runpod import RunPodRunner
+
+    def go() -> None:
+        h = RunPodRunner(RunnerConfig.load(config)).attach(run_dir)
+        h.cancel()
+        console.print(f"{h.run_id}: {h.status().value}")
+
+    run_guarded(go)
+
+
+@app.command("remote-worker", hidden=True)
+def remote_worker(inputs: Path = typer.Argument(..., help="jobs/<run_id>/inputs.json")) -> None:
+    """Pod side of a RunPod run: verify the inputs, train, write status and outputs (Phase 6)."""
+    from minegs.train.remote.worker import run_worker
+
+    raise typer.Exit(run_worker(inputs))

@@ -225,10 +225,12 @@ def test_dataset_hash_covers_images(synthetic, tmp_path):
     assert sha256_tree(synthetic.dataset_dir, DATASET_HASH_PATTERNS) == before
 
 
-def test_runpod_runner_is_explicitly_unimplemented(synthetic):
+def test_runpod_runner_refuses_before_any_external_step(synthetic, monkeypatch):
+    # Phase 6: implemented, so what is pinned now is that an incomplete config is refused before
+    # anything is uploaded or created — here, no network volume to hold the run
+    monkeypatch.setenv("RUNPOD_API_KEY", "dummy-key-value")
     r = get_runner("runpod", RunnerConfig(runner="runpod", image="x@sha256:abc"))
-    # light, not heavy: heavy is refused earlier for depth_loss, which would mask this path
-    with pytest.raises(NotYetImplementedError, match="Phase 6"):
+    with pytest.raises(ContractError, match="network_volume_id"):
         r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light"))
 
 
@@ -292,7 +294,8 @@ def test_runner_prepare_writes_provenance(synthetic):
 
 def test_sync_never_pushes_raw(synthetic, tmp_path):
     argv = rsync.push_command(synthetic.dataset_dir, "remote:x")
-    assert argv[:3] == ["rclone", "sync", str(synthetic.dataset_dir)] and "--include" in argv
+    # Phase 6: exactly the files the dataset hash covers, by list, never a second pattern set
+    assert argv[:3] == ["rclone", "copy", str(synthetic.dataset_dir)] and "--files-from" in argv
     with pytest.raises(ContractError, match="raw"):
         rsync.push_command(synthetic.root / "raw", "remote:x")
     with pytest.raises(ContractError):

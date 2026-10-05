@@ -131,7 +131,7 @@ training_setup, trainer_exit, output_verification, worker_restarted, worker_erro
 volume_mount_path, container_disk_gb, docker_args, env={}, cloud_type, allowed_cuda_versions}`;
 `PodInfo{pod_id, desired_status, gpu_display_name, gpu_count, image, uptime_seconds, cost_per_hr,
 last_status_change}`. `SdkRunPodClient` 만 `runpod` 을 import 한다. 오류는 `ProviderAllocationError` /
-`ProviderUnavailable` / `ProviderError` 로 (redaction 후). GPU type 은 요청 목록 순서대로 시도하고 할당
+`ProviderUnavailableError` / `ProviderError` 로 (redaction 후). GPU type 은 요청 목록 순서대로 시도하고 할당
 실패 (`ProviderAllocationError`) 일 때만 다음으로 — retry scheduler 가 아니라 GPU 선택이다.
 
 Pod 요청: `image=<repo@sha256:...>`, `gpu_count=1`, `network_volume_id`, `volume_mount_path=volume_mount`,
@@ -194,7 +194,70 @@ pod 경로다 — 로컬 render/surface (`run_views`) 는 기록된 경로가 �
 
 ## 13. 구현 기록
 
-(C1–C4 에서 채운다.)
+### 13.1 모듈
+
+| 모듈 | 내용 |
+|---|---|
+| `minegs/train/remote/layout.py` | §4 경로, `safe_id` / `safe_mount` (worker 인자에 들어가는 문자 제한) |
+| `minegs/train/remote/store.py` | `LocalDirStore` (mount 된 volume, 테스트의 temp volume), `RcloneStore` (`lsjson --stat`·`cat`·`copyto`/`moveto`·`copy --files-from`), `store_for` |
+| `minegs/train/remote/bundle.py` | `RunInputBundle`, `require_dataset_dir`·`dataset_file_table` (raw 거부, hash 와 같은 목록), `publish_inputs` |
+| `minegs/train/remote/status.py` | `JobStatus`, `RemoteOutputRecord`, `verify_output_tree` |
+| `minegs/train/remote/provider.py` | `RunPodClient` seam, `SdkRunPodClient` (runpod 1.12), 오류 분류·redaction |
+| `minegs/train/remote/worker.py` | `run_worker`, `verify_pod_inputs`, `RemoteWorkerRunner(LocalRunner)` |
+| `minegs/train/remote/secrets.py` | 기록 금지 값의 이름 패턴, `redact` |
+| `minegs/train/runner/runpod.py` | `RunPodRunner` (`plan`·`submit`·`attach`·`terminate`), `RunPodHandle`, `RemoteExecutionRecord` (`remote.json`) |
+| `minegs/eval/compare/execution.py` | fingerprint, `compare_execution` |
+| `minegs/train/runner/sync.py` | push = hash 파일 목록 (`--files-from`), pull = `backend_out/` 만 제외 |
+
+### 13.2 구현하며 정한 것
+
+* **LocalRunner 변경은 하나:** handle 이 trainer exit code (`returncode`) 를 노출한다. 명령·staging·기록은
+  그대로 (`test_a_local_run_is_unchanged_by_phase_6`, `test_the_pod_computes_what_a_local_run_computes`).
+* **`RunnerConfig` 1.1** (no-op migration): `gpu_count`, `cuda_archs` (기본값 = `IMAGE_CUDA_ARCHS` = Dockerfile,
+  테스트로 drift 감시), `allowed_cuda_versions`, `cloud_type`, `terminate_on_completion`.
+* **profile 은 이름으로만.** 파일 profile 은 pod 이미지에 없으므로 거부한다 (override 는 bundle 에).
+* **chunk plan 업로드는 바이트를 `chunk_plan.json` 이름으로**: 로컬 파일 이름과 무관하게 digest 경로의 같은
+  이름. pod 기록의 `chunk.plan_path` 는 pod 경로이고, 로컬 render/surface (`run_views`) 는 그 경로가 없으면
+  dataset 의 `chunks/<plan_id>/chunk_plan.json` 을 digest 로 확인해 쓴다.
+* **image 의 code SHA:** `Dockerfile.gpu` 의 `ARG MINEGS_GIT_SHA` → `ENV MINEGS_GIT_COMMIT`; `git_commit()` 은
+  git 이 없을 때만 그 값을 (hex 형식일 때만) 쓴다.
+* **pull 은 `backend_out/` 을 제외한 run 디렉터리 전체** (staged 포함 — 이후 render 가 읽는다). 큰 dataset 에선
+  전송량이 크다 (§13.6).
+* **dry run** (`train run --runner runpod --dry-run`): `prepare` 를 임시 디렉터리에서 돌려 bundle·pod 요청을
+  보여 준다. upload·pod·volume 쓰기 없음.
+* **CLI:** `train fetch` (attach → status → 검증된 pull), `train cancel`, hidden `train remote-worker`,
+  `eval compare-execution`. RunPod 대기 간격은 config 의 `poll_interval_s`.
+* **live test:** `tests/test_phase6_live.py` (`-m runpod_live` + `MINEGS_RUNPOD_LIVE=1` + config/dataset 경로).
+
+### 13.3 negative test 대응 (지시서 §70–§75)
+
+| 지시서 | 테스트 |
+|---|---|
+| credential/config: key 없음, digest 없음, volume 없음, `gpu_count > 1`, 잘못된 mount, rclone 없음, 잘못된 remote | `test_phase6_runpod.py::test_an_incomplete_runner_config_costs_nothing`, `test_a_missing_credential_or_rclone_costs_nothing`, `test_bad_runs_are_refused_before_upload_or_pod` (모두 pod·volume 쓰기 0 확인) |
+| input sync: raw, provenance 누락, bundle 뒤 dataset 변경, remote hash 불일치, depth 변조, chunk plan, centerline, 불완전 bundle, 같은 id 다른 hash | `test_phase6_sync.py` (parametrized tamper 4 종, bundle 편집·partial, claim 충돌, 두 버전 공존, depth 재검증), `test_phase6_chunks.py` |
+| lifecycle: EXITED·TERMINATED·사라짐 + status 없음, SUCCEEDED + exit ≠ 0, exit 0 + run.json FAILED, exit 0 + 산출물 없음, 취소, provider 상태 불명 | `test_phase6_runpod.py` (ended pod, forged status 2 종, output_verification, cancel/failed-stays-failed, timeout → UNKNOWN, worker 재시작, GPU 3 종) |
+| outputs: manifest 변조, pull 후 파일 누락, hash 불일치, 다른 run id, dataset hash, image digest, 기존 로컬 디렉터리 | `test_phase6_outputs.py` (forger 가 manifest·status 를 맞춰도 identity 로 거부) |
+| secrets | `test_credentials_never_reach_records_logs_or_errors` (3 개 secret, 성공·실패·provider 오류, volume·run dir·예외·stdout 전수) |
+| LocalRunner / Phase 5 회귀 | `test_a_local_run_is_unchanged_by_phase_6`, `test_the_pod_computes_what_a_local_run_computes`, 기존 Phase 0D–5 테스트 전체 |
+
+### 13.4 C4 hostile review
+
+(C4 에서 채운다.)
+
+### 13.5 검증
+
+(C4 에서 채운다.)
+
+### 13.6 한계와 미룬 것
+
+* 실제 RunPod·실제 GPU 실행 없음. provider 는 fake, volume 은 temp directory, rclone 은 stand-in.
+  `SdkRunPodClient` 는 1.12.0 소스를 읽고 작성했지만 실제 API 로 호출된 적이 없다.
+* RunPod 이 pod 의 `RUNPOD_POD_ID` 를 주입한다는 것은 문서 기반 — 없으면 `pod_id: null` 로 남는다.
+* 할당 오류 판별은 SDK 메시지 문자열 ("instances ... available") 에 기대고, 아니면 일반 provider 오류로
+  submit 을 멈춘다 (다음 GPU type 으로 넘어가지 않는다 — 보수적).
+* pull 은 staged 를 포함한 run 디렉터리 전체 (`backend_out/` 제외) 라 큰 dataset 에서 전송량이 크다.
+* worker 가 쓰는 status 는 volume 위 파일이다. volume 자체가 없어지면 증거도 없다 (그때 run 은 FAILED/UNKNOWN).
+* resume, multi-GPU, 자동 retry, pod 재사용, 비용 합계는 범위 밖.
 
 ## 14. 종료 성숙도 (live RunPod 없이)
 

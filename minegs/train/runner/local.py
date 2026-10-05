@@ -93,6 +93,11 @@ class LocalHandle(RunHandle):
             return RunStatus.RUNNING
         return RunStatus.SUCCEEDED if rc == 0 else RunStatus.FAILED
 
+    @property
+    def returncode(self) -> int | None:
+        """The trainer process's exit code once it has ended (None while running or unknown)."""
+        return None if self._proc is None else self._proc.poll()
+
     def logs(self, tail: int | None = None) -> str:
         p = self.run_dir / "log" / "train.log"
         if not p.exists():
@@ -119,7 +124,7 @@ class LocalRunner(Runner):
             raise NoGpuError(
                 "No CUDA device found. Training needs a GPU. Run on a CUDA host (docker with "
                 "--gpus device=0), or use --native for a developer run in the current environment. "
-                "Cloud routing (RunPod) is Phase 6 and not implemented yet — see docs/ROADMAP.md."
+                "Or run it on a RunPod GPU: --runner runpod --config configs/runner/runpod.yaml."
             )
 
         # One GPU, decided before anything is staged. gsplat reads torch.cuda.device_count() and
@@ -338,6 +343,10 @@ class _FinalizingHandle(RunHandle):
         Runner.write_record(rec, self.run_dir)
         self._terminal = rec.status
         return self._terminal
+
+    @property
+    def returncode(self) -> int | None:
+        return self._inner.returncode
 
     def logs(self, tail: int | None = None) -> str:
         return self._inner.logs(tail)

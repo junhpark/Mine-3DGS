@@ -90,6 +90,9 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+markers = [
+    "runpod_live: billable RunPod execution; also needs MINEGS_RUNPOD_LIVE=1 (docs/PHASE6_ACCEPTANCE.md)",
+]
 filterwarnings = ["error::DeprecationWarning:minegs.*"]
 
 [tool.mypy]

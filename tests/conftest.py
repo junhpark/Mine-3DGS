@@ -98,3 +98,11 @@ def golden_gate_small(dataset_small, staging_small, tmp_path_factory):
 
     out = tmp_path_factory.mktemp("gg")
     return run_golden_gate(dataset_small.dataset_dir, staging_small.staging_dir, out), out
+
+
+@pytest.fixture
+def pod_env(tmp_path, monkeypatch):
+    """Phase 6: a temp network volume, a fake provider, a trainer stand-in (tests/phase6_fakes)."""
+    from phase6_fakes import make_pod_env
+
+    return make_pod_env(tmp_path, monkeypatch)
