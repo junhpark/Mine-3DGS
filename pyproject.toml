@@ -46,7 +46,7 @@ eval = ["open3d>=0.18", "scikit-image>=0.22", "lpips>=0.1.4"]
 # 12 visualisation
 viz = ["viser>=0.2.7"]
 # 8.2 RunPod runner
-runpod = ["runpod>=1.6"]
+runpod = ["runpod>=1.12,<1.13"]  # signatures read from 1.12.0 (docs/PHASE6_CONTRACT.md §2 Q1')
 dev = [
   "pytest>=8",
   "pytest-cov>=5",
