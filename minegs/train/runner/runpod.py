@@ -630,6 +630,9 @@ class RunPodHandle(RunHandle):
                 "depth_artifact_sha256"
             ) != rem.depth_artifact_sha256:
                 problems.append("depth supervision artifact")
+            unlisted = sorted(set(rec.outputs) - {e.path for e in manifest.entries})
+            if unlisted:
+                problems.append(f"outputs {unlisted[:3]} not in the manifest")
             if (rec.status is RunStatus.SUCCEEDED) != js.succeeded:
                 problems.append(
                     f"run.json says {rec.status.value} but the job says {js.state.value} "

@@ -50,13 +50,17 @@ GPU 가격 최적화·입찰, Phase 7/8, 새 backend·loss·metric.
 
 * 개발·`pytest`·CI 는 billable 호출을 하지 않는다: provider 는 seam 뒤의 fake, network volume 은 temp
   directory. 실제 provider 테스트는 `pytest -m runpod_live` **그리고** `MINEGS_RUNPOD_LIVE=1` 둘 다
-  있을 때만 (credential 이 있다는 것만으로는 돌지 않는다).
+  있을 때만 (credential 이 있다는 것만으로는 돌지 않는다). `tests/conftest.py` 가 `-m` 식이 `runpod_live`
+  를 고르지 않으면 그 marker 의 항목을 전부 skip 한다 — env 만으로는 돌지 않는다 (C4).
 * API key 는 환경변수 `RUNPOD_API_KEY` (SDK/CLI 관례). 없으면 `ContractError` — SDK 인증 오류까지 가지
   않는다. 값은 SDK 호출 직전에 `runpod.api_key` 에만 넣는다.
 * 기록 금지 값: `RUNPOD_API_KEY`, `RCLONE_CONFIG_PASS`, `RCLONE_*_SECRET*`/`*_KEY*`/`*_PASS*`,
   `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, registry token, SSH key, Authorization header — run.json,
   status.json, remote.json, bundle, log, command, provenance, 예외 메시지 어디에도. 이름은 기록 가능
-  (`credential_source: "RUNPOD_API_KEY"`). provider·rclone 의 오류 문자열은 기록 전 redaction.
+  (`credential_source: "RUNPOD_API_KEY"`). provider·rclone 의 오류 문자열은 기록 전 redaction — 전체를
+  redact 한 **뒤에** 자른다 (자른 뒤 redact 하면 잘린 secret 반쪽이 남는다). Authorization header 는 scheme
+  (Bearer · Basic · Token · AWS4-HMAC-SHA256 …) 과 무관하게 줄 끝까지, JSON/dict 형태는 따옴표 값 전체를
+  가린다.
 * pod 에는 secret 을 넘기지 않는다: worker 는 volume 의 파일만 읽고, pod env 는 비어 있다.
 
 ## 4. Remote 경로 (volume root 기준, pod 에서는 `<volume_mount>/` 아래)
@@ -73,8 +77,12 @@ minegs/<dataset_id>/runs/<run_id>/                  run 디렉터리 (run.json, 
 
 * `dataset_id`, `run_id`: `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`. 아니면 거부 (경로·worker 인자에 안전하지
   않다). `volume_mount`: 절대 경로, `/` 아님, `..` 없음, 같은 문자 집합.
-* write-once: `jobs/<run_id>/` 또는 `runs/<run_id>/` 가 이미 있으면 거부. 같은 hash 의 dataset 재업로드는
-  idempotent; `dataset.json` 이 다른 hash 를 말하면 거부.
+* write-once: `jobs/<run_id>/` 또는 `runs/<run_id>/` 가 이미 있으면 거부. dataset 경로도 write-once:
+  `dataset.json` (claim) 은 upload 가 끝난 뒤 마지막에 쓰고, claim 이 있는 경로에는 **다시 쓰지 않는다**
+  (재업로드 없음 — volume 의 사본이 상했으면 pod 의 재-hash 가 거부한다). claim 이 다른 hash 를 말하면 거부.
+* chunk plan 은 로컬 파일 이름과 무관하게 `<plan_digest>/chunk_plan.json` 으로 쓴다. depth 는 검증된
+  record 가 이름 붙인 두 파일 (`depth_supervision.json`, samples) 만 올린다 — 검증 뒤에 디렉터리를 다시
+  나열하지 않는다.
 * stale 읽기 없음: worker 는 bundle 이 이름 붙인 content-addressed 경로만 읽는다.
 
 ## 5. `RunInputBundle` (schema 1.0, `inputs.json`)
@@ -89,6 +97,9 @@ plan_digest, path} | null, depth_supervision {supervision_id, artifact_sha256, p
   는 `inputs.json` 없이는 시작하지 않는다.
 * raw 거부: 대상은 `manifest.json` 이 있는 dataset 디렉터리여야 하고 (`raw/`, project root 거부), upload
   목록에 raw 확장자 (`.e57 .mp4 .mov .avi .mkv .insv .insp .360 .las .laz`) 파일이 있으면 거부.
+* symlink 거부: dataset 디렉터리에서 파일까지의 경로에 symlink 가 하나라도 있거나 (`provenance/` 같은 디렉터리
+  포함), 실제 경로가 dataset 밖이면 거부. raw 확장자는 link 이름과 target 둘 다 본다. depth 파일과
+  `LocalDirStore` 의 upload 원본도 같다. link 는 이 기계의 어떤 파일이든 가리킬 수 있다.
 
 ## 6. Job status 와 성공
 
@@ -112,7 +123,9 @@ training_setup, trainer_exit, output_verification, worker_restarted, worker_erro
 | final SUCCEEDED + exit 0 | 무관 | pull·검증 통과 시 SUCCEEDED, 아니면 FAILED (stage `pull_verification`) |
 | final FAILED / exit ≠ 0 | 무관 | FAILED (worker 의 stage·message) |
 | 없음 / STARTING / RUNNING | RUNNING | RUNNING (status 없으면 PENDING) |
-| 사용자 terminate, final 없음 | 무관 | CANCELLED |
+| 사용자 terminate (terminate 성공), final 없음 | 무관 | CANCELLED |
+| cancel 요청, terminate 실패 | RUNNING | RUNNING/PENDING (cancel 은 오류를 올리고, 다시 cancel 하면 재시도) |
+| cancel 요청 | EXITED · TERMINATED · 사라짐 | CANCELLED |
 | 없음 / 비-final | EXITED · TERMINATED · 사라짐 | FAILED (stage `pod_ended_without_final_status`) |
 | provider 조회 실패·timeout | — | UNKNOWN (상태를 바꾸지 않는다) |
 
@@ -122,7 +135,10 @@ training_setup, trainer_exit, output_verification, worker_restarted, worker_erro
 * 자동 종료 (`terminate_on_completion`, 기본 true): final status 와 output manifest 가 volume 에 있을 때만
   pod 를 끈다. 증거는 volume 에 남는다.
 * `terminate()`: 의도를 `remote.json` 과 `jobs/<run_id>/cancel_requested.json` 에 기록하고 pod 를 끈다.
-  이미 final 이면 그 결과를 덮지 않는다.
+  이미 final 이면 그 결과를 덮지 않는다. terminate 호출이 실패하면 CANCELLED 가 아니다 (pod 가 아직 돌고
+  과금될 수 있다): note 를 남기고 오류를 올린다.
+* pull 중 어떤 오류든 (manifest 가 JSON 이 아님, run.json 파싱 실패, I/O) FAILED `pull_verification` 이고 pod
+  를 끈다 — handle 이 죽거나 RUNNING 에 머물지 않는다.
 
 ## 7. Provider seam
 
@@ -156,10 +172,17 @@ dataset hash 재계산 = bundle 의 hash · bundle digest · chunk plan (`verify
   [{path, size, sha256}], output_tree_digest, created_at`) 를 atomic 하게 쓰고, 그 sha 를 status 에 넣는다.
   `backend_out/` (scratch) 만 제외.
 * 로컬 pull: `<run_dir>` 옆 임시 디렉터리로 받는다 → manifest sha = status 의 sha → 모든 항목 size·sha
-  일치, manifest 에 없는 파일 없음 → `output_tree_digest` 재계산 일치 → `run.json` 의 `run_id`·
-  `dataset_hash`·`docker_digest`·`runner` 가 bundle 과 일치 → 로컬 run 디렉터리에 우리 것 (`run.json`
-  placeholder, `remote.json`) 말고 아무것도 없을 때만 publish (`run.json` 마지막). 하나라도 어긋나면 publish
-  하지 않는다.
+  일치, manifest 에 없는 파일 없음 (받은 쪽에서는 `.partial` 도 "없는 파일" 로 센다) → `output_tree_digest`
+  재계산 일치 → `run.json` 의 `run_id`·`dataset_hash`·`docker_digest`·`image`·`runner`·input bundle digest·
+  `remote_sync.pod_dataset_hash`·chunk (`chunk_id`, `plan_id`, `plan_digest`)·depth artifact sha 가
+  **submit 때 `remote.json` 에 기록한 값** 과 일치 (fetch 시점 config 가 아니라), `run.json.outputs` 가 모두
+  manifest 에 있음 → 로컬 run 디렉터리에 우리 것 (`run.json` placeholder, `remote.json`) 말고 아무것도 없을
+  때만 publish. publish 하는 것은 manifest 항목과 manifest 자체뿐이고 `run.json` 이 마지막이다. 하나라도
+  어긋나면 publish 하지 않는다.
+* `attach` (`train fetch`/`cancel`) 는 config 의 image 가 submit 때의 image 와 다르면 거부한다.
+* worker 는 학습이 끝난 뒤 `staged/images`·`staged/masks` 가 검증한 dataset table 의 sha 와 같은지 다시
+  본다 (staging 은 volume 의 dataset 을 hard-link 한다). 다르면 run.json 을 FAILED 로 고치고 job 은 FAILED
+  `input_verification`.
 
 ## 10. Evidence
 
@@ -211,7 +234,9 @@ pod 경로다 — 로컬 render/surface (`run_views`) 는 기록된 경로가 �
 
 ### 13.2 구현하며 정한 것
 
-* **LocalRunner 변경은 하나:** handle 이 trainer exit code (`returncode`) 를 노출한다. 명령·staging·기록은
+* **LocalRunner 변경은 둘:** handle 이 trainer exit code (`returncode`) 를 노출한다. 그리고 (C4, F6)
+  bare-environment `--native` run 은 image·`docker_digest` 를 기록하지 않는다 — image 안에서 실행되지 않았다
+  (`Runner.native_runs_in_image`; RunPod worker 만 True — pod 가 그 image 의 container 다). 명령·staging 은
   그대로 (`test_a_local_run_is_unchanged_by_phase_6`, `test_the_pod_computes_what_a_local_run_computes`).
 * **`RunnerConfig` 1.1** (no-op migration): `gpu_count`, `cuda_archs` (기본값 = `IMAGE_CUDA_ARCHS` = Dockerfile,
   테스트로 drift 감시), `allowed_cuda_versions`, `cloud_type`, `terminate_on_completion`.
@@ -242,11 +267,50 @@ pod 경로다 — 로컬 render/surface (`run_views`) 는 기록된 경로가 �
 
 ### 13.4 C4 hostile review
 
-(C4 에서 채운다.)
+한 번, bounded: S1–S10 (raw·symlink, write-once·충돌, chunk/depth identity, image digest, lifecycle,
+산출물, secret, profile/code drift, chunk pull, live 차단) 을 차원별 finder 가 찾고, 각 finding 을 독립
+verifier 가 재현·반박했다. **20 건 중 14 건 확인 (major 4 · minor 10), 6 건 기각.** 확인된 것은 모두 고쳤고 각각 회귀 테스트가 있다.
+
+| # | S | 심각도 | finding | 고침 | 테스트 |
+|---|---|---|---|---|---|
+| F1 | S1 | major | dataset 아래 symlink (`provenance/` 디렉터리, 이미지) 를 따라가 외부·raw 파일이 올라감 | 경로의 모든 component 의 symlink·root 밖 resolve 거부, raw 는 target 도 검사, `LocalDirStore` 원본 symlink 거부 | `test_nothing_goes_up_through_a_symlink` (3 종) |
+| F2 | S2 | major | claim 이 있는 content-addressed dataset 경로에 매번 재업로드 (실행 중 다른 run 의 입력을 덮을 수 있음) | claim 있으면 upload 생략 (write-once), claim 은 마지막; worker 가 학습 뒤 staged images/masks 를 table 과 대조 | `test_a_claimed_dataset_path_is_never_written_again`, `test_the_trainer_reads_only_verified_bytes` |
+| F3 | S1 | minor | depth 디렉터리를 검증 뒤 다시 나열해 upload | 검증된 record 의 두 파일만, symlink·raw 검사 | `test_only_the_verified_depth_files_go_up` |
+| F4 | S3 | minor (×2) | chunk plan 이 로컬 파일 이름으로 올라가 pod 가 `chunk_plan.json` 을 찾지 못함 (두 verifier 가 독립 보고) | plan bytes 를 `<digest>/chunk_plan.json` 으로 `write_atomic` | `test_a_plan_file_under_any_local_name_reaches_the_pod_as_its_digest` |
+| F5 | S3/S9 | minor | pull 이 chunk·depth identity 를 확인하지 않음 | submit 때 `remote.json` 에 chunk·depth identity 기록, pull 이 `chunk_id`·`chunk`·`depth_supervision`·`remote_sync` 대조 | `test_a_run_record_that_is_not_the_submitted_run_is_refused` (+6 종) |
+| F6 | S4 | major | bare-environment `--native` local run 이 실행하지 않은 image 의 digest 를 기록 → 재현성 쌍이 거짓으로 성립 | `Runner.native_runs_in_image` (worker 만 True); native local 은 image·digest null | `test_a_local_run_is_unchanged_by_phase_6` |
+| F7 | S4 | minor | pull 이 fetch 시점 config 의 digest 와 비교 | submit 때의 `rem.image` digest 와 비교, `attach` 는 image 불일치 거부 | `test_a_run_is_fetched_with_the_image_it_was_submitted_with` |
+| F8 | S10 | minor | live test 가 `-m runpod_live` 없이 env 만으로 실행 가능 | conftest 가 marker 를 고르지 않으면 skip | 수동 확인 (env 만 → skip), CI smoke |
+| F9 | S6 | minor | 받은 쪽에서 `.partial` 을 검증 없이 publish | 받은 쪽 strict 검증 (`.partial` = 없는 파일), manifest 항목만 publish | `test_a_partial_file_from_the_pod_is_never_published` |
+| F10 | S5 | major | manifest 파싱 오류 시 `status()` 가 예외로 죽고 pod 가 종료되지 않음 | 파싱 → `ContractError`, `_finish` 가 `ValueError`/`TypeError`/`OSError` 도 FAILED + terminate | `test_an_unparseable_manifest_fails_the_run_and_releases_the_pod` (3 종) |
+| F11 | S5 | minor | cancel 에서 terminate 가 실패해도 CANCELLED 로 고정 | 실패 시 note + 오류, `terminated_at` 또는 pod 종료일 때만 CANCELLED, 재시도 가능 | `test_a_cancel_whose_terminate_failed_is_not_cancelled` |
+| F12 | S7 | minor | rclone stderr 를 자른 뒤 redact → 잘린 secret 반쪽 노출 | redact 후 truncate | `test_rclone_errors_are_redacted_before_they_are_shortened` (옛 코드에서 실패 확인) |
+| F13 | S7 | minor | Bearer 아닌 Authorization header (Basic·Token·AWS4) 값이 남음 | header 값 줄 끝까지·JSON 따옴표 값 전체 redact | `test_any_authorization_header_is_redacted` (6 종) |
+
+기각 6 건 (재현은 됐지만 계약 위반이 아님):
+
+1. `raw/<x>/dataset` 처럼 raw 아래 중첩된 dataset 디렉터리를 받아들인다 — 대상은 manifest 가 있는 dataset
+   이고 upload 목록의 raw 파일은 따로 거부된다 (§5). 거부 규칙은 경로 이름이 아니라 내용이다.
+2. image digest 형식을 검사하지 않는다 — 계약은 `image_digest() is None` 거부만 요구했다. 그래도
+   **강화했다**: RunPod image 는 `repo@sha256:<64 hex>` 만 받는다 (`test_an_incomplete_runner_config_costs_nothing`
+   +2 종).
+3. `minegs sync pull` 이 검증하지 않는다 — 계약상 plain transport (§13.2). 검증된 경로는 `train fetch`.
+4. forger 가 산출물 파일을 지우고 manifest·status 를 다시 맞추면 `run.json.outputs` 가 없는 파일을 가리킨
+   채 SUCCEEDED — volume 에 쓸 수 있는 forger 시나리오다. 그래도 **강화했다**: `run.json.outputs` 가 모두
+   manifest 에 있어야 한다 (parametrize +1).
+5. submitter checkout 과 image 의 profile 이 다르면 결과가 다르다 — 계약상 image 가 code·profile 을 싣는다
+   (§1, §13.2). 재현성 fingerprint 가 code SHA·expected trainer config 로 그 차이를 드러낸다.
+6. git 이 없을 때 `MINEGS_GIT_COMMIT` 을 code SHA 로 쓴다 — 계약 Q4 그대로 (hex 일 때만).
 
 ### 13.5 검증
 
-(C4 에서 채운다.)
+(final gate 결과는 PR 본문에 그대로 기록한다.)
+
+* `ruff check .` · `ruff format --check .`: 통과.
+* `pytest` 전체 (일반 venv): 통과, skip 은 torch·live 항목뿐. torch 항목은 numpy<2 venv 에서
+  `test_phase4_trainer_torch`·`test_phase5_train_torch`·`test_phase6_torch` 통과.
+* CI 의 Phase 6 CLI smoke (`bash -e`): dry run, key 없음·tag image 거부, key 값 미출력, volume 무변경 — 통과.
+* live RunPod: 사용하지 않음. 실제 GPU: 사용하지 않음. billable 호출: 없음.
 
 ### 13.6 한계와 미룬 것
 
@@ -256,6 +320,11 @@ pod 경로다 — 로컬 render/surface (`run_views`) 는 기록된 경로가 �
 * 할당 오류 판별은 SDK 메시지 문자열 ("instances ... available") 에 기대고, 아니면 일반 provider 오류로
   submit 을 멈춘다 (다음 GPU type 으로 넘어가지 않는다 — 보수적).
 * pull 은 staged 를 포함한 run 디렉터리 전체 (`backend_out/` 제외) 라 큰 dataset 에서 전송량이 크다.
+* staged 재검사는 images·masks 만이다. `sparse/0`·`init_points.ply` 는 staging 이 읽어 새로 쓰므로, prepare 의
+  재-hash 와 staging 사이 (초 단위) 에 volume 이 바뀌는 창이 남는다. volume 은 이 run 만 쓰는 write-once
+  경로라 위협은 volume 에 쓸 권한이 있는 쪽뿐이다.
+* docker local run 의 `backend.version` 은 host 의 패키지에서 읽는다 (image 안이 아니다). 재현성 비교는
+  image digest 를 따로 보므로 쌍 판정은 영향받지 않지만, 그 필드 자체는 host 사실이다.
 * worker 가 쓰는 status 는 volume 위 파일이다. volume 자체가 없어지면 증거도 없다 (그때 run 은 FAILED/UNKNOWN).
 * resume, multi-GPU, 자동 retry, pod 재사용, 비용 합계는 범위 밖.
 

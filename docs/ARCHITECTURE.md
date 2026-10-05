@@ -295,12 +295,14 @@ RunHandle.status() / .logs() / .fetch_artifacts()
 * `LocalRunner` — `docker run --gpus device=<n> minegs:gpu@sha256:...`. CUDA 없으면 거부하고
   RunPod 저가 GPU 라우팅 제안.
 * `RunPodRunner` (Phase 6, [계약](PHASE6_CONTRACT.md)) — network volume 이 persistent truth.
-  비용 전 검증 → dataset hash 가 덮는 파일만 content-addressed 경로로 upload, sidecar 는 digest 로
+  비용 전 검증 → dataset hash 가 덮는 파일만 (symlink 거부) content-addressed·write-once 경로로
+  upload, sidecar 는 digest 로
   → `inputs.json` 마지막 → pod 생성 (`minegs train remote-worker`). pod 는 같은 이미지에서
   LocalRunner 의 native 경로를 그대로 실행하고 (`runner: runpod`), 학습 전에 모든 identity 를 다시
   도출한다. 성공은 worker 의 `status.json` (exit code) + output manifest 이고 lifecycle 이 아니다.
   pull 은 manifest 로 모든 파일을 검증한 뒤에만 publish.
-* 두 러너의 GPU 이미지 digest 는 동일. run.json 에 기록.
+* 두 러너의 GPU 이미지 digest 는 동일. run.json 에 기록. bare-environment `--native` 개발 run 은 이미지
+  안에서 돌지 않으므로 image·digest 를 기록하지 않는다 (재현성 쌍이 되지 않는다).
 * **Training resume 은 구현되어 있지 않다.** `--resume-from` 은 명시적 옵션으로 존재하지만
   `Runner.prepare` 에서 항상 거부되며, 이는 trainer 실행 이전이자 run directory 생성 이전이다.
   gsplat v1.5.3 은 학습을 이어붙일 수 없고 (`--ckpt` = evaluation only), 진짜 resume 은 완전한

@@ -119,6 +119,10 @@ def _forge(run, job, edit) -> None:
         (lambda d: d.update(runner="local"), "runner local"),
         (lambda d: d["remote_sync"].update(input_bundle_digest="f" * 64), "input bundle"),
         (lambda d: d["remote_sync"].update(pod_dataset_hash="0" * 64), "pod dataset hash"),
+        (
+            lambda d: d.update(outputs=[*d["outputs"], "point_cloud/point_cloud_99.ply"]),
+            "not in the manifest",
+        ),
         (lambda d: d.update(chunk_id="K001"), "chunk K001"),
         (
             lambda d: d.update(chunk={"plan_id": "p", "plan_digest": "e" * 64}),
