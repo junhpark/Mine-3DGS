@@ -21,6 +21,7 @@ import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -238,6 +239,39 @@ def check_run(run_dir: Path, dataset_id: str, dataset_hash: str):
     return rec
 
 
+def run_views(run, dataset_dir: Path, images: dict) -> dict:
+    """The views a run's depth is rendered and back-projected from.
+
+    Every dataset view for an ordinary run. For a chunk of a plan (Phase 5), the chunk's view set:
+    every capture group, of any split, whose span meets its support. A chunk model holds Gaussians
+    for its stretch of tunnel only, so a view far down the drift would render empty and is not a
+    view of this model. The set is re-derived from the verified plan, not read from the record.
+    """
+    if run.chunk is None:
+        if run.chunk_id is not None:
+            raise ContractError(
+                f"run {run.run_id} names chunk {run.chunk_id} without a chunk plan; which views "
+                "belong to it cannot be decided"
+            )
+        return images
+    from minegs.chunks.plan import verify_chunk_plan
+
+    plan = verify_chunk_plan(dataset_dir, run.chunk["plan_path"])
+    if plan.plan_digest != run.chunk.get("plan_digest"):
+        raise ContractError(
+            f"run {run.run_id} was trained from plan {run.chunk.get('plan_id')}, but "
+            f"{run.chunk['plan_path']} now holds {plan.plan_id}"
+        )
+    views = set(plan.chunk(run.chunk_id).views)
+    chosen = {iid: im for iid, im in images.items() if im.name in views}
+    if len(chosen) != len(views):
+        raise ContractError(
+            f"chunk {run.chunk_id} views {sorted(views - {im.name for im in chosen.values()})[:3]} "
+            "are not in the dataset's model"
+        )
+    return chosen
+
+
 def _depth_provenance(
     depth_dir: Path, run, run_dir: Path, dataset_id: str, dataset_hash: str, model
 ) -> tuple[str, Any]:
@@ -320,11 +354,12 @@ def build_depth_surface(
     dataset_hash = sha256_tree(dataset_dir, DATASET_HASH_PATTERNS)
     run = check_run(run_dir, manifest.dataset_id, dataset_hash)
     run_id = run.run_id
+    views = SimpleNamespace(cameras=model.cameras, images=run_views(run, dataset_dir, model.images))
     depth_source, rendered = _depth_provenance(
-        depth_dir, run, run_dir, manifest.dataset_id, dataset_hash, model
+        depth_dir, run, run_dir, manifest.dataset_id, dataset_hash, views
     )
 
-    pc = depth_to_points(depth_dir, model.cameras, model.images, stride, max_depth, True)
+    pc = depth_to_points(depth_dir, views.cameras, views.images, stride, max_depth, True)
     # §14 sanity. Neither is reachable from finite depth maps and a rigid pose, which is the
     # point: if one ever fires, the inputs were not what the contract says they are.
     if len(pc) == 0:
@@ -345,7 +380,7 @@ def build_depth_surface(
         "run_dir": str(run_dir.resolve()),
         "stride": int(stride),
         "max_depth_m": None if max_depth is None else float(max_depth),
-        "expected_views": len(model.images),
+        "expected_views": len(views.images),
     }
     if rendered is not None:
         parameters["depth_manifest_id"] = rendered.manifest_id
@@ -365,8 +400,8 @@ def build_depth_surface(
             point_file=SURFACE_POINTS_FILE,
             point_sha256=sha256_file(ply),
             point_count=len(pc),
-            depth_map_count=len(model.images),
-            depth_sha256=depth_digest(depth_dir, model.images),
+            depth_map_count=len(views.images),
+            depth_sha256=depth_digest(depth_dir, views.images),
             parameters=parameters,
             bounds_min_m=[float(v) for v in lo],
             bounds_max_m=[float(v) for v in hi],
@@ -426,8 +461,9 @@ def rederive_depth_source(surface, dataset_dir: str | Path) -> str | None:
             f"surface {surface.surface_id} names run {surface.run_id}, but {run_dir} now holds "
             f"run {run.run_id}"
         )
+    views = SimpleNamespace(cameras=model.cameras, images=run_views(run, dataset_dir, model.images))
     source, rendered = _depth_provenance(
-        Path(where["depth_dir"]), run, run_dir, manifest.dataset_id, dataset_hash, model
+        Path(where["depth_dir"]), run, run_dir, manifest.dataset_id, dataset_hash, views
     )
     if source not in CLAIM_CAPABLE_DEPTH_SOURCES:
         return (

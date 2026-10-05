@@ -531,7 +531,8 @@ def render_depths(
     min_alpha: float | None = None,
     renderer: DepthRenderer | None = None,
 ) -> tuple[DepthManifest, Path]:
-    """Render metric depth for every dataset view of a succeeded run (§1B).
+    """Render metric depth for every dataset view of a succeeded run (§1B), or for every view of
+    its chunk when the run is a chunk of a plan (Phase 5, ``run_views``).
 
     Returns the manifest and the directory it was published to. Everything that could make the
     result not mean what it says is refused rather than worked around: the run must have
@@ -576,6 +577,9 @@ def render_depths(
 
     record = check_run(run_dir, manifest_ds.dataset_id, dataset_hash)
     run_id = record.run_id
+    from minegs.eval.surface.depth import run_views
+
+    views = run_views(record, dataset_dir, model.images)
     require_metric_outputs(record)
     require_reproducible_render(record, run_dir)
     ckpt = _require_checkpoint(record, run_dir)
@@ -592,13 +596,11 @@ def render_depths(
     require_pinned_backend(record)
     renderer.require_available()
 
-    expected = {im.name for im in model.images.values()}
+    expected = {im.name for im in views.values()}
     entries: list[RenderedDepth] = []
     seen: set[str] = set()
     with staged_dir(out) as tmp:
-        for image, depth in renderer.render(
-            ckpt, model.cameras, model.images, record.checkpoint_step
-        ):
+        for image, depth in renderer.render(ckpt, model.cameras, views, record.checkpoint_step):
             if image.name not in expected:
                 raise ContractError(
                     f"{image.name}: renderer produced a view the dataset does not have"

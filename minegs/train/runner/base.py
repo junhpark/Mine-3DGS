@@ -91,6 +91,9 @@ class RunConfig(VersionedModel):
     # fails closed today; see ``Runner.prepare`` and docs/ROADMAP.md §Phase 0D.
     resume_from: str | None = None
     chunk_id: str | None = None
+    #: The verified ``ChunkPlanRecord`` (``chunks/<plan_id>``) that ``chunk_id`` names (Phase 5).
+    #: A chunk is only ever trained from a plan; neither is accepted without the other.
+    chunk_plan: str | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
     #: A verified DepthSupervisionRecord directory (Phase 4). Required exactly when the profile
     #: requests depth_loss; given to a profile that does not, it is refused, not ignored.
@@ -118,10 +121,17 @@ def _run_1_1_to_1_2(d: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
+@RUN_RECORD_MIGRATIONS.register("1.2", "1.3")
+def _run_1_2_to_1_3(d: dict[str, Any]) -> dict[str, Any]:
+    """1.3 adds the Phase 5 chunk binding. A 1.2 run trained no plan's chunk: ``chunk`` stays
+    null. (A 1.2 ``chunk_id`` came from the legacy manifest plan and is kept as written.)"""
+    return d
+
+
 class RunRecord(VersionedModel):
     """``runs/<run_id>/run.json`` (§9)."""
 
-    SCHEMA_VERSION: ClassVar[str] = "1.2"
+    SCHEMA_VERSION: ClassVar[str] = "1.3"
     MIGRATIONS: ClassVar[MigrationRegistry | None] = RUN_RECORD_MIGRATIONS
     run_id: str
     dataset_id: str
@@ -184,6 +194,11 @@ class RunRecord(VersionedModel):
     #: Images upstream actually optimised, which is not every staged one (test_every).
     optimised_images: int | None = None
 
+    # ---- Phase 5 chunk binding (schema 1.3). Null for a run that is not a plan's chunk.
+    #: Plan identity, the chunk's core/support, what was selected for it, and what it used
+    #: (docs/PHASE5_CONTRACT.md §6). Outputs stay in the dataset's LOCAL_METRIC frame.
+    chunk: dict[str, Any] | None = None
+
 
 class RunHandle(ABC):
     def __init__(self, run_id: str, run_dir: Path) -> None:
@@ -236,17 +251,39 @@ class Runner(ABC):
         if not run.run_dir:
             run.run_dir = str(dataset_dir.parent / "runs" / run.run_id)
         run_dir = Path(run.run_dir)
+        # One frame for every run, chunked or not (Phase 5 AD-4): staging never re-expresses
+        # poses or points, so the outputs are in the dataset's LOCAL_METRIC and that is what is
+        # recorded. (The legacy manifest plan's per-chunk origin described data that did not
+        # exist; it is not used.)
         T_tls_from_local = manifest.T_tls_from_local
-        if run.chunk_id:
-            if manifest.chunks is None:
-                raise ContractError("run.chunk_id set but manifest has no chunks")
-            chunk = next((c for c in manifest.chunks.items if c.id == run.chunk_id), None)
-            if chunk is None:
-                raise ContractError(f"unknown chunk {run.chunk_id}")
-            if chunk.T_tls_from_local is not None:
-                from minegs.core.frames import SE3
+        chunk_binding = None
+        self._chunk = None
+        if run.chunk_id is not None or run.chunk_plan is not None:
+            if not (run.chunk_id and run.chunk_plan):
+                raise ContractError(
+                    "a chunk is trained from a verified chunk plan: give --chunk-plan "
+                    "<chunks/<plan_id>> together with --chunk <id> (Phase 5 AD-1); the legacy "
+                    "manifest.chunks windows are not a training plan"
+                )
+            from minegs.chunks.plan import verify_chunk_plan
 
-                T_tls_from_local = SE3.from_matrix(chunk.T_tls_from_local)
+            plan = verify_chunk_plan(dataset_dir, run.chunk_plan, manifest=manifest)
+            chunk = plan.chunk(run.chunk_id)
+            require_whole_chunk(chunk, profile.max_images)
+            self._chunk = (plan, chunk)
+            chunk_binding = {
+                "plan_id": plan.plan_id,
+                "plan_digest": plan.plan_digest,
+                "plan_path": str(Path(run.chunk_plan).resolve()),
+                "chunk_id": chunk.chunk_id,
+                "ordinal": chunk.ordinal,
+                "n_chunks": len(plan.chunks),
+                "core_range_m": list(chunk.core_range_m),
+                "support_range_m": list(chunk.support_range_m),
+                "capture_groups": list(chunk.capture_groups),
+                "images": list(chunk.images),
+                "actual_image_support_m": list(chunk.actual_image_support_m),
+            }
         # `is not None`, not truthiness: resume_from="" is still a resume *request*, and one
         # that names nothing is the least honourable of all — under a truthiness test it would
         # fall through to a fresh iteration-0 run, which is the exact silent restart this phase
@@ -275,6 +312,17 @@ class Runner(ABC):
             verified = verify_depth_supervision(
                 dataset_dir, run.depth_supervision, manifest=manifest
             )
+            if self._chunk is not None:
+                # The global artifact is reused byte for byte; the adapter will only read the
+                # samples of the chunk's own images. If there are none, the run could only end
+                # FAILED after training, so it is refused now (Phase 5 §5.5).
+                chunk = self._chunk[1]
+                if not verified.images_with_samples(list(chunk.images)):
+                    raise ContractError(
+                        f"chunk {chunk.chunk_id}: none of its {len(chunk.images)} training "
+                        f"images carries a depth sample in {verified.record.supervision_id}; a "
+                        "depth-supervised run of it would apply no depth term"
+                    )
         refuse_used_run_dir(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         record = RunRecord(
@@ -283,6 +331,7 @@ class Runner(ABC):
             dataset_id=manifest.dataset_id,
             dataset_hash=sha256_tree(dataset_dir, DATASET_HASH_PATTERNS),
             chunk_id=run.chunk_id,
+            chunk=chunk_binding,
             backend={"name": backend.name, "version": backend.version()},
             profile=profile.model_dump(mode="json"),
             runner=self.name,
@@ -706,6 +755,35 @@ def staged_metric_scale(staged_dir: Path) -> float:
     return metric_scale_from_cameras(c2w, similarity_from_cameras)
 
 
+def require_whole_chunk(chunk, max_images: int | None) -> None:
+    """A chunk trains on every image of its capture groups, or not at all (Phase 5 §5.3).
+
+    The plan selects groups atomically; a profile's ``max_images`` thins image by image, which
+    would leave part of a 360 ring or of a video segment. Refused rather than thinned.
+    """
+    if max_images is not None and max_images < len(chunk.images):
+        raise ContractError(
+            f"chunk {chunk.chunk_id} plans {len(chunk.images)} training images in "
+            f"{len(chunk.capture_groups)} capture groups, but the profile caps max_images at "
+            f"{max_images}; thinning image by image would split capture groups. Train the chunk "
+            "with max_images: null (or at least the planned count), or plan smaller chunks"
+        )
+
+
+def staged_scene_scale(staged_dir: Path, global_scale: float) -> float:
+    """``scene_scale`` upstream derives from the staged cameras (host-side port).
+
+    gsplat 1.5.3: ``Parser.scene_scale`` is the largest distance of a camera centre from their
+    mean over every parsed image, and the runner multiplies it by ``1.1 * global_scale``.
+    ``normalize_world_space`` is refused, so the centres are the staged ``LOCAL_METRIC`` ones.
+    """
+    from minegs.ingest.common import colmap_io
+
+    model = colmap_io.read_model(Path(staged_dir) / "sparse" / "0")
+    c = np.stack([im.world_from_cam.matrix()[:3, 3] for im in model.images.values()])
+    return float(np.max(np.linalg.norm(c - c.mean(axis=0), axis=1)) * 1.1 * global_scale)
+
+
 def check_trainer_evidence(
     record: RunRecord, evidence: Any, staged_dir: Path, n_final: int
 ) -> None:
@@ -783,6 +861,23 @@ def check_trainer_evidence(
         n = int((record.staged or {}).get("n_images") or 0)
         te = int(expected.get("test_every") or 8)
         record.optimised_images = n - (-(-n // te)) if n else None
+    if record.chunk is not None:
+        # Upstream derives scene_scale (learning rates, densification thresholds, the depth
+        # term, MCMC's noise) from the staged cameras, so it differs chunk to chunk. Recorded,
+        # not compensated (Phase 5 AD-9): the adapter's own value when it ran, otherwise
+        # upstream's formula applied to the cameras this run staged.
+        if adapter is not None:
+            scale, source = adapter.get("scene_scale"), "adapter"
+        else:
+            global_scale = _cfg_value(cfg, "global_scale")
+            if global_scale is _MISSING or isinstance(global_scale, bool):
+                raise ContractError(
+                    "the trainer's cfg.yml has no global_scale, so this chunk's scene_scale "
+                    "cannot be stated"
+                )
+            scale = staged_scene_scale(staged_dir, float(global_scale))
+            source = "host_from_staged_cameras"
+        record.chunk = {**record.chunk, "scene_scale": scale, "scene_scale_source": source}
 
     # ---- depth supervision actually acted, on the artifact this run recorded
     sup = record.depth_supervision

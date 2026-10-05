@@ -47,6 +47,8 @@ minegs/
       video/     frames(ffmpeg), dedup_blur, masks,
                  sfm/   SfMBackend: COLMAPIncremental · COLMAPGlobal · (exp) GLUEMAP
                  rig.py 360 크롭 → COLMAP rig 정의
+    chunks/    plan (ChunkPlanRecord · owner_index · verifier) · run (train_chunks) ·
+               compose (ChunkRunSet: core-only stitching · coverage · seam 수치) — Phase 5
     train/     staging (쓰기 가능 복사본 · max_images 서브셋 · init_points→points3D)
       backends/  base.py(BackendCapabilities), gsplat.py
                  (later) splatfacto.py, pgsr.py — INRIA 는 외부 호출만, 저장소 미포함
@@ -338,7 +340,12 @@ artifact 는 자기 ID 가 무엇을 가리키는지도 말할 수 없다. hash 
 ## 10. 청킹 · 중심선
 
 장거리 갱도(100 m–1 km)는 단일 모델로 안 간다. 청킹 기준은 XYZ 격자가 아니라
-**중심선 chainage**. 청크는 v1 에서 파일을 실제로 쪼개지 않아도 manifest 에 예약.
+**중심선 chainage**. 나누는 것은 **학습 단위**뿐이다 (Phase 5, [계약](PHASE5_CONTRACT.md)):
+`chunks/<plan_id>/chunk_plan.json` (`ChunkPlanRecord`) 은 dataset hash 밖의 별도 artifact 이고, 모든
+chunk run 은 같은 dataset·같은 `LOCAL_METRIC`·같은 전역 split·같은 depth artifact 를 쓴다. 소유권은
+`owner_index` 하나 (`[lo,hi)`, 마지막 `[lo,hi]`) 이고 planner 와 합성이 같은 함수를 쓴다. 합성
+(`ChunkRunSet`) 은 station 을 소유 chunk 하나에서만 읽고 Gaussian 을 병합하지 않는다. 기존
+`manifest.chunks` 창은 읽기 호환용이며 학습에 쓰이지 않는다.
 
 `centerline` 은 1급 산출물: 설계 중심선(DXF/측점표) 임포트가 기본, 없으면 TLS
 클라우드에서 추출(`core/centerline.py`). 청킹·단면·체적·change 가 모두 이걸 참조한다.
@@ -429,4 +436,11 @@ end-to-end MVP(v0.1) → **3** 영상·360 독립 재구성 → **4** Advanced G
   측량에서 나온다) — 그 관계는 측정해 기록한다. "real GPU" 는 run 자신의 기록이 GPU 와 고정된 upstream
   trainer (버전 + `simple_trainer.py` sha256) 를 보여 줄 때만이고, 비교 입력은 자기 run 에 묶인다.
   근거: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) (§14.5 적대적 검토).
+* 2026-10 — Phase 5: 장거리 갱도는 **하나의 dataset 을 학습 단위로만** 나눈다. chunk plan 은 dataset
+  hash 밖의 versioned artifact 이고 (manifest 를 고치면 dataset identity 가 바뀐다), chunk frame 은
+  없다 — 모든 chunk 가 dataset 의 `LOCAL_METRIC` 에서 `T_local_from_internal = I` 로 학습되므로 chunk
+  사이 변환을 추정할 것도 (ICP), Gaussian 을 병합할 것도 없다. capture group 은 전역 split 뒤에
+  atomic 하게 선택되고, init 은 기존 support locator, depth 는 전역 artifact 그대로다. 평가는
+  station 소유권으로 이어 붙인 section 하나를 기존 `compare_to_reference` 로 잰다; seam 은 일치도
+  수치일 뿐 pass 가 없다. 근거: [docs/PHASE5_CONTRACT.md](PHASE5_CONTRACT.md).
 * 보류 — GLUEMAP: 갱도 조건에 특화되나 의존성 무거움. Phase 2 이후 experimental 백엔드.

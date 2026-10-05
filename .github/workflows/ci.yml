@@ -275,6 +275,38 @@ jobs:
             echo 'tampered depth samples verified'; exit 1
           fi
           echo 'phase 4 fail-closed smoke ok'
+          # Phase 5: a long tunnel is cut into training chunks of ONE dataset. The plan is a
+          # separate artifact (the dataset hash does not move), it verifies, and a malformed plan,
+          # a chunk without a plan and a plan written into the manifest are refused.
+          minegs dataset synthetic /tmp/p5 --length-m 160 --n-stations 8 --image-size 32 > /dev/null
+          dshash() { python -c "
+          from minegs.core.provenance import sha256_tree
+          from minegs.train.runner.base import DATASET_HASH_PATTERNS
+          print(sha256_tree('/tmp/p5/dataset', DATASET_HASH_PATTERNS))"; }
+          H0=$(dshash)
+          minegs dataset chunk-plan /tmp/p5/dataset --core-length-m 60 --overlap-m 10
+          P=$(ls /tmp/p5/dataset/chunks/cplan_*/chunk_plan.json)
+          minegs dataset chunk-plan-verify /tmp/p5/dataset "$P"
+          test "$H0" = "$(dshash)" || { echo 'writing a chunk plan changed the dataset hash'; exit 1; }
+          if minegs dataset chunk-plan /tmp/p5/dataset --core-length-m 60 --overlap-m 60; then
+            echo 'an overlap as long as the core was accepted'; exit 1
+          fi
+          if minegs train run /tmp/p5/dataset --profile light --native --chunk K000; then
+            echo 'a chunk was trained without a chunk plan'; exit 1
+          fi
+          test ! -d /tmp/p5/runs || { echo 'a refused chunk run created a run directory'; exit 1; }
+          if minegs dataset chunks /tmp/p5/dataset --write; then
+            echo 'a chunk plan was written into the manifest'; exit 1
+          fi
+          python -c "
+          import json; p = '$P'; d = json.load(open(p))
+          d['chunks'][1]['core_range_m'][0] += 5.0
+          json.dump(d, open('/tmp/p5/gap_plan.json', 'w'))"
+          if minegs dataset chunk-plan-verify /tmp/p5/dataset /tmp/p5/gap_plan.json; then
+            echo 'a plan with a gap between cores verified'; exit 1
+          fi
+          minegs eval chunk-set --help | tr -d '\n' | grep -q -- '--allow-incomplete'
+          echo 'phase 5 fail-closed smoke ok'
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

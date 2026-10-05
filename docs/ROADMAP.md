@@ -28,7 +28,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 2 | E57 End-to-End MVP | **implemented + structurally tested** — E57 한 개를 ingest→dataset→train→depth→surface→geometry→section/volume→report 로 관통하는 단일 orchestration (`minegs e2e`), stage checkpoint, paired TLS validation, Phase 2 report. 합성 structural gate 는 실제 E57 파일에서 돌지만 **trainer/renderer 는 대체**된다. **real E57 G2: NOT RUN**, 실측 과학적 검증: **NOT VALIDATED** (§2) |
 | 3 | Image / 360 Independent Reconstruction | **implemented and structurally tested, 미검증** (manual acceptance: **DEFERRED**, [runbook](PHASE3_ACCEPTANCE.md)) — 영상/360 → `FrameSetRecord` → `SfmRecord` → `RegistrationRecord` → image-only dataset → 기존 학습·depth·surface·sections·volume → TLS-assisted 대비 비교까지 한 workflow 로 이어진다. 합성 갱도 하나를 스캐너와 파노라마 양쪽으로 재구성하는 구조 게이트와 T1–T30 negative test 가 있다. **실제 COLMAP·GPU·렌더러·실측 영상은 한 번도 실행되지 않았다** — SfM·프레임 추출·학습·렌더러 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 기록된다. 계약: [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) (C0 freeze + §17 구현 기록) |
 | 4 | Advanced GS / Heavy Profile | **implemented and structurally tested** — metric depth supervision artifact (`DepthSupervisionRecord`, init 과 분리, holdout leakage 재도출 검증), upstream `simple_trainer.py` 를 그대로 실행하는 MineGS trainer adapter (depth 항·MCMC metric 보정), 실행 가능한 heavy profile 과 ablation 셋, 요청↔실제 trainer config 대조, baseline↔advanced 비교 경로. **real GPU heavy training: NOT PERFORMED**, **baseline vs heavy 실측 비교: NOT PERFORMED**, **G3: PENDING**, 실측 과학적 검증: **NOT VALIDATED**. 계약: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) |
-| 5 | Long Tunnel & Chunking | 예약만 (manifest.chunks) |
+| 5 | Long Tunnel & Chunking | **implemented and structurally tested** — 중심선 chainage 를 따라 dataset 하나를 versioned `ChunkPlanRecord` (core/support, `[lo,hi)` 소유권, atomic capture group, 전역 split 보존) 로 나누고, 각 chunk 를 기존 run 경로 그대로 같은 dataset·같은 `LOCAL_METRIC` 에서 학습한 뒤 (`train chunks`), station 마다 소유 chunk 하나의 section 만 읽어 `ChunkRunSet` 으로 합성한다 (`eval chunk-set`: coverage·누락 구간·holdout 평가·seam 일치도 수치). Gaussian 병합 없음. **real GPU chunked training: NOT PERFORMED**, **real long-tunnel mine dataset: NOT VALIDATED**, **optimal chunk size: NOT DETERMINED**, **G3: PENDING**. 계약: [docs/PHASE5_CONTRACT.md](PHASE5_CONTRACT.md) |
 | 6 | RunPod / Reproducible Compute | **미구현, fail-closed** |
 | 7 | Multi-Epoch Change Detection | 미구현 — single manifest 는 change claim 불가 |
 | 8 | Viewer / Export / Web | 부분 implemented (Viser·export), FastAPI 미착수 |
@@ -843,13 +843,33 @@ SHOULD_FIX deferred, 계약 §2.3-13).
 
 ### Phase 5 — Long Tunnel & Chunking
 
-소구간에서 검증된 파이프라인을 장거리 갱도(100 m–1 km)로 확장한다.
+계약: [docs/PHASE5_CONTRACT.md](PHASE5_CONTRACT.md) (C0 reality audit + freeze, §12 구현 기록).
 
-**범위**: 중심선 chainage 청킹, overlap, 청크별 local frame, 청크 학습, 병합/전이,
-메모리 제어, 재현성, seam 진단. XYZ 격자 청킹으로 바꾸지 않는다.
+긴 갱도 dataset 하나를 중심선 chainage 를 따라 학습 단위로 나눈다. 나누는 것은 학습 단위뿐이고
+dataset identity · `LOCAL_METRIC` frame · 전역 train/test/holdout split · depth leakage 계약 ·
+evidence provenance · geometry/volume 평가는 하나 그대로다. XYZ 격자 청킹이 아니다.
 
-**Gate (G3)**: 모든 청크 완료, overlap 정렬, 심각한 seam 불연속 없음,
-전역 TLS 재구성 복원 가능, 메모리/런타임 거동 문서화.
+| 항목 | 상태 |
+|---|---|
+| `ChunkPlanRecord` (versioned, dataset id/hash·centerline sha·정책·plan digest, dataset hash 밖의 별도 artifact) | **implemented + structurally tested** |
+| core/support, 소유권 `[lo,hi)` · 마지막 `[lo,hi]`, overlap 이하의 짧은 나머지는 앞 core 에 병합 | **implemented + structurally tested** |
+| plan verifier (gap·중복 소유·id·단조·support⊇core·policy·digest·dataset·centerline·재계획 일치) | **implemented + structurally tested** |
+| capture group atomic 선택 (360 ring·video 를 쪼개지 않음, 전역 split 뒤 선택, test·holdout 제외 이미지 부활 없음) | **implemented + structurally tested** |
+| chunk-aware staging (기존 `stage_dataset` 확장, 기존 `Support.locate` 로 init 선택, 전역 depth artifact 재사용) | **implemented + structurally tested** |
+| chunk 학습 (`train run --chunk-plan --chunk`, `train chunks` 순차·첫 실패에서 정지), `RunRecord` 1.3 chunk binding | **implemented + structurally tested** (stand-in trainer, CPU torch stand-in upstream) |
+| chunk run 의 depth 렌더·surface 를 plan 의 chunk view 로 한정 (`run_views`) | **implemented + structurally tested** |
+| `ChunkRunSet` 합성 (섞인 artifact 거부, core-only stitching, coverage·누락 구간, holdout 평가, seam 수치) | **implemented + structurally tested** |
+| real GPU chunked training | **NOT PERFORMED** |
+| 실제 장거리 갱도 dataset | **NOT VALIDATED** |
+| 최적 chunk 크기 | **NOT DETERMINED** (사용자가 `core_length`·`overlap` 을 정한다) |
+| G3 | **PENDING** |
+
+범위 밖 (Phase 5 non-goal): RunPod·분산·multi-GPU, Gaussian 병합 (overlap 평균·중복 제거·opacity
+blending), chunk ICP, 자동 chunk 크기, VRAM scheduler, retry/resume, normalized world space, viewer/LOD.
+seam 수치는 두 복원의 **일치도**이며 정확도가 아니다 (둘 다 틀리면서 일치할 수 있다) — pass 필드가 없다.
+
+**Gate (G3)**: 실제 장거리 갱도에서 모든 chunk 완료, seam 불연속의 정량적 거동, 전역 TLS 대비 holdout
+평가, 메모리/런타임 거동 문서화.
 
 ### Phase 6 — RunPod / Reproducible Compute
 
@@ -950,6 +970,15 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | 다른 run·dataset·surface 의 e2e 보고서, run 자신의 예측을 기준으로 한 비교 | `ContractError` (exit 2) | 비교 입력은 자기 run 에 묶여야 한다 (Phase 4 AD-12) | 해당 없음 (설계) |
 | `normalize_world_space: true` | `ContractError` (exit 2) | upstream 은 변환을 저장하지 않고 출력을 되돌릴 수 없다 (Phase 4 계약 §8) | 7 조건 충족 시 |
 | run 후 cfg.yml / adapter evidence 가 요청과 다름 | run **FAILED** | 요청한 실험이 아님 (Phase 4 AD-8) | 해당 없음 (설계) |
+| `core_length ≤ 0`, `overlap < 0`, `overlap ≥ core_length` | `ContractError` (exit 2) | 정의되지 않는 chunk (Phase 5 §5.1) | 해당 없음 (설계) |
+| gap·중복 소유·support ⊉ core·digest 불일치 plan, plan 생성 뒤 dataset·centerline 변경 | `ContractError` (exit 2) | plan verifier 가 재도출로 확인 (Phase 5 §5.2) | 해당 없음 (설계) |
+| plan 없는 `--chunk`, `--chunk` 없는 `--chunk-plan`, plan 에 없는 chunk, legacy `manifest.chunks` 로 학습 | `ContractError` (exit 2) | chunk 는 검증된 plan 에서만 학습한다 (Phase 5 AD-1) | 해당 없음 (설계) |
+| `dataset chunks --write` | `ContractError` (exit 2) | manifest 를 바꿔 dataset identity 가 바뀐다 | 해당 없음 (설계) |
+| chunk 의 계획된 이미지보다 작은 `max_images` (capture group 을 이미지 단위로 솎게 됨) | `ContractError` (exit 2, run 디렉터리 생성 전) | capture group 은 atomic (Phase 5 §5.3, 리뷰 B1) | 해당 없음 (설계) — `max_images: null` 또는 더 작은 chunk |
+| frame 이 `LOCAL_METRIC` 이 아닌 (`UNKNOWN` 포함) `init_points.ply` 로 chunk staging | `ContractError` (exit 2) | chunk init 은 위치(chainage)로 선택된다 (리뷰 B2) | 해당 없음 (설계) |
+| depth profile chunk 인데 chunk 이미지에 depth 샘플 없음 | `ContractError` (exit 2, 학습 전) | 증거 없는 depth run 금지 | 해당 없음 (설계) |
+| 다른 dataset·plan·profile·chunk binding 의 run, 중복·누락 chunk, FAILED chunk run, 비 metric run, 다른 grid·그 run 이 아닌 section·스캔이 아닌 reference 로 `eval chunk-set` | `ContractError` (exit 2) — 누락·FAILED 는 `--allow-incomplete` 일 때만 incomplete set 으로 보고 | 하나의 실험만 합성한다 (Phase 5 §7) | 해당 없음 (설계) |
+| chunk binding 이 다른 두 run 의 `compare-runs` | `ContractError` (exit 2) | 갱도의 다른 부분을 비교하게 된다 | 해당 없음 (설계) |
 | `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
 | TSDF / mesh 추출 | `NotYetImplementedError` | 미구현 | Phase 1 후속 |

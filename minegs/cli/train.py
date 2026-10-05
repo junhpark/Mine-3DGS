@@ -101,7 +101,10 @@ def run(
         "backend (gsplat v1.5.3 cannot continue training) can honour it, so it always fails "
         "closed rather than silently restarting from iteration 0 (Phase 0D.3, docs/ROADMAP.md).",
     ),
-    chunk: str | None = typer.Option(None),
+    chunk: str | None = typer.Option(None, help="a chunk id of --chunk-plan (Phase 5)"),
+    chunk_plan: Path | None = typer.Option(
+        None, "--chunk-plan", help="a chunks/<plan_id> directory (`minegs dataset chunk-plan`)"
+    ),
     depth_supervision: Path | None = typer.Option(
         None,
         "--depth-supervision",
@@ -152,6 +155,7 @@ def run(
                 runner=rname,
                 resume_from=str(resume_from) if resume_from else None,
                 chunk_id=chunk,
+                chunk_plan=str(chunk_plan) if chunk_plan else None,
                 depth_supervision=str(depth_supervision) if depth_supervision else None,
             )
         )
@@ -161,6 +165,62 @@ def run(
         if st is not RunStatus.SUCCEEDED:
             rec = load_record(h.run_dir)
             raise ContractError(rec.failure_reason or f"run finished {st.value}")
+
+    run_guarded(go)
+
+
+@app.command("chunks")
+def chunks(
+    dataset_dir: Path = typer.Argument(...),
+    chunk_plan: Path = typer.Option(..., "--chunk-plan", help="a chunks/<plan_id> directory"),
+    profile: str = typer.Option("light"),
+    runner: str | None = typer.Option(None, help="local (default: profile.default_runner)"),
+    backend: str = typer.Option("gsplat"),
+    config: Path | None = typer.Option(None, help="configs/runner/*.yaml"),
+    native: bool = typer.Option(False, help="local: run in this python env instead of docker"),
+    runs_dir: Path | None = typer.Option(None, help="default <dataset>/../runs/<plan_id>"),
+    depth_supervision: Path | None = typer.Option(None, "--depth-supervision"),
+) -> None:
+    """Train every chunk of a plan in order with one profile; stop at the first failure.
+
+    Each chunk is an ordinary `train run` with the plan and its chunk id: the same staging,
+    trainer, evidence and refusals. No scheduler, parallelism or retry (Phase 5 AD-5).
+    """
+    from minegs.chunks.run import train_chunks
+    from minegs.core.errors import ContractError
+    from minegs.train.backends import get_backend
+    from minegs.train.profiles import load_profile
+    from minegs.train.runner import get_runner
+    from minegs.train.runner.base import RunnerConfig
+
+    def go() -> None:
+        prof = load_profile(profile)
+        get_backend(backend or prof.backend).resolve_requests(prof)
+        rname = runner or prof.default_runner
+        rcfg = RunnerConfig.load(config) if config else RunnerConfig(runner=rname, native=native)
+        if rcfg.runner != rname:
+            raise ContractError(
+                f"--config names runner {rcfg.runner!r}, but these runs would go to {rname!r}"
+            )
+        if native:
+            rcfg.native = True
+        done = train_chunks(
+            dataset_dir,
+            chunk_plan,
+            profile,
+            get_runner(rname, rcfg),
+            runs_dir=runs_dir,
+            backend=backend,
+            depth_supervision=depth_supervision,
+        )
+        for d in done:
+            console.print(f"  {d['chunk_id']}: {d['status']}  {d['run_dir']}")
+        failed = [d for d in done if d["status"] != "succeeded"]
+        if failed:
+            raise ContractError(
+                f"chunk {failed[0]['chunk_id']} did not succeed ({failed[0]['failure']}); the "
+                "remaining chunks were not started and the chunk set is not complete"
+            )
 
     run_guarded(go)
 

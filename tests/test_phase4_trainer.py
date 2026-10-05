@@ -519,6 +519,15 @@ def test_matching_evidence_passes_and_is_recorded(scene, tmp_path):
     assert rec.optimised_images == 5
 
 
+def test_the_adapters_own_image_count_is_recorded_not_a_host_estimate(scene, tmp_path):
+    # Phase 5 hostile review: a chunk branch once re-paired the host formula
+    # (n - ceil(n / test_every)) with every non-chunk run, overwriting what the trainer reported.
+    rec, ev, staged = _record_and_evidence(scene, tmp_path)
+    ev.adapter_evidence["optimised_images"] = ["a"] * 3
+    check_trainer_evidence(rec, ev, staged, n_final=100)
+    assert rec.optimised_images == 3 and rec.chunk is None
+
+
 @pytest.mark.parametrize(
     "mutate,match",
     [

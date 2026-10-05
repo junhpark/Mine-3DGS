@@ -129,6 +129,7 @@ class LocalRunner(Runner):
         device = single_device_index(self.config.gpus)
 
         enabled = backend.resolve_requests(profile)
+        planned = getattr(self, "_chunk", None)
         staged = stage_dataset(
             dataset_dir,
             run_dir / "staged",
@@ -137,11 +138,39 @@ class LocalRunner(Runner):
             chunk_id=run.chunk_id,
             data_factor=profile.data_factor,
             clamp_init_rgb=bool(enabled.get("appearance_embedding")),
+            chunk=None if planned is None else planned[1],
         )
         verified = getattr(self, "_verified_supervision", None)
         staged_supervision = None
         if verified is not None:
             staged_supervision = stage_depth_supervision(verified, staged.path)
+        if planned is not None:
+            chunk = dict(record.chunk or {})
+            ev = dict(staged.chunk or {})
+            if ev.get("chunk_id") != chunk.get("chunk_id"):
+                raise ContractError(
+                    f"staged chunk {ev.get('chunk_id')} is not the run's chunk "
+                    f"{chunk.get('chunk_id')}"
+                )
+            if sorted(staged.images) != sorted(chunk.get("images") or []):
+                raise ContractError(
+                    "staged images are not exactly the chunk's planned images; capture groups "
+                    "are trained whole (Phase 5 §5.3)"
+                )
+            chunk.update(
+                {k: v for k, v in ev.items() if k.startswith("init_points_")},
+                staged_images=len(staged.images),
+                planned_images=len(chunk.get("images") or []),
+            )
+            if verified is not None:
+                used = verified.images_with_samples(list(staged.images))
+                if not used:
+                    raise ContractError(
+                        f"chunk {chunk['chunk_id']}: no staged image carries a depth sample"
+                    )
+                chunk["depth_images_with_samples"] = len(used)
+                chunk["depth_samples_for_images"] = verified.samples_in_loss_for(used)
+            record.chunk = chunk
         record.staged = {
             "path": "staged",
             "n_images": len(staged.images),
@@ -151,6 +180,7 @@ class LocalRunner(Runner):
             "init_points": staged.init_points,
             "downscale": staged.downscale,
             "init_rgb_clamped": staged.init_rgb_clamped,
+            **({} if staged.chunk is None else {"chunk": staged.chunk}),
             "depth_supervision": None
             if staged_supervision is None
             else str(staged_supervision.relative_to(staged.path)),

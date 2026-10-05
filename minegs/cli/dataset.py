@@ -133,15 +133,23 @@ def chunks(
     dataset_dir: Path = typer.Argument(...),
     length_m: float = typer.Option(80.0),
     overlap_m: float = typer.Option(15.0),
-    write: bool = typer.Option(False, help="Write the plan into manifest.chunks"),
+    write: bool = typer.Option(
+        False, help="refused: a plan in manifest.json would change dataset identity"
+    ),
 ) -> None:
-    """Plan chainage chunks along the dataset centerline (§10)."""
+    """Preview legacy overlapping chainage windows (§10). Training uses `dataset chunk-plan`."""
     from minegs.core.centerline import Centerline
     from minegs.core.chunking import assign_groups, plan_chunks
     from minegs.core.errors import ContractError
     from minegs.core.manifest import Manifest
 
     def go() -> None:
+        if write:
+            raise ContractError(
+                "writing chunks into manifest.json changes the dataset hash, so every run, "
+                "surface and section made before it would stop matching its dataset. A chunk "
+                "plan is a separate artifact now: `minegs dataset chunk-plan` (Phase 5 AD-1)."
+            )
         m = Manifest.load_dataset(dataset_dir, strict_layout=False)
         if m.centerline is None:
             raise ContractError("manifest has no centerline; import one first")
@@ -153,10 +161,49 @@ def chunks(
         )
         for c in plan.items:
             console.print(f"{c.id}: {c.range_m}  groups={c.groups}")
-        if write:
-            m.chunks = plan
-            m.save_dataset(dataset_dir)
-            console.print("manifest.chunks updated")
+
+    run_guarded(go)
+
+
+@app.command("chunk-plan")
+def chunk_plan(
+    dataset_dir: Path = typer.Argument(...),
+    core_length_m: float = typer.Option(..., help="chainage each chunk owns (an execution choice)"),
+    overlap_m: float = typer.Option(..., help="training context on each side; not ownership"),
+    out: Path | None = typer.Option(None, help="default <dataset>/chunks/<plan_id>"),
+) -> None:
+    """Cut a dataset into training chunks along chainage (Phase 5 AD-1…AD-3).
+
+    The plan is written outside the dataset hash and records the dataset and axis it was made
+    against. The same dataset, axis and parameters always give the same plan.
+    """
+    from minegs.chunks.plan import build_chunk_plan
+
+    def go() -> None:
+        rec, path = build_chunk_plan(dataset_dir, core_length_m, overlap_m, out)
+        console.print(f"[green]chunk plan[/] {rec.plan_id} -> {path}")
+        for c in rec.chunks:
+            console.print(
+                f"  {c.chunk_id}: core {c.core_range_m[0]:g}-{c.core_range_m[1]:g} m, support "
+                f"{c.support_range_m[0]:g}-{c.support_range_m[1]:g} m, {len(c.images)} train "
+                f"images in {len(c.capture_groups)} groups (image support "
+                f"{c.actual_image_support_m[0]:g}-{c.actual_image_support_m[1]:g} m)"
+            )
+
+    run_guarded(go)
+
+
+@app.command("chunk-plan-verify")
+def chunk_plan_verify(
+    dataset_dir: Path = typer.Argument(...),
+    plan: Path = typer.Argument(..., help="a chunks/<plan_id> directory or its chunk_plan.json"),
+) -> None:
+    """Re-derive a chunk plan from the dataset as it is now; refuse any difference."""
+    from minegs.chunks.plan import verify_chunk_plan
+
+    def go() -> None:
+        rec = verify_chunk_plan(dataset_dir, plan)
+        console.print(f"[green]verified[/] {rec.plan_id} ({len(rec.chunks)} chunks)")
 
     run_guarded(go)
 
