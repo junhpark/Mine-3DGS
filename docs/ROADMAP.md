@@ -29,7 +29,7 @@ Phase 는 Gate 를 통과해야 완료다. 코드가 머지되었다는 사실�
 | 3 | Image / 360 Independent Reconstruction | **implemented and structurally tested, 미검증** (manual acceptance: **DEFERRED**, [runbook](PHASE3_ACCEPTANCE.md)) — 영상/360 → `FrameSetRecord` → `SfmRecord` → `RegistrationRecord` → image-only dataset → 기존 학습·depth·surface·sections·volume → TLS-assisted 대비 비교까지 한 workflow 로 이어진다. 합성 갱도 하나를 스캐너와 파노라마 양쪽으로 재구성하는 구조 게이트와 T1–T30 negative test 가 있다. **실제 COLMAP·GPU·렌더러·실측 영상은 한 번도 실행되지 않았다** — SfM·프레임 추출·학습·렌더러 네 seam 모두 대체되고 그 사실이 artifact 와 report 에 기록된다. 계약: [docs/PHASE3_CONTRACT.md](PHASE3_CONTRACT.md) (C0 freeze + §17 구현 기록) |
 | 4 | Advanced GS / Heavy Profile | **implemented and structurally tested** — metric depth supervision artifact (`DepthSupervisionRecord`, init 과 분리, holdout leakage 재도출 검증), upstream `simple_trainer.py` 를 그대로 실행하는 MineGS trainer adapter (depth 항·MCMC metric 보정), 실행 가능한 heavy profile 과 ablation 셋, 요청↔실제 trainer config 대조, baseline↔advanced 비교 경로. **real GPU heavy training: NOT PERFORMED**, **baseline vs heavy 실측 비교: NOT PERFORMED**, **G3: PENDING**, 실측 과학적 검증: **NOT VALIDATED**. 계약: [docs/PHASE4_CONTRACT.md](PHASE4_CONTRACT.md) |
 | 5 | Long Tunnel & Chunking | **implemented and structurally tested** — 중심선 chainage 를 따라 dataset 하나를 versioned `ChunkPlanRecord` (core/support, `[lo,hi)` 소유권, atomic capture group, 전역 split 보존) 로 나누고, 각 chunk 를 기존 run 경로 그대로 같은 dataset·같은 `LOCAL_METRIC` 에서 학습한 뒤 (`train chunks`), station 마다 소유 chunk 하나의 section 만 읽어 `ChunkRunSet` 으로 합성한다 (`eval chunk-set`: coverage·누락 구간·holdout 평가·seam 일치도 수치). Gaussian 병합 없음. **real GPU chunked training: NOT PERFORMED**, **real long-tunnel mine dataset: NOT VALIDATED**, **optimal chunk size: NOT DETERMINED**, **G3: PENDING**. 계약: [docs/PHASE5_CONTRACT.md](PHASE5_CONTRACT.md) |
-| 6 | RunPod / Reproducible Compute | **미구현, fail-closed** |
+| 6 | RunPod / Reproducible Compute | **implemented and structurally tested** — 같은 digest 의 GPU 이미지, dataset hash 가 덮는 바로 그 파일만 network volume 에 (content-addressed, raw 거부), sidecar (chunk plan·depth artifact) 는 digest 로, `inputs.json` 마지막 publish, pod 안에서 dataset hash·sidecar·GPU 를 다시 검증한 뒤 LocalRunner 와 같은 학습 경로 (`runner: runpod`), 성공은 pod lifecycle 이 아니라 worker 의 durable `status.json` (exit code) + output manifest, 로컬 pull 은 모든 파일을 manifest 로 검증한 뒤에만 publish, chunk·depth run 호환, secret 미기록. **Live RunPod GPU execution: NOT PERFORMED**, **Local↔RunPod reproducibility: NOT VALIDATED**, **G3: PENDING**. 계약: [docs/PHASE6_CONTRACT.md](PHASE6_CONTRACT.md), runbook: [docs/PHASE6_ACCEPTANCE.md](PHASE6_ACCEPTANCE.md) |
 | 7 | Multi-Epoch Change Detection | 미구현 — single manifest 는 change claim 불가 |
 | 8 | Viewer / Export / Web | 부분 implemented (Viser·export), FastAPI 미착수 |
 
@@ -834,7 +834,7 @@ docker 경로의 host trainer 경로, 다른 run 의 보고서로 "real" 이 되
 예측을 기준으로 쓰는 비교, 고정되지 않은 upstream trainer 가 real 로 보고될 수 있던 것.
 
 계속 거부되는 것: upstream `depth_loss` (target 이 init 점 자체), `normalize_world_space=true`
-(계약 §8 의 7 조건 미충족), `normal_loss` (v1.5.3 3DGS trainer 에 없음), `--runner runpod` (Phase 6).
+(계약 §8 의 7 조건 미충족), `normal_loss` (v1.5.3 3DGS trainer 에 없음). (`--runner runpod` 는 Phase 6 에서 구현.)
 알려진 미해결: depth renderer 가 학습 해상도가 아니라 full 해상도로 렌더한다 (Phase 1B 부터,
 SHOULD_FIX deferred, 계약 §2.3-13).
 
@@ -880,11 +880,26 @@ infrastructure 이므로 로컬 scientific workflow 가 안정화된 뒤 구현�
 checkpoint, **exit-code 기반 status**, artifact 동기화 복귀, provenance, GPU 타입 기록.
 resume 은 Phase 6 범위가 아니다 — runner 와 무관하게 Phase 0D.3 이다 (§Phase 0D).
 
-**현재 상태**: `RunPodRunner.submit` 은 외부 호출 전에 `NotYetImplementedError` 를 던진다.
-필요한 단계는 `minegs/train/runner/runpod.py` docstring 에 있다. 특히 이전 스케치에 없던
-두 단계 — 원격 remote 의 내용을 pod `/data` 로 들여오는 단계, pod 산출물을 remote 로
-내보내는 단계 — 를 반드시 포함한다. pod lifecycle state (EXITED/TERMINATED) 만으로 성공을
-판정하지 않는다.
+계약: [docs/PHASE6_CONTRACT.md](PHASE6_CONTRACT.md) (C0 audit + freeze, §13 구현 기록). Live runbook:
+[docs/PHASE6_ACCEPTANCE.md](PHASE6_ACCEPTANCE.md).
+
+| 항목 | 상태 |
+|---|---|
+| RunPod runner (`--runner runpod`, `train fetch` / `cancel`, `--dry-run`) | **implemented + structurally tested** |
+| provider seam (`runpod>=1.12,<1.13`, create/get/terminate), 첫 GPU type 할당 실패 시 다음 type | **implemented** (fake provider 로 test) |
+| dataset/sidecar sync (hash 가 덮는 파일 목록 그대로, content-addressed, raw 거부, `inputs.json` 마지막) | **implemented + structurally tested** |
+| network-volume workflow (pod 가 volume 을 mount, 로컬은 rclone remote 또는 mount 경로) | **implemented + structurally tested** (temp volume, rclone stand-in) |
+| pod 안 재검증 (dataset hash, bundle digest, chunk plan, depth artifact, GPU 1 개·arch, 빈 run dir) | **implemented + structurally tested** |
+| exit-code 기반 job status (`status.json`, worker 재시작 시 재학습 없음) | **implemented + structurally tested** |
+| artifact 왕복 검증 (output manifest, 임시 디렉터리로 pull → 전부 검증 → publish) | **implemented + structurally tested** |
+| chunk·advanced profile (`train chunks --runner runpod`, heavy-depth + chunk + depth) | **implemented + structurally tested** (heavy 는 CPU torch stand-in) |
+| 재현성 fingerprint / `eval compare-execution` | **implemented** — 허용범위 없음 |
+| Live RunPod GPU execution | **NOT PERFORMED** |
+| Local↔RunPod reproducibility | **NOT VALIDATED** |
+| G3 | **PENDING** |
+
+pod lifecycle (EXITED/TERMINATED/사라짐) 은 성공이 아니다. resume·multi-GPU·자동 retry·job queue 는
+범위 밖이다.
 
 **Gate (G3)**: Local ↔ RunPod 재현성. 동일 code SHA · docker digest · dataset hash · profile
 조건에서 결과 차이가 허용범위 내인지 확인.
@@ -979,7 +994,10 @@ architecture 변경이 필요하면 구현 중 암묵적으로 바꾸지 말고 
 | depth profile chunk 인데 chunk 이미지에 depth 샘플 없음 | `ContractError` (exit 2, 학습 전) | 증거 없는 depth run 금지 | 해당 없음 (설계) |
 | 다른 dataset·plan·profile·chunk binding 의 run, 중복·누락 chunk, FAILED chunk run, 비 metric run, 다른 grid·그 run 이 아닌 section·스캔이 아닌 reference 로 `eval chunk-set` | `ContractError` (exit 2) — 누락·FAILED 는 `--allow-incomplete` 일 때만 incomplete set 으로 보고 | 하나의 실험만 합성한다 (Phase 5 §7) | 해당 없음 (설계) |
 | chunk binding 이 다른 두 run 의 `compare-runs` | `ContractError` (exit 2) | 갱도의 다른 부분을 비교하게 된다 | 해당 없음 (설계) |
-| `--runner runpod` | `NotYetImplementedError` (exit 4) | 미구현 | Phase 6 |
+| RunPod: digest 없는 image, network volume 없음, `gpu_count ≠ 1`, 잘못된 `volume_mount`·`sync.remote`, `RUNPOD_API_KEY` 없음, rclone 없음, 파일 profile | `ContractError` (exit 2), upload·pod 전 | 비용 전에 거부 (Phase 6 계약 §3, §7) | 해당 없음 (설계) |
+| RunPod: raw 파일·project root·`raw/`, 다른 hash 를 주장하는 dataset 경로, 이미 있는 remote run id | `ContractError` (exit 2), pod 전 | raw 는 로컬에 남고 remote 는 write-once (§4, §5) | 해당 없음 (설계) |
+| pod 의 dataset·sidecar·bundle 이 제출한 것과 다름, GPU 가 1 개가 아니거나 image arch 밖 | job FAILED (trainer 미실행) | pod 가 다시 도출한다 (§8) | 해당 없음 (설계) |
+| final status 없이 pod 종료·소멸, status SUCCEEDED 인데 exit ≠ 0, run.json FAILED, manifest·파일 불일치, 다른 run 의 run.json, 로컬 run dir 의 남의 파일 | run FAILED, 아무것도 publish 안 함 | lifecycle 은 성공이 아니고 pull 은 검증 후에만 (§6, §9) | 해당 없음 (설계) |
 | `backend_args` 에 하이픈/언더스코어 두 철자 | `ContractError` | tyro 는 둘 다 받으므로 거부를 우회할 수 있다 | 해당 없음 (설계) |
 | TSDF / mesh 추출 | `NotYetImplementedError` | 미구현 | Phase 1 후속 |
 | CUDA·gsplat 없이 `eval render-depth` | `NoGpuError` / `MissingDependencyError` (exit 4) | rasterizer 는 CUDA 전용이고 CPU fallback 은 없다 | 해당 없음 (설계) |

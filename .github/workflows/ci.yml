@@ -307,6 +307,35 @@ jobs:
           fi
           minegs eval chunk-set --help | tr -d '\n' | grep -q -- '--allow-incomplete'
           echo 'phase 5 fail-closed smoke ok'
+          # Phase 6: a RunPod run costs nothing until every check passes. No provider is ever
+          # called here: the dry run shows the request, and the refusals happen before it.
+          mkdir -p /tmp/p6/vol
+          python -c "
+          import yaml
+          cfg = dict(schema_version='1.1', runner='runpod', network_volume_id='vol1',
+                     image='ghcr.io/x/minegs:gpu@sha256:' + 'ab' * 32, gpu_types=['NVIDIA RTX A5000'],
+                     volume_mount='/tmp/p6/vol', sync={'remote': '/tmp/p6/vol'})
+          open('/tmp/p6/runpod.yaml', 'w').write(yaml.safe_dump(cfg))
+          cfg['image'] = 'ghcr.io/x/minegs:gpu'
+          open('/tmp/p6/tag.yaml', 'w').write(yaml.safe_dump(cfg))"
+          rp() { minegs train run /tmp/p5/dataset --runner runpod --dry-run "$@"; }
+          if env -u RUNPOD_API_KEY bash -c "$(declare -f rp); rp --config /tmp/p6/runpod.yaml"; then
+            echo 'a RunPod run was planned without RUNPOD_API_KEY'; exit 1
+          fi
+          if RUNPOD_API_KEY=dummy-key-not-real rp --config /tmp/p6/tag.yaml; then
+            echo 'a RunPod run accepted an image without a digest'; exit 1
+          fi
+          RUNPOD_API_KEY=dummy-key-not-real rp --config /tmp/p6/runpod.yaml > /tmp/p6/plan.out
+          if grep -q dummy-key-not-real /tmp/p6/plan.out; then echo 'the API key was printed'; exit 1; fi
+          python -c "
+          import json; t = open('/tmp/p6/plan.out').read(); plan = json.loads(t[t.index('{'):])
+          pod = plan['pod_requests'][0]
+          assert pod['image'].count('@sha256:') == 1 and pod['gpu_count'] == 1, pod
+          assert pod['docker_args'].startswith('train remote-worker /tmp/p6/vol/minegs/'), pod
+          assert plan['credential_source'] == 'RUNPOD_API_KEY'
+          print('phase 6 dry-run smoke ok')"
+          test -z "$(ls -A /tmp/p6/vol)" || { echo 'a dry run wrote to the volume'; exit 1; }
+          echo 'phase 6 fail-closed smoke ok'
 
   dockerfiles:
     # Lint both images explicitly (their names are Dockerfile.cpu / Dockerfile.gpu, which the

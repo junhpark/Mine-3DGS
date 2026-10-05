@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import platform
+import re
 import secrets
 import subprocess
 from datetime import datetime, timezone
@@ -54,12 +55,21 @@ def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def tree_files(root: str | Path, patterns: tuple[str, ...] = ("**/*",)) -> list[Path]:
+    """The files ``sha256_tree`` hashes, in the order it hashes them.
+
+    One function, so a caller that moves "the dataset" somewhere (Phase 6 sync) moves exactly
+    the bytes the dataset hash covers — not a second pattern list that can drift from it.
+    """
+    root = Path(root)
+    return sorted({p for pat in patterns for p in root.glob(pat) if p.is_file()})
+
+
 def sha256_tree(root: str | Path, patterns: tuple[str, ...] = ("**/*",)) -> str:
     """Order-independent hash of a directory (relative path + content hash per file)."""
     root = Path(root)
-    files = sorted({p for pat in patterns for p in root.glob(pat) if p.is_file()})
     h = hashlib.sha256()
-    for p in files:
+    for p in tree_files(root, patterns):
         h.update(str(p.relative_to(root)).encode())
         h.update(sha256_file(p).encode())
     return h.hexdigest()
@@ -96,7 +106,7 @@ def git_commit(repo_root: str | Path | None = None) -> str:
         )
         sha = out.stdout.strip()
         if out.returncode != 0 or not sha:
-            return "unknown"
+            return _built_commit()
         dirty = subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain"],
             capture_output=True,
@@ -106,7 +116,20 @@ def git_commit(repo_root: str | Path | None = None) -> str:
         ).stdout.strip()
         return sha + ("-dirty" if dirty else "")
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        return _built_commit()
+
+
+def _built_commit() -> str:
+    """The commit an image was built from, when there is no git checkout to ask (Phase 6).
+
+    The GPU image copies the source without ``.git``; ``docker/Dockerfile.gpu`` takes the commit
+    as a build argument and sets ``MINEGS_GIT_COMMIT``. Without it the answer stays ``unknown``,
+    which a reproducibility comparison treats as "not the same code" rather than guessing.
+    """
+    import os
+
+    sha = os.environ.get("MINEGS_GIT_COMMIT", "").strip()
+    return sha if re.fullmatch(r"[0-9a-f]{7,40}(-dirty)?", sha) else "unknown"
 
 
 def _package_version(name: str) -> str | None:

@@ -256,7 +256,13 @@ def run_views(run, dataset_dir: Path, images: dict) -> dict:
         return images
     from minegs.chunks.plan import verify_chunk_plan
 
-    plan = verify_chunk_plan(dataset_dir, run.chunk["plan_path"])
+    plan_path = Path(run.chunk["plan_path"])
+    if not plan_path.exists():
+        # A run trained elsewhere (a RunPod pod) recorded where the plan was *there*. The plan is
+        # found by identity instead: the dataset's own copy, accepted only if its digest is the
+        # one the run trained from (checked below).
+        plan_path = Path(dataset_dir) / "chunks" / str(run.chunk.get("plan_id")) / "chunk_plan.json"
+    plan = verify_chunk_plan(dataset_dir, plan_path)
     if plan.plan_digest != run.chunk.get("plan_digest"):
         raise ContractError(
             f"run {run.run_id} was trained from plan {run.chunk.get('plan_id')}, but "

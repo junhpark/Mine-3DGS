@@ -617,7 +617,9 @@ def test_a_pre_0d2_run_record_still_loads():
     }
     rec = RunRecord.from_dict(old)
     # 1.0 -> 1.1 (0D.2 evidence) -> 1.2 (Phase 4 trainer evidence) -> 1.3 (Phase 5 chunk)
-    assert rec.schema_version == "1.3" and rec.chunk is None
+    # -> 1.4 (Phase 6 remote evidence; null for a run that never ran remotely)
+    assert rec.schema_version == "1.4" and rec.chunk is None
+    assert rec.remote_execution is None and rec.remote_sync is None
     # a 1.0 run recorded no evidence, and the migration does not invent any
     assert rec.final_model is None and rec.observed_final_step is None and rec.extents == {}
     assert rec.trainer == {} and rec.depth_supervision is None and rec.trainer_config == {}

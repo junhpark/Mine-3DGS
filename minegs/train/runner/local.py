@@ -93,6 +93,11 @@ class LocalHandle(RunHandle):
             return RunStatus.RUNNING
         return RunStatus.SUCCEEDED if rc == 0 else RunStatus.FAILED
 
+    @property
+    def returncode(self) -> int | None:
+        """The trainer process's exit code once it has ended (None while running or unknown)."""
+        return None if self._proc is None else self._proc.poll()
+
     def logs(self, tail: int | None = None) -> str:
         p = self.run_dir / "log" / "train.log"
         if not p.exists():
@@ -107,6 +112,13 @@ class LocalHandle(RunHandle):
 class LocalRunner(Runner):
     name = "local"
 
+    def _after_staging(self, dataset_dir: Path) -> None:
+        """Called once staging has read everything it reads, before any trainer starts.
+
+        A local run's dataset is this machine's own directory; nothing to re-check. The RunPod
+        worker re-hashes the dataset on the shared volume here (Phase 6 §8).
+        """
+
     def submit(self, run: RunConfig) -> RunHandle:
         run, manifest, profile, record = self.prepare(run)
         run_dir = Path(run.run_dir)
@@ -119,7 +131,7 @@ class LocalRunner(Runner):
             raise NoGpuError(
                 "No CUDA device found. Training needs a GPU. Run on a CUDA host (docker with "
                 "--gpus device=0), or use --native for a developer run in the current environment. "
-                "Cloud routing (RunPod) is Phase 6 and not implemented yet — see docs/ROADMAP.md."
+                "Or run it on a RunPod GPU: --runner runpod --config configs/runner/runpod.yaml."
             )
 
         # One GPU, decided before anything is staged. gsplat reads torch.cuda.device_count() and
@@ -144,6 +156,7 @@ class LocalRunner(Runner):
         staged_supervision = None
         if verified is not None:
             staged_supervision = stage_depth_supervision(verified, staged.path)
+        self._after_staging(dataset_dir)
         if planned is not None:
             chunk = dict(record.chunk or {})
             ev = dict(staged.chunk or {})
@@ -250,7 +263,7 @@ class LocalRunner(Runner):
         record.T_local_from_internal = cmd.T_local_from_internal.to_list()
         record.trainer = dict(cmd.trainer)
         record.expected_trainer_config = dict(cmd.expected_config)
-        record.image = self.config.image or None
+        record.image = self.recorded_image()[0]
         record.max_steps = profile.max_steps
         record.runtime = (
             runtime_info()
@@ -338,6 +351,10 @@ class _FinalizingHandle(RunHandle):
         Runner.write_record(rec, self.run_dir)
         self._terminal = rec.status
         return self._terminal
+
+    @property
+    def returncode(self) -> int | None:
+        return self._inner.returncode
 
     def logs(self, tail: int | None = None) -> str:
         return self._inner.logs(tail)

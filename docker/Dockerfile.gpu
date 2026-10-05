@@ -1,6 +1,7 @@
 # minegs GPU training image (§1.2, §8.2).
 # One image, used by LocalRunner and RunPodRunner *by digest*. Build, push, then pin:
-#   docker build -f docker/Dockerfile.gpu -t <registry>/minegs:gpu .
+#   docker build -f docker/Dockerfile.gpu --build-arg MINEGS_GIT_SHA="$(git rev-parse HEAD)" \
+#     -t <registry>/minegs:gpu .
 #   docker push <registry>/minegs:gpu            # note the sha256 digest
 #   configs/runner/*.yaml -> image: <registry>/minegs:gpu@sha256:<digest>
 #
@@ -56,6 +57,13 @@ RUN git clone --depth 1 --branch v${GSPLAT_VERSION} https://github.com/nerfstudi
     && pip install -r /opt/gsplat/examples/requirements.txt \
     && python /opt/gsplat/examples/simple_trainer.py default --help > /dev/null
 ENV MINEGS_GSPLAT_TRAINER=/opt/gsplat/examples/simple_trainer.py
+
+# The source is copied without .git, so the commit is passed in and recorded in every run's
+# provenance (Phase 6: a RunPod run and a local run are a reproducibility pair only on the same
+# code). Build with --build-arg MINEGS_GIT_SHA="$(git rev-parse HEAD)"; without it the code stays
+# "unknown" and no comparison will call two runs the same experiment.
+ARG MINEGS_GIT_SHA=unknown
+ENV MINEGS_GIT_COMMIT=${MINEGS_GIT_SHA}
 
 WORKDIR /opt/minegs
 COPY pyproject.toml README.md ./

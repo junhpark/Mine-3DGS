@@ -1,13 +1,21 @@
-schema_version: "1.0"
+schema_version: "1.1"
 runner: runpod
+# Must be the same digest as runner/local.yaml: a RunPod run and a local run are the same
+# computation only on the same image (docs/PHASE6_CONTRACT.md §2 Q4). A tag alone is refused.
 image: "ghcr.io/junhpark/minegs:gpu@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 data_root: ./data
-# API key 는 RUNPOD_API_KEY 환경변수 (파일에 쓰지 않는다)
-gpu_types: ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA RTX 4000 Ada"]
-network_volume_id: null        # 체크포인트는 볼륨에 (resume 은 Phase 0D.3, 미구현)
-volume_mount: /data
-container_disk_gb: 40
+# API key: RUNPOD_API_KEY environment variable only (never in this file, never recorded).
+gpu_types: ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA RTX 4000 Ada Generation"]
+gpu_count: 1                   # one GPU: gsplat goes distributed on sight of a second
+# The network volume is the persistent truth (dataset, job status, outputs); it outlives the pod.
+network_volume_id: null        # required: the RunPod network volume id
+volume_mount: /data            # where the pod mounts that volume
+container_disk_gb: 40          # scratch only
+cloud_type: ALL
+allowed_cuda_versions: null    # e.g. ["12.4", "12.5", "12.6"] for the CUDA 12.4 image
+terminate_on_completion: true  # stop paying once status + output manifest are on the volume
 sync:
-  remote: runpod:minegs        # rclone remote (dataset/ 만 push, runs/ 만 pull)
-  transfers: 16
+  # How this machine reaches the SAME volume: an rclone remote for RunPod's S3-compatible
+  # network-volume endpoint (remote:<volume id>), or the absolute path where it is mounted here.
+  remote: runpod-s3:VOLUME_ID
 poll_interval_s: 30
