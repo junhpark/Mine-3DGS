@@ -229,7 +229,7 @@ def test_runpod_runner_refuses_before_any_external_step(synthetic, monkeypatch):
     # Phase 6: implemented, so what is pinned now is that an incomplete config is refused before
     # anything is uploaded or created — here, no network volume to hold the run
     monkeypatch.setenv("RUNPOD_API_KEY", "dummy-key-value")
-    r = get_runner("runpod", RunnerConfig(runner="runpod", image="x@sha256:abc"))
+    r = get_runner("runpod", RunnerConfig(runner="runpod", image="x@sha256:" + "ab" * 32))
     with pytest.raises(ContractError, match="network_volume_id"):
         r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light"))
 
