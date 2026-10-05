@@ -273,7 +273,7 @@ def test_local_runner_refuses_without_gpu(synthetic, monkeypatch):
 
     monkeypatch.setattr(local, "cuda_available", lambda: False)
     r = get_runner("local", RunnerConfig(runner="local", native=True))
-    with pytest.raises(NoGpuError, match="Phase 6 and not implemented"):
+    with pytest.raises(NoGpuError, match="--runner runpod"):  # Phase 6: RunPod is the cloud route
         r.submit(RunConfig(dataset_dir=str(synthetic.dataset_dir), profile="light"))
 
 

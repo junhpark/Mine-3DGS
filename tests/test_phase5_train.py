@@ -77,7 +77,7 @@ def test_a_chunk_run_is_bound_to_its_plan_and_stays_in_the_dataset_frame(tunnel,
     assert status is RunStatus.SUCCEEDED, load_record(h.run_dir).failure_reason
     rec = load_record(h.run_dir)
     c = tunnel.plan.chunk("K001")
-    assert rec.chunk_id == "K001" and rec.schema_version == "1.3"
+    assert rec.chunk_id == "K001" and rec.schema_version == "1.4"
     assert rec.chunk["plan_id"] == tunnel.plan.plan_id
     assert rec.chunk["plan_digest"] == tunnel.plan.plan_digest
     assert tuple(rec.chunk["core_range_m"]) == c.core_range_m
